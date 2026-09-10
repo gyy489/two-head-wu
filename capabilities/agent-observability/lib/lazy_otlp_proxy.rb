@@ -64,7 +64,6 @@ module TwoHeadWu
       end
       acceptors.each(&:join)
       REQUEST_WORKERS.times { @request_queue << :stop }
-      @queue << :stop
       request_workers.each(&:join)
       worker.join
       0
@@ -109,6 +108,7 @@ module TwoHeadWu
         Signal.trap(signal) do
           @stopping = true
           listeners.each { |listener| listener.close rescue nil }
+          @queue << :stop
         end
       end
     end

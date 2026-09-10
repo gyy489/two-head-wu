@@ -66,6 +66,7 @@ flowchart LR
 
 - 已确认：问题可重复出现，通知进程会堆积，Colima 中的 Collector/ClickHouse 随后出现负载高峰；
 - 已确认：只终止精确识别的进程树可以完成当次止损，不需要粗暴杀掉所有 Ruby 或整个 Codex 运行面；
+- 已确认：独立的 Ruby 3.3/macOS 回归测另外捕获到 TERM 收尾路径的 `TypeError: wrong argument type false (expected mutex)`，但尚无证据表明它与本机资源风暴是同一根因；
 - 尚未确认：触发点究竟在通知负载、下游转发、中断清理，还是它们的交互；
 - 已放弃的早期结论：“两次被中断的测试导致进程树扩张”只是一个不足以解释多次复发的假设，不再当作根因。
 
