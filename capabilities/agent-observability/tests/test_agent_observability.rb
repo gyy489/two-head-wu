@@ -1591,7 +1591,10 @@ class AgentObservabilityTest < Minitest::Test
 
     Process.kill("TERM", pid)
     Timeout.timeout(3) { Process.wait(pid) }
-    assert_predicate $?, :success?
+    status = $?
+    diagnostic_path = proxy_home.join("Library/Logs/TwoHeadWu/agent-observability-errors.jsonl")
+    diagnostic = diagnostic_path.file? ? diagnostic_path.read : "no proxy diagnostic was written"
+    assert_predicate status, :success?, diagnostic
   ensure
     client&.close
     listener&.close

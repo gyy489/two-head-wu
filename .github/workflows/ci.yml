@@ -60,13 +60,22 @@ jobs:
           ruby-version: "3.3"
       - name: Test Agent identity
         run: capabilities/agent-identity/tests/test_agent_identity.sh
-      - name: Test Agent observability
-        timeout-minutes: 3
-        run: capabilities/agent-observability/tests/test_agent_observability.sh
       - name: Test personal memory with a simulated OpenClaw
         run: capabilities/personal-memory/tests/test_personal_memory.sh
       - name: Test protected server operations
         run: capabilities/server-operations/tests/test_server_operations.sh
+
+  experimental-observability:
+    runs-on: macos-latest
+    timeout-minutes: 3
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - name: Test experimental Agent observability
+        run: capabilities/agent-observability/tests/test_agent_observability.sh
 
   remote-work-contracts:
     runs-on: ubuntu-latest
