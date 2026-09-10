@@ -45,6 +45,7 @@ launchd 代理的热路径只读取系统盘上的验证标记并写系统盘 ga
 启动。worker 单条处理失败会记录 gap 后继续处理后续 trace，不能再因一个异常永久塞满队列。
 不完整的本地 HTTP 请求有固定读超时，避免空连接无限占用 worker；provider readiness 在生产默认没有
 固定丢弃截止时间，只有 32 MiB 队列上限、显式停止或真实转发结果决定 trace 的去向。
+代理收到 TERM/INT 时，signal handler 只标记停止并关闭 listener；需要队列锁的 worker 收尾由主运行流程完成，避免在 Ruby trap context 中执行带锁操作。
 代理不会只凭 TCP 端口开放就宣称 Collector 可用；它会向真实 `/v1/traces` 接收器发送空的合法
 OTLP/HTTP 探针并等待 2xx，再释放排队 trace，避免容器冷启动的“端口已开、HTTP 未就绪”窗口。
 

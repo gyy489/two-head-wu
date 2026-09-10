@@ -61,6 +61,7 @@ jobs:
       - name: Test Agent identity
         run: capabilities/agent-identity/tests/test_agent_identity.sh
       - name: Test Agent observability
+        timeout-minutes: 3
         run: capabilities/agent-observability/tests/test_agent_observability.sh
       - name: Test personal memory with a simulated OpenClaw
         run: capabilities/personal-memory/tests/test_personal_memory.sh
