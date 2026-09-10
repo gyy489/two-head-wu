@@ -1,0 +1,34 @@
+schema_version: 1
+id: example-capability
+version: "0.1.0"
+status: example
+summary: "Minimal public example of a versioned capability declaration."
+
+interfaces:
+  - id: example.read.v1
+    type: adapter
+    entrypoint: adapters/example
+    side_effect: read-only
+
+compatibility:
+  codex: compatible
+  claude-code: compatible
+  openclaw: needs-review
+
+permissions:
+  risk_level: low
+  network: none
+  secrets: none
+  filesystem:
+    read: []
+    write: []
+
+dependencies: []
+
+recovery:
+  source_of_truth: Git-tracked source and declarations
+  private_material: none
+  rollback: Reactivate the previous verified release
+
+tests:
+  - tests/test_example.sh

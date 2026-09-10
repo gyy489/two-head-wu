@@ -1,0 +1,11 @@
+.DS_Store
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+var/
+logs/
+private/
+backups/
