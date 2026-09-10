@@ -42,10 +42,6 @@ jobs:
         timeout-minutes: 2
         run: |
           capabilities/skills-dashboard/tests/test_skills_dashboard.sh
-      - name: Test server operations
-        timeout-minutes: 2
-        run: |
-          capabilities/server-operations/tests/test_server_operations.sh
       - name: Test remote-work bootstrap
         run: |
           capabilities/remote-work-bootstrap/tests/test_remote_work_bootstrap.sh
@@ -53,6 +49,23 @@ jobs:
         run: |
           ruby scripts/tests/test_skill_policy.rb
           python3 scripts/tests/test_skills_manager.py
+
+  macos-capabilities:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - name: Test Agent identity
+        run: capabilities/agent-identity/tests/test_agent_identity.sh
+      - name: Test Agent observability
+        run: capabilities/agent-observability/tests/test_agent_observability.sh
+      - name: Test personal memory with a simulated OpenClaw
+        run: capabilities/personal-memory/tests/test_personal_memory.sh
+      - name: Test protected server operations
+        run: capabilities/server-operations/tests/test_server_operations.sh
 
   remote-work-contracts:
     runs-on: ubuntu-latest
