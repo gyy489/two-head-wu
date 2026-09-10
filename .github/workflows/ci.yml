@@ -10,6 +10,7 @@ permissions:
 jobs:
   platform:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: ruby/setup-ruby@v1
@@ -28,19 +29,34 @@ jobs:
           ruby tools/validate-capability examples/capability.yaml
           ruby tools/validate-capability examples/hello-capability/capability.yaml
           examples/hello-capability/tests/test_hello.sh
-      - name: Run portable infrastructure tests
+      - name: Install portable test dependencies
         run: |
           gem install webrick --no-document
+      - name: Test capability release management
+        run: |
           ruby capabilities/capability-release-management/tests/test_capability_release_manager.rb
+      - name: Test change governance
+        run: |
           ruby capabilities/spec-kit-governance/tests/test_change_governance.rb
+      - name: Test Skills Dashboard
+        timeout-minutes: 2
+        run: |
           capabilities/skills-dashboard/tests/test_skills_dashboard.sh
+      - name: Test server operations
+        timeout-minutes: 2
+        run: |
           capabilities/server-operations/tests/test_server_operations.sh
+      - name: Test remote-work bootstrap
+        run: |
           capabilities/remote-work-bootstrap/tests/test_remote_work_bootstrap.sh
+      - name: Test Skill policy and lifecycle managers
+        run: |
           ruby scripts/tests/test_skill_policy.rb
           python3 scripts/tests/test_skills_manager.py
 
   remote-work-contracts:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: ruby/setup-ruby@v1
