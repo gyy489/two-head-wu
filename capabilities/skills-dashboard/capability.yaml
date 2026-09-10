@@ -56,6 +56,9 @@ dependencies:
   - id: two-head-wu-core
     version: ">=0.1.0"
     purpose: "Project capability resolution and registered Skill exposure."
+  - id: webrick
+    version: ">=1.8 <2.0"
+    purpose: "Serve the loopback-only dashboard on Ruby versions that no longer bundle WEBrick."
 
 recovery:
   source_of_truth: "tracked capability package; runtime state under var/skills-dashboard/ is fully rebuildable and disposable"

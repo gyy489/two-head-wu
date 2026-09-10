@@ -117,6 +117,9 @@ dependencies:
   - id: agent-identity
     version: ">=0.1.0"
     purpose: "Launch Mini Codex work under each Air user's exact private-registry identity binding without copying credentials."
+  - id: pyyaml
+    version: ">=6.0 <7.0"
+    purpose: "Parse YAML policy fixtures in the portable Python contract tests."
 
 recovery:
   source_of_truth: "tracked protocol, unified Air client, service, worker, Skill, signed installer sources, contracts, and grant policies"

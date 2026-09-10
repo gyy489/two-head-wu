@@ -28,6 +28,8 @@ Skill——纯粹是把已经存在的元数据画出来看。
 
 ## 使用
 
+Ruby 3 不再默认附带 WEBrick 时，先运行 `gem install webrick`。
+
 ```bash
 capabilities/skills-dashboard/adapters/skills-dashboard start --open   # 启动并在默认浏览器打开
 capabilities/skills-dashboard/adapters/skills-dashboard status --json  # 是否在跑、端口是多少
