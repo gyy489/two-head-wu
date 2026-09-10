@@ -1,0 +1,152 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Two-Headed-Wu multi-user v2 contract bundle
+type: object
+additionalProperties: false
+required: [schema_version, users, devices, codex_bindings, grants, content_leases, jobs, interactions]
+properties:
+  schema_version: {const: 2}
+  users: {type: array, maxItems: 256, items: {$ref: "#/$defs/user"}}
+  devices: {type: array, maxItems: 256, items: {$ref: "#/$defs/device"}}
+  codex_bindings: {type: array, maxItems: 256, items: {$ref: "#/$defs/codex_binding"}}
+  grants: {type: array, maxItems: 256, items: {$ref: "#/$defs/grant"}}
+  content_leases: {type: array, maxItems: 256, items: {$ref: "#/$defs/content_lease"}}
+  jobs: {type: array, maxItems: 256, items: {$ref: "#/$defs/job"}}
+  interactions: {type: array, maxItems: 1024, items: {$ref: "#/$defs/interaction"}}
+$defs:
+  user:
+    type: object
+    additionalProperties: false
+    required: [schema_version, id, role, status, display_name, created_at]
+    properties:
+      schema_version: {const: 2}
+      id: {type: string, pattern: "^usr-[a-z0-9][a-z0-9-]{7,63}$"}
+      role: {enum: [owner, member]}
+      status: {enum: [active, suspended, revoked]}
+      display_name: {type: string, minLength: 1, maxLength: 80}
+      created_at: {type: string, format: date-time}
+      updated_at: {type: string, format: date-time}
+  device:
+    type: object
+    additionalProperties: false
+    required: [schema_version, id, user_id, role, platform, key_provider, public_key_spki_base64, status, created_at]
+    properties:
+      schema_version: {const: 2}
+      id: {type: string, pattern: "^dev-[a-z0-9][a-z0-9-]{7,95}$"}
+      user_id: {type: string, pattern: "^usr-[a-z0-9][a-z0-9-]{7,63}$"}
+      role: {const: air}
+      platform: {enum: [macos, windows]}
+      key_provider: {enum: [secure-enclave, tpm-cng]}
+      public_key_spki_base64:
+        type: string
+        minLength: 124
+        maxLength: 124
+        description: "Base64 of a DER SubjectPublicKeyInfo containing an uncompressed ECDSA P-256 public key."
+      status: {enum: [pending, active, revoked]}
+      created_at: {type: string, format: date-time}
+      revoked_at: {type: string, format: date-time}
+  codex_binding:
+    type: object
+    additionalProperties: false
+    required: [schema_version, id, user_id, identity_alias, routing_mode, status, created_at]
+    properties:
+      schema_version: {const: 2}
+      id: {type: string, pattern: "^cdx-[a-z0-9][a-z0-9-]{7,63}$"}
+      user_id: {type: string, pattern: "^usr-[a-z0-9][a-z0-9-]{7,63}$"}
+      identity_alias: {type: string, pattern: "^[a-z][a-z0-9-]{0,62}$"}
+      routing_mode: {const: air-fixed}
+      status: {enum: [active, revoked]}
+      created_at: {type: string, format: date-time}
+      revoked_at: {type: string, format: date-time}
+  grant:
+    type: object
+    additionalProperties: false
+    required: [schema_version, id, user_id, capability_id, effect, status, scopes, created_at]
+    properties:
+      schema_version: {const: 2}
+      id: {type: string, pattern: "^grant-[a-z0-9][a-z0-9-]{7,63}$"}
+      user_id: {type: string}
+      capability_id: {type: string, pattern: "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"}
+      effect: {enum: [allow, deny]}
+      status: {enum: [active, revoked]}
+      scopes: {type: array, maxItems: 32, uniqueItems: true, items: {type: string, pattern: "^[a-z][a-z0-9-]{0,63}$"}}
+      created_at: {type: string, format: date-time}
+      expires_at: {type: string, format: date-time}
+  content_lease:
+    type: object
+    additionalProperties: false
+    required: [schema_version, id, user_id, job_id, kind, state, sha256, size, receipt_required, created_at, expires_at]
+    properties:
+      schema_version: {const: 2}
+      id: {type: string, pattern: "^content-[a-z0-9][a-z0-9-]{7,63}$"}
+      user_id: {type: string}
+      job_id: {type: string}
+      kind: {enum: [project-capsule, input-artifact, result-package]}
+      state: {enum: [staged, available, received, expired, purged]}
+      sha256: {type: string, pattern: "^[a-f0-9]{64}$"}
+      size: {type: integer, minimum: 0, maximum: 52428800}
+      receipt_required: {type: boolean}
+      created_at: {type: string, format: date-time}
+      expires_at: {type: string, format: date-time}
+      received_at: {type: string, format: date-time}
+      purged_at: {type: string, format: date-time}
+  capability_envelope:
+    type: object
+    additionalProperties: false
+    required: [schema_version, capabilities, egress_profile, secret_access, result_mode]
+    properties:
+      schema_version: {const: 2}
+      capabilities: {type: array, maxItems: 64, uniqueItems: true, items: {type: string, pattern: "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"}}
+      egress_profile: {enum: [none, registered-only]}
+      secret_access: {const: none}
+      result_mode: {const: review-only}
+  job:
+    type: object
+    additionalProperties: false
+    required: [schema_version, id, request_id, user_id, device_id, codex_binding_id, kind, state, instruction, capability_envelope, content_lease_ids, created_at]
+    properties:
+      schema_version: {const: 2}
+      id: {type: string, pattern: "^job-[a-z0-9][a-z0-9-]{7,95}$"}
+      request_id: {type: string, pattern: "^call-[a-f0-9]{24}$"}
+      user_id: {type: string}
+      device_id: {type: string}
+      codex_binding_id: {type: string}
+      kind: {enum: [codex, capability]}
+      submission_mode: {const: capsule-draft}
+      capability_id: {type: string, pattern: "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"}
+      capability_input: {type: object}
+      state: {enum: [staging, queued, leased, running, waiting_user, uploading, succeeded, failed, cancelled, expired]}
+      instruction: {type: string, minLength: 1, maxLength: 20000}
+      capability_envelope: {$ref: "#/$defs/capability_envelope"}
+      content_lease_ids: {type: array, maxItems: 32, uniqueItems: true, items: {type: string}}
+      created_at: {type: string, format: date-time}
+      updated_at: {type: string, format: date-time}
+      worker_id: {type: string, pattern: "^dev-[a-z0-9][a-z0-9-]{7,95}$"}
+      execution_lease_id: {type: string, pattern: "^work-[a-f0-9]{24}$"}
+      lease_expires_at: {type: integer, minimum: 0}
+      attempt: {type: integer, minimum: 1, maximum: 3}
+      failure_code: {enum: [identity_required, authorization_required, execution_failed, lease_expired]}
+  interaction:
+    type: object
+    additionalProperties: false
+    required: [schema_version, id, user_id, job_id, execution_lease_id, kind, state, title, detail, action_sha256, created_at, expires_at]
+    properties:
+      schema_version: {const: 2}
+      id: {type: string, pattern: "^ask-[a-f0-9]{16}$"}
+      user_id: {type: string}
+      job_id: {type: string}
+      execution_lease_id: {type: string, pattern: "^work-[a-f0-9]{24}$"}
+      kind: {enum: [command-approval, user-input]}
+      state: {enum: [pending, answered, denied, cancelled, expired]}
+      title: {type: string, minLength: 1, maxLength: 200}
+      detail: {type: string, minLength: 1, maxLength: 4000}
+      action_sha256: {type: string, pattern: "^[a-f0-9]{64}$"}
+      created_at: {type: string, format: date-time}
+      expires_at: {type: string, format: date-time}
+      reply:
+        type: object
+        additionalProperties: false
+        required: [decision]
+        properties:
+          decision: {enum: [accept, decline, cancel, answer]}
+          answer: {type: string, minLength: 1, maxLength: 4000}
+      replied_at: {type: string, format: date-time}

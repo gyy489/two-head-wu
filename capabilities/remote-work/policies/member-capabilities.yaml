@@ -1,0 +1,124 @@
+schema_version: 1
+visibility: air
+default: deny
+credentials: forbidden
+private_memory: owner-air-exact-only
+owner_resource_catalogs: forbidden
+unknown_entries: denied
+
+modules:
+  - id: skill:remote-work
+    audience: all-air
+    status: active
+    summary: "两头乌 Air/Mini 统一连接能力；Skill 指令本身不授予远端权限。"
+  - id: skill:paper-writing
+    audience: all-air
+    status: active
+    summary: "学术论文分章节写作工作流；Skill 指令本身不授予 Mini、论文库或外网权限。"
+  - id: skill:paper-navigator
+    audience: all-air
+    status: active
+    summary: "论文检索与阅读工作流；远端资料库调用仍由独立 grant 决定。"
+
+  - id: skill:two-head-wu
+    audience: owner-air
+    status: active
+    summary: "仅谷梓阳登记的 Air 可见的两头乌个人入口；不含 Mini 管理权限。"
+  - id: skill:server-operations
+    audience: owner-step-up
+    status: active
+    summary: "仅谷梓阳登记的 Air 可见；真实发布仍需本地四空格防误触确认解锁的一次性动作签名。"
+
+forbidden_modules:
+  - skill:agent-identity
+  - skill:remote-work-bootstrap
+  - skill:skills-dashboard
+  - memory:personal
+  - mcp:private-memory
+
+# This file is a publication allowlist, not an authorization grant. The cloud
+# still intersects it with the authenticated Air user's active grants, and every
+# execution entry point checks the grant again.
+entries:
+  - id: codex:project-task
+    audience: all-air
+    confirmation: none
+    executor: air-worker
+    status: active
+    summary: "在用户自己的隔离 Codex 身份和临时工作区中执行任务；结果只进入该用户的审阅区，不自动应用。"
+  - id: capability:result-review
+    audience: all-air
+    confirmation: none
+    executor: air-worker
+    status: active
+    summary: "下载本人任务的结果包到 Air 审阅区；不能读取其他用户的结果。"
+  - id: capability:model-catalog
+    audience: all-air
+    confirmation: none
+    executor: air-worker
+    status: disabled
+    summary: "Air 模型目录尚未开放；目录存在不代表获得调用权限。"
+  - id: capability:interaction-relay
+    audience: all-air
+    confirmation: none
+    executor: air-worker
+    status: disabled
+    summary: "Air 跨端交互仍在施工，当前任务不能通过提示内容取得额外权限。"
+  - id: capability:artifact-relay
+    audience: all-air
+    confirmation: none
+    executor: air-worker
+    status: disabled
+    summary: "Air 附件与项目胶囊仍在施工，当前只支持不带项目正文的任务。"
+  - id: mcp-tool:openai-docs
+    audience: all-air
+    confirmation: none
+    executor: air-worker
+    status: disabled
+    summary: "固定官方 OpenAI 文档查询能力尚未接入统一 Air Worker。"
+  - id: research-library:search
+    audience: all-air
+    confirmation: none
+    executor: air-worker
+    status: active
+    summary: "通过只读 Provider 检索脱敏文献定位信息；不返回数据库路径、原件路径或整库内容。"
+  - id: research-library:get
+    audience: all-air
+    confirmation: none
+    executor: air-worker
+    status: active
+    summary: "按文献 ID 读取引用与版本元数据；论文原件和 Mini 文件路径不进入成员结果。"
+  - id: tool:codex-status
+    audience: all-air
+    confirmation: none
+    executor: air-worker
+    status: active
+    summary: "只查询本人固定 Codex 绑定的邮箱、套餐和额度窗口；不枚举其他身份，也不返回认证状态文件或令牌。"
+  - id: memory:notebook
+    audience: owner-air
+    confirmation: none
+    executor: protected-adapter
+    status: active
+    summary: "仅谷梓阳登记的 Air 可使用小本本精确接口；不暴露原始文件、备份、配置或任意路径。"
+  - id: workflow:publish-site
+    audience: owner-step-up
+    confirmation: owner-password
+    executor: protected-adapter
+    status: disabled
+    summary: "固定站点发布预留能力；精确适配器与四空格本地确认签名验收前不可调用。"
+
+forbidden_ids:
+  - mcp:private-memory
+  - tool:identity-catalog
+  - tool:resource-catalog
+  - research-library:export
+  - workflow:sync-air
+  - workflow:refresh-documentation
+  - workflow:verify-change
+  - workflow:capabilities-inventory
+  - workflow:sync-skill-surfaces
+  - workflow:refresh-topology
+  - workflow:spec-kit-health
+  - workflow:server-operations-health
+  - workflow:remote-work-bootstrap-health
+  - workflow:remote-work-health

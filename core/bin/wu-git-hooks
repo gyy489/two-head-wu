@@ -1,0 +1,296 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "date"
+require "open3"
+require "pathname"
+require "set"
+require "time"
+require "yaml"
+
+class WuGitHooksError < StandardError; end
+
+class WuGitHooks
+  HOOKS_PATH = ".githooks"
+  HOOK_NAMES = %w[pre-commit pre-push].freeze
+  MANAGED_DOCUMENTS = %w[
+    PROJECT_MAP.md
+    docs/capability_management.md
+    inventories/capability_documentation.md
+    inventories/capabilities_inventory.md
+    inventories/function_catalog.md
+    inventories/function_catalog.json
+    skills/inventories/skills_catalog.md
+  ].freeze
+
+  def initialize(arguments)
+    @arguments = arguments.dup
+    @root = Pathname.new(__dir__).join("../..").expand_path.cleanpath
+  end
+
+  def run
+    command = @arguments.shift || "help"
+    raise WuGitHooksError, "unknown arguments: #{@arguments.join(' ')}" unless @arguments.empty?
+
+    case command
+    when "install" then install
+    when "status" then status
+    when "uninstall" then uninstall
+    when "pre-commit" then pre_commit
+    when "pre-push" then pre_push
+    when "help", "--help", "-h" then help
+    else raise WuGitHooksError, "unknown command: #{command}"
+    end
+  rescue WuGitHooksError, KeyError, Psych::Exception => error
+    warn "ERROR: #{error.message}"
+    warn "修复说明后运行：wu 更新说明；手动复验：wu 验收修改"
+    2
+  end
+
+  private
+
+  def install
+    ensure_repository!
+    current = local_hooks_path
+    if current && current != HOOKS_PATH
+      raise WuGitHooksError, "core.hooksPath already points to #{current}; refusing to replace it"
+    end
+    HOOK_NAMES.each do |name|
+      hook = @root.join(HOOKS_PATH, name)
+      raise WuGitHooksError, "tracked hook missing or not executable: #{hook}" unless hook.file? && hook.executable?
+    end
+    run_required("git", "config", "--local", "core.hooksPath", HOOKS_PATH)
+    puts "Git change gates installed: pre-commit + pre-push"
+    status
+  end
+
+  def status
+    ensure_repository!
+    configured = local_hooks_path
+    hooks = HOOK_NAMES.to_h do |name|
+      hook = @root.join(HOOKS_PATH, name)
+      [name, hook.file? && hook.executable?]
+    end
+    puts "core.hooksPath: #{configured || '(not configured)'}"
+    hooks.each { |name, ready| puts "#{name}: #{ready ? 'ready' : 'missing'}" }
+    configured == HOOKS_PATH && hooks.values.all? ? 0 : 2
+  end
+
+  def uninstall
+    ensure_repository!
+    current = local_hooks_path
+    if current.nil?
+      puts "Git change gates are already disabled"
+      return 0
+    end
+    unless current == HOOKS_PATH
+      raise WuGitHooksError, "core.hooksPath points to #{current}; refusing to unset another hook owner"
+    end
+    run_required("git", "config", "--local", "--unset", "core.hooksPath")
+    puts "Git change gates disabled; tracked hook files were preserved"
+    0
+  end
+
+  def pre_commit
+    ensure_repository!
+    staged = git_paths("diff", "--cached", "--name-only", "--diff-filter=ACMRD", "-z")
+    raise WuGitHooksError, "pre-commit gate found no staged files" if staged.empty?
+
+    errors = documentation_coupling_errors(staged)
+    pending_managed = unstaged_managed_documents
+    unless pending_managed.empty?
+      errors << "managed documentation has unstaged changes: #{pending_managed.join(', ')}"
+    end
+    raise WuGitHooksError, errors.join("; ") unless errors.empty?
+
+    puts "Git pre-commit gate: staged documentation coupling ok"
+    run_change_gate("staged")
+    run_verifier
+  end
+
+  def pre_push
+    ensure_repository!
+    dirty = status_paths
+    unless dirty.empty?
+      raise WuGitHooksError, "pre-push requires a clean worktree so verification matches the pushed commit: #{dirty.first(8).join(', ')}"
+    end
+
+    puts "Git pre-push gate: worktree clean"
+    run_verifier
+  end
+
+  def documentation_coupling_errors(changed)
+    changed_set = changed.to_set
+    errors = []
+    package_records.each do |entry, manifest|
+      prefix = "#{entry.fetch('path')}/"
+      package_changes = changed.select { |relative| relative.start_with?(prefix) }
+      next if package_changes.empty?
+
+      docs = manifest.fetch("documentation")
+      explanation_paths = Set[
+        entry.fetch("manifest"),
+        docs.fetch("overview"),
+        *Array(docs["skill_docs"]),
+        *Array(docs["references"])
+      ]
+      implementation_changes = package_changes.reject do |relative|
+        explanation_paths.include?(relative) || relative.end_with?(".md")
+      end
+      if implementation_changes.any? && (changed_set & explanation_paths).empty?
+        errors << "#{entry.fetch('id')}: staged implementation lacks its manifest or explanation document"
+      end
+    end
+
+    core_changes = changed.select do |relative|
+      %w[.githooks/ core/ catalog/ registries/ mcp/ scripts/].any? { |prefix| relative.start_with?(prefix) }
+    end
+    core_docs = Set[
+      "README.md",
+      "PROJECT_MAP.md",
+      "catalog/documentation_registry.yaml",
+      "docs/capability_management.md",
+      "docs/documentation_governance.md",
+      "docs/directory_policy.md",
+      "capabilities/two-head-wu-core/capability.yaml"
+    ]
+    if core_changes.any? && (changed_set & core_docs).empty?
+      errors << "staged Core, Catalog, or Git-gate changes lack the Core overview, directory policy, or manifest"
+    end
+
+    skill_implementation = changed.select do |relative|
+      relative.start_with?("skills/") &&
+        !relative.start_with?(
+          "skills/docs/",
+          "skills/inventories/",
+          "skills/outputs/",
+          "skills/registries/",
+          "skills/audits/"
+        )
+    end
+    skill_docs = Set[
+      "skills/docs/skills_management.md",
+      "skills/inventories/skills_catalog.md",
+      "skills/registries/skills_registry.yaml"
+    ]
+    if skill_implementation.any? && (changed_set & skill_docs).empty?
+      errors << "staged Skill implementation lacks the Skill registry, catalog, or management explanation"
+    end
+    errors
+  end
+
+  def unstaged_managed_documents
+    registry = load_yaml("catalog/documentation_registry.yaml")
+    generated = Array(registry.dig("policy", "generated_outputs"))
+    managed = MANAGED_DOCUMENTS + generated + Dir.glob(
+      @root.join("skills/outputs/system-cartographer/topology/*").to_s
+    ).map { |file| Pathname.new(file).relative_path_from(@root).to_s }
+    unstaged = git_paths("diff", "--name-only", "-z", "--", *managed)
+    untracked = untracked_paths & managed
+    (unstaged + untracked).uniq.sort
+  end
+
+  def package_records
+    registry = load_yaml("catalog/packages_registry.yaml")
+    Array(registry.fetch("packages")).map do |entry|
+      [entry, load_yaml(entry.fetch("manifest"))]
+    end
+  end
+
+  def run_verifier
+    success = system(@root.join("core/bin/wu-docs").to_s, "verify", chdir: @root.to_s)
+    raise WuGitHooksError, "change verification failed; Git operation blocked" unless success
+
+    0
+  end
+
+  def run_change_gate(scope)
+    command = @root.join("capabilities/spec-kit-governance/adapters/change-governance").to_s
+    success = system(command, "gate", "--scope", scope, chdir: @root.to_s)
+    raise WuGitHooksError, "Change Capsule gate failed; Git operation blocked" unless success
+  end
+
+  def ensure_repository!
+    stdout, _stderr, status = Open3.capture3("git", "rev-parse", "--show-toplevel", chdir: @root.to_s)
+    raise WuGitHooksError, "not inside a Git repository" unless status.success?
+    raise WuGitHooksError, "Git root does not match Two-Headed-Wu" unless Pathname.new(stdout.strip).realpath == @root.realpath
+  end
+
+  def local_hooks_path
+    stdout, _stderr, status = Open3.capture3("git", "config", "--local", "--get", "core.hooksPath", chdir: @root.to_s)
+    status.success? ? stdout.strip : nil
+  end
+
+  def status_paths
+    stdout, stderr, status = Open3.capture3(
+      "git", "status", "--porcelain=v1", "-z", "--untracked-files=all", chdir: @root.to_s
+    )
+    raise WuGitHooksError, "cannot inspect worktree: #{stderr.strip}" unless status.success?
+
+    parse_porcelain_paths(stdout)
+  end
+
+  def untracked_paths
+    stdout, stderr, status = Open3.capture3(
+      "git", "status", "--porcelain=v1", "-z", "--untracked-files=all", chdir: @root.to_s
+    )
+    raise WuGitHooksError, "cannot inspect untracked files: #{stderr.strip}" unless status.success?
+
+    stdout.split("\0").each_with_object([]) do |entry, paths|
+      paths << entry[3..] if entry.start_with?("?? ")
+    end
+  end
+
+  def parse_porcelain_paths(stdout)
+    entries = stdout.split("\0")
+    paths = []
+    index = 0
+    while index < entries.length
+      entry = entries[index]
+      status_code = entry[0, 2]
+      paths << entry[3..] if entry.length > 3
+      if status_code&.match?(/[RC]/)
+        index += 1
+        paths << entries[index] if entries[index]
+      end
+      index += 1
+    end
+    paths.compact.uniq
+  end
+
+  def git_paths(*arguments)
+    stdout, stderr, status = Open3.capture3("git", *arguments, chdir: @root.to_s)
+    raise WuGitHooksError, "git #{arguments.join(' ')} failed: #{stderr.strip}" unless status.success?
+
+    stdout.split("\0").reject(&:empty?)
+  end
+
+  def run_required(*command)
+    success = system(*command, chdir: @root.to_s)
+    raise WuGitHooksError, "command failed: #{command.join(' ')}" unless success
+  end
+
+  def load_yaml(relative)
+    file = @root.join(relative)
+    raise WuGitHooksError, "missing YAML: #{relative}" unless file.file?
+
+    YAML.safe_load(
+      file.read(encoding: "UTF-8"),
+      permitted_classes: [Date, Time],
+      aliases: false
+    )
+  end
+
+  def help
+    puts <<~HELP
+      Usage: wu-git-hooks install|status|uninstall
+
+      install      Configure this repository to use the tracked hooks
+      status       Show local hook configuration and tracked hook readiness
+      uninstall    Remove only the Two-Headed-Wu core.hooksPath setting
+    HELP
+    0
+  end
+end
+
+exit WuGitHooks.new(ARGV).run

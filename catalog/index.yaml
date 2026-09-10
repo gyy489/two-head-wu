@@ -1,0 +1,27 @@
+version: 1
+updated_at: "2026-09-10"
+purpose: "两头乌基础平台公开脱敏目录。"
+
+sources:
+  projects: registries/projects_registry.yaml
+  agents: registries/agents_registry.yaml
+  runtimes: registries/runtimes_registry.yaml
+  capability_policy: registries/capabilities_registry.yaml
+  skill_sources: skills/registries/skills_registry.yaml
+  mcp: catalog/mcp_registry.yaml
+  accounts: registries/accounts_registry.yaml
+  dependencies: registries/dependencies_registry.yaml
+  package_index: catalog/packages_registry.yaml
+  capability_releases: catalog/capability_releases.yaml
+  project_capability_bindings: catalog/project_capability_bindings.yaml
+  documentation_navigation: catalog/documentation_registry.yaml
+  workflows: catalog/workflows_registry.yaml
+  infrastructure_resources: catalog/resources/infrastructure.yaml
+  protected_assets: catalog/resources/protected-assets.yaml
+  static_site_deployments: catalog/deployments/personal-static-sites.yaml
+
+rules:
+  plaintext_secrets: forbidden
+  secret_references: allowed
+  raw_private_paths: forbidden
+  generated_runtime_state_is_not_catalog: true

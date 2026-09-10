@@ -1,0 +1,882 @@
+schema_version: 1
+id: remote-work-owner-only
+status: experimental
+
+scope:
+  owner_user: example-owner
+  allowed_devices:
+    - mac-mini-worker
+    - owner-air
+  allowed_identity_aliases:
+    - owner-primary
+    - owner-secondary
+  classmates: forbidden
+  silent_identity_fallback: owner-pool-only
+
+transport:
+  scheme: https
+  public_endpoint: https://relay.example/two-head-wu/v1
+  api_prefix: /two-head-wu/v1
+  request_authentication: hmac-sha256
+  enrollment: single-use
+  maximum_clock_skew_seconds: 300
+  nonce_retention_seconds: 900
+
+modules:
+  priority:
+    - server-denial
+    - project-lock
+    - device-policy
+    - automatic-suggestion
+  modes:
+    - off
+    - metadata-only
+    - on-demand
+    - auto-update
+    - pinned
+  entries:
+    - id: skill:remote-work
+      source: capabilities/remote-work/skills/remote-work
+      classification: portable
+      status: active
+      default_mode: auto-update
+      summary: "两头乌多端工作中文对话与操作 Skill。"
+    - id: skill:two-head-wu
+      source: capabilities/two-head-wu-core/skills/two-head-wu
+      classification: portable
+      status: active
+      default_mode: auto-update
+      summary: "两头乌确定性能力入口；Skill 指令不授予 Mini 管理权。"
+    - id: skill:server-operations
+      source: capabilities/server-operations/skills/server-operations
+      classification: portable
+      status: active
+      default_mode: on-demand
+      summary: "固定站点发布说明；真实外部写入仍需 owner step-up。"
+    - id: skill:paper-writing
+      source: skills/论文写作skills/EvoScientist-EvoSkills/paper-writing
+      classification: portable
+      status: active
+      default_mode: on-demand
+      summary: "学术论文分章节写作工作流。"
+    - id: skill:paper-navigator
+      source: skills/论文写作skills/EvoScientist-EvoSkills/paper-navigator
+      classification: portable
+      status: active
+      default_mode: on-demand
+      summary: "论文检索与阅读工作流。"
+    - id: mcp:private-memory
+      classification: remote-only
+      status: active
+      default_mode: metadata-only
+      summary: "只在 Mac mini 使用的私人记忆能力；不分发凭据或数据。"
+    - id: memory:personal
+      classification: forbidden
+      status: active
+      default_mode: off
+      summary: "私人记忆正文不得通过组件漫游分发。"
+
+tools:
+  entries:
+    - id: codex-status
+      version: 2
+      mode: read-only
+      execution: mac-mini
+      output_schema: two-head-wu.codex-status.v1
+      allowed_roles:
+        - owner-air
+      copies_credentials: false
+      automatic_identity_switching: owner-pool-only
+    - id: runtime-status
+      version: 1
+      mode: read-only
+      execution: mac-mini
+      output_schema: two-head-wu.runtime-status.v1
+      allowed_roles:
+        - owner-air
+      copies_credentials: false
+      automatic_identity_switching: false
+    - id: module-catalog
+      version: 1
+      mode: read-only
+      execution: mac-mini
+      output_schema: two-head-wu.module-catalog.v1
+      allowed_roles:
+        - owner-air
+      copies_credentials: false
+      automatic_identity_switching: false
+    - id: identity-catalog
+      version: 1
+      mode: read-only
+      execution: mac-mini
+      output_schema: two-head-wu.identity-catalog.v1
+      allowed_roles: [owner-air]
+      copies_credentials: false
+      automatic_identity_switching: false
+    - id: resource-catalog
+      version: 1
+      mode: read-only
+      execution: mac-mini
+      output_schema: two-head-wu.resource-catalog.v1
+      allowed_roles: [owner-air]
+      copies_credentials: false
+      automatic_identity_switching: false
+
+capability_directory:
+  visibility: owner-air
+  credentials: forbidden
+  unknown_entries: denied
+  entries:
+    - id: workflow:sync-air
+      name: 同步两头乌 Air 流水线
+      kind: workflow
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: confirm
+      side_effect: external-write
+      queueable: true
+      runtime_requires: [air-sync-pipeline]
+      command: "wu 同步两头乌Air"
+      data_location: mini-two-head-wu-source-and-fixed-aliyun-control-plane
+      input_schema: {type: object, additionalProperties: false}
+      output_schema: two-head-wu.air-sync.v1
+      executor_kind: workflow
+      adapter: workflow:sync-air
+      capability_version: 1
+      replay_class: owner-confirmation-required
+      approval_policy: owner-confirmation
+      summary: "由所有者从 Air 显式触发：盘点受管组件，未知项停在待审核；同步已登记 Skill、更新说明、验收、签名发布并重新同步 Air。客户端确实升级时也会触发一次。"
+    - id: tool:codex-status
+      name: Codex 额度状态
+      kind: tool
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: auto
+      side_effect: read-only
+      queueable: true
+      runtime_requires: [codex-status]
+      command: "wu 查看额度"
+      tool_id: codex-status
+      data_location: mac-mini-only
+      input_schema:
+        type: object
+        additionalProperties: false
+      output_schema: two-head-wu.codex-status.v1
+      executor_kind: tool
+      adapter: builtin:codex-status
+      capability_version: 2
+      replay_class: safe-read
+      approval_policy: auto
+      summary: "查询 Mini 已登记 Codex 身份的脱敏额度状态；不复制凭据。Air 与微信任务只可在 owner-primary、owner-secondary 所有者池内自动切换。"
+    - id: tool:runtime-status
+      name: Mini 运行时状态
+      kind: tool
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: auto
+      side_effect: read-only
+      queueable: true
+      runtime_requires: [runtime-catalog]
+      command: "wu 调用能力 tool:runtime-status"
+      tool_id: runtime-status
+      data_location: mac-mini-only
+      input_schema:
+        type: object
+        additionalProperties: false
+      output_schema: two-head-wu.runtime-status.v1
+      executor_kind: tool
+      adapter: builtin:runtime-status
+      capability_version: 1
+      replay_class: safe-read
+      approval_policy: auto
+      summary: "返回 Mini 运行时、协议、适配器与兼容状态，不包含凭据或原始配置。"
+    - id: tool:module-catalog
+      name: Mini 适配器目录
+      kind: tool
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: auto
+      side_effect: read-only
+      queueable: true
+      runtime_requires: [capability-adapters]
+      command: "wu 调用能力 tool:module-catalog"
+      tool_id: module-catalog
+      data_location: mac-mini-only
+      input_schema:
+        type: object
+        additionalProperties: false
+      output_schema: two-head-wu.module-catalog.v1
+      executor_kind: tool
+      adapter: builtin:module-catalog
+      capability_version: 1
+      replay_class: safe-read
+      approval_policy: auto
+      summary: "返回 Mini 当前真正装有执行适配器的模块清单；未接线模块不会伪装成可调用。"
+    - id: codex:project-task
+      name: Mini Codex 项目任务
+      kind: codex-task
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: queue
+      side_effect: isolated-write
+      queueable: true
+      runtime_requires: [codex-job, result-package]
+      command: "wu 远程任务 <指令>"
+      data_location: isolated-mini-workspace
+      executor_kind: codex
+      adapter: codex:project-task
+      capability_version: 1
+      replay_class: owner-confirmation-required
+      approval_policy: manual
+      summary: "把 Air 项目胶囊交给 Mini 的 Codex 后台处理；新任务开始前在 owner-primary、owner-secondary 所有者池内检查额度并自动选择，结果只进入审阅区。"
+    - id: capability:model-catalog
+      name: Mini 模型目录
+      kind: model-catalog
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: auto
+      side_effect: read-only
+      queueable: false
+      runtime_requires: [model-catalog]
+      command: "wu 查看模型"
+      data_location: mac-mini-only
+      summary: "查看 Mini 当前发布的 Codex 模型及推理强度，不包含账号凭据。"
+    - id: capability:interaction-relay
+      name: 跨端审批与提问
+      kind: capability
+      location: aliyun
+      exposure: callable
+      status: active
+      invocation_policy: confirm
+      side_effect: external-write
+      queueable: true
+      runtime_requires: [interaction-relay]
+      command: "wu 待处理 <job-id>"
+      data_location: aliyun-relay-expiring
+      summary: "把 Mini 的审批和问题回传 Air；回复必须来自所有者的明确选择。"
+    - id: capability:artifact-relay
+      name: 附件中继
+      kind: artifact
+      location: aliyun
+      exposure: callable
+      status: active
+      invocation_policy: confirm
+      side_effect: external-write
+      queueable: true
+      runtime_requires: []
+      command: "wu 上传附件 <file>"
+      data_location: aliyun-relay-14-days
+      summary: "中转显式选择的单文件附件；拒绝凭据形文件，单文件最大 50 MiB，保留 14 天。"
+    - id: capability:result-review
+      name: 结果审阅
+      kind: capability
+      location: aliyun
+      exposure: callable
+      status: active
+      invocation_policy: auto
+      side_effect: read-only
+      queueable: true
+      runtime_requires: []
+      command: "wu 接收结果 <job-id>"
+      data_location: air-review-directory
+      summary: "下载远端任务的摘要、测试、补丁和文件包到 Air 审阅目录；不会自动应用。"
+    - id: tool:identity-catalog
+      name: Mini 多账号脱敏目录
+      kind: tool
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: auto
+      side_effect: read-only
+      queueable: true
+      runtime_requires: [identity-catalog]
+      command: "wu 调用能力 tool:identity-catalog"
+      tool_id: identity-catalog
+      data_location: mac-mini-private-registry-metadata
+      input_schema: {type: object, additionalProperties: false}
+      output_schema: two-head-wu.identity-catalog.v1
+      executor_kind: tool
+      adapter: builtin:identity-catalog
+      capability_version: 1
+      replay_class: safe-read
+      approval_policy: auto
+      summary: "返回 Mini 已登记身份、模式、会话池和项目绑定；不返回 CODEX_HOME、凭据或额度。"
+    - id: tool:resource-catalog
+      name: Mini 脱敏资源与站点目录
+      kind: tool
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: auto
+      side_effect: read-only
+      queueable: true
+      runtime_requires: [resource-catalog]
+      command: "wu 调用能力 tool:resource-catalog"
+      tool_id: resource-catalog
+      data_location: bundled-redacted-catalog
+      input_schema:
+        type: object
+        properties:
+          id: {type: string, maxLength: 63}
+        additionalProperties: false
+      output_schema: two-head-wu.resource-catalog.v1
+      executor_kind: tool
+      adapter: builtin:resource-catalog
+      capability_version: 1
+      replay_class: safe-read
+      approval_policy: auto
+      summary: "查询四台机器与两个固定站点的脱敏角色、状态和允许动作；不返回 IP、SSH、路径或私有引用。"
+    - id: mcp-tool:openai-docs
+      name: OpenAI Developer Docs MCP
+      kind: mcp-tool
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: auto
+      side_effect: read-only
+      queueable: true
+      runtime_requires: [openai-docs-mcp]
+      command: "wu 调用能力 mcp-tool:openai-docs --input-json '<JSON>'"
+      data_location: official-openai-docs
+      input_schema:
+        type: object
+        required: [action]
+        properties:
+          action: {type: string}
+          query: {type: string, maxLength: 2000}
+          limit: {type: integer}
+          cursor: {type: string, maxLength: 1024}
+          url: {type: string, maxLength: 2000}
+          anchor: {type: string, maxLength: 512}
+          languages: {type: array}
+          code_examples_only: {type: boolean}
+        additionalProperties: false
+      output_schema: two-head-wu.openai-docs.v1
+      executor_kind: tool
+      adapter: mcp:openai-docs
+      capability_version: 1
+      replay_class: safe-read
+      approval_policy: auto
+      summary: "通过 Mini 的固定官方 MCP 端点搜索、列举、读取 OpenAI 文档并查询 API 规范；端点不可由 Air 替换。"
+    - id: research-library:search
+      name: 个人研究资料库检索
+      kind: database-query
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: auto
+      side_effect: read-only
+      queueable: true
+      runtime_requires: [research-library-provider]
+      command: "wu 调用能力 research-library:search --input-json '<JSON>'"
+      data_location: mini-private-data-service-via-provider
+      input_schema:
+        type: object
+        required: [query]
+        properties:
+          query: {type: string, maxLength: 2000}
+          type:
+            type: string
+            enum: [article, conference-paper, thesis, book, chapter, interview, web-article, report, published-owner-work]
+          limit: {type: integer, minimum: 1, maximum: 100}
+        additionalProperties: false
+      output_schema: two-head-wu.research-library.search.v1
+      executor_kind: tool
+      adapter: research-library:search
+      capability_version: 1
+      replay_class: safe-read
+      approval_policy: auto
+      summary: "通过资料库 Provider 检索脱敏文献定位信息；不暴露数据库、文件路径或整库内容。"
+    - id: research-library:get
+      name: 个人研究资料库取件
+      kind: database-query
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: auto
+      side_effect: read-only
+      queueable: true
+      runtime_requires: [research-library-provider]
+      command: "wu 调用能力 research-library:get --input-json '<JSON>'"
+      data_location: mini-private-data-service-via-provider
+      input_schema:
+        type: object
+        required: [work_id]
+        properties:
+          work_id: {type: string, pattern: "^[0-9a-fA-F-]{36}$"}
+          version: {type: string, maxLength: 36}
+        additionalProperties: false
+      output_schema: two-head-wu.research-library.get.v1
+      executor_kind: tool
+      adapter: research-library:get
+      capability_version: 1
+      replay_class: safe-read
+      approval_policy: auto
+      summary: "按资料库生成的文献 ID 读取引用与版本元数据；原件路径只留在 Mini。"
+    - id: research-library:export
+      name: 个人研究资料原件中继
+      kind: artifact
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: confirm
+      side_effect: external-write
+      queueable: true
+      runtime_requires: [research-library-provider, artifact-relay]
+      command: "wu 调用能力 research-library:export --input-json '<JSON>' --confirm"
+      data_location: mini-selected-research-artifact-to-expiring-relay
+      input_schema:
+        type: object
+        required: [artifact_id, expected_sha256]
+        properties:
+          artifact_id: {type: string, pattern: "^[0-9a-fA-F-]{36}$"}
+          expected_sha256: {type: string, pattern: "^[a-f0-9]{64}$"}
+        additionalProperties: false
+      output_schema: two-head-wu.research-library.export.v1
+      executor_kind: tool
+      adapter: research-library:export
+      capability_version: 1
+      replay_class: owner-confirmation-required
+      approval_policy: owner-confirmation
+      summary: "经所有者确认后，仅把一份已选定且哈希吻合的完整文献原件送入 14 天附件中继；单文件上限 50 MiB，不自动分片。"
+    - id: workflow:refresh-documentation
+      name: 更新两头乌说明
+      kind: workflow
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: confirm
+      side_effect: local-write
+      queueable: false
+      runtime_requires: [project-workflows]
+      command: "wu 调用能力 workflow:refresh-documentation --confirm"
+      data_location: mini-two-head-wu-source
+      input_schema: {type: object, additionalProperties: false}
+      output_schema: two-head-wu.workflow-result.v1
+      executor_kind: workflow
+      adapter: workflow:refresh-documentation
+      capability_version: 1
+      replay_class: owner-confirmation-required
+      approval_policy: owner-confirmation
+      summary: "在 Mini 源码仓库运行固定的说明与拓扑更新；会写入受管文档，必须由所有者确认。"
+    - id: workflow:verify-change
+      name: 验收两头乌修改
+      kind: workflow
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: queue
+      side_effect: read-only
+      queueable: false
+      runtime_requires: [project-workflows]
+      command: "wu 调用能力 workflow:verify-change"
+      data_location: mini-two-head-wu-source
+      input_schema: {type: object, additionalProperties: false}
+      output_schema: two-head-wu.workflow-result.v1
+      executor_kind: workflow
+      adapter: workflow:verify-change
+      capability_version: 1
+      replay_class: safe-read
+      approval_policy: auto
+      summary: "在 Mini 源码仓库运行完整文档、拓扑、包、测试和存储放置验收。"
+    - id: workflow:capabilities-inventory
+      name: 刷新能力盘点
+      kind: workflow
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: confirm
+      side_effect: local-write
+      queueable: false
+      runtime_requires: [project-workflows]
+      command: "wu 调用能力 workflow:capabilities-inventory --confirm"
+      data_location: mini-two-head-wu-source
+      input_schema: {type: object, additionalProperties: false}
+      output_schema: two-head-wu.workflow-result.v1
+      executor_kind: workflow
+      adapter: workflow:capabilities-inventory
+      capability_version: 1
+      replay_class: owner-confirmation-required
+      approval_policy: owner-confirmation
+      summary: "刷新 Mini 能力盘点和审计记录；只执行固定命令，必须由所有者确认。"
+    - id: workflow:sync-skill-surfaces
+      name: 同步 Skill 运行面
+      kind: workflow
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: confirm
+      side_effect: local-write
+      queueable: false
+      runtime_requires: [project-workflows]
+      command: "wu 调用能力 workflow:sync-skill-surfaces --confirm"
+      data_location: mini-managed-skill-surfaces
+      input_schema: {type: object, additionalProperties: false}
+      output_schema: two-head-wu.workflow-result.v1
+      executor_kind: workflow
+      adapter: workflow:sync-skill-surfaces
+      capability_version: 1
+      replay_class: owner-confirmation-required
+      approval_policy: owner-confirmation
+      summary: "重新生成 Mini 的 Claude Code 与 OpenClaw Skill 运行面；必须由所有者确认。"
+    - id: workflow:refresh-topology
+      name: 刷新系统拓扑
+      kind: workflow
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: confirm
+      side_effect: local-write
+      queueable: false
+      runtime_requires: [project-workflows]
+      command: "wu 调用能力 workflow:refresh-topology --confirm"
+      data_location: mini-managed-topology
+      input_schema: {type: object, additionalProperties: false}
+      output_schema: two-head-wu.workflow-result.v1
+      executor_kind: workflow
+      adapter: workflow:refresh-topology
+      capability_version: 1
+      replay_class: owner-confirmation-required
+      approval_policy: owner-confirmation
+      summary: "刷新 Mini 项目与声明机器的受管拓扑快照；必须由所有者确认。"
+    - id: workflow:spec-kit-health
+      name: Spec Kit 健康检查
+      kind: workflow
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: queue
+      side_effect: read-only
+      queueable: false
+      runtime_requires: [project-workflows]
+      command: "wu 调用能力 workflow:spec-kit-health"
+      data_location: mini-two-head-wu-source
+      input_schema: {type: object, additionalProperties: false}
+      output_schema: two-head-wu.workflow-result.v1
+      executor_kind: workflow
+      adapter: workflow:spec-kit-health
+      capability_version: 1
+      replay_class: safe-read
+      approval_policy: auto
+      summary: "检查 Mini 项目内 Spec Kit 版本、清单与作用域边界。"
+    - id: workflow:server-operations-health
+      name: 服务器能力健康检查
+      kind: workflow
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: queue
+      side_effect: read-only
+      queueable: false
+      runtime_requires: [project-workflows]
+      command: "wu 调用能力 workflow:server-operations-health"
+      data_location: mini-two-head-wu-source
+      input_schema: {type: object, additionalProperties: false}
+      output_schema: two-head-wu.workflow-result.v1
+      executor_kind: workflow
+      adapter: workflow:server-operations-health
+      capability_version: 1
+      replay_class: safe-read
+      approval_policy: auto
+      summary: "离线检查脱敏服务器资源和两站静态发布边界，不进行真实发布。"
+    - id: workflow:remote-work-bootstrap-health
+      name: 多端节点引导健康检查
+      kind: workflow
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: queue
+      side_effect: read-only
+      queueable: false
+      runtime_requires: [project-workflows]
+      command: "wu 调用能力 workflow:remote-work-bootstrap-health"
+      data_location: mini-two-head-wu-source
+      input_schema: {type: object, additionalProperties: false}
+      output_schema: two-head-wu.workflow-result.v1
+      executor_kind: workflow
+      adapter: workflow:remote-work-bootstrap-health
+      capability_version: 1
+      replay_class: safe-read
+      approval_policy: auto
+      summary: "离线检查阿里云固定运行区、受保护 SSH 引用和两站保护条件；不读取密钥。"
+    - id: workflow:remote-work-health
+      name: 多端系统健康检查
+      kind: workflow
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: queue
+      side_effect: read-only
+      queueable: true
+      runtime_requires: [runtime-workflows]
+      command: "wu 调用能力 workflow:remote-work-health"
+      data_location: mini-worker-runtime
+      input_schema: {type: object, additionalProperties: false}
+      output_schema: two-head-wu.workflow-result.v1
+      executor_kind: workflow
+      adapter: workflow:remote-work-health
+      capability_version: 1
+      replay_class: safe-read
+      approval_policy: auto
+      summary: "检查 Mini 内置盘 worker 运行件中的个人版客户端、模块策略、所有者自动身份池、HTTPS 端点和构建输入。"
+    - id: memory:notebook
+      name: 两头乌小本本
+      kind: memory
+      location: mac-mini
+      exposure: callable
+      status: active
+      invocation_policy: queue
+      side_effect: local-write
+      queueable: true
+      runtime_requires: [protected-owner-adapter]
+      command: "wu 调用能力 memory:notebook --input-json '<JSON>'"
+      data_location: mini-owner-notebook-via-exact-adapter
+      input_schema:
+        type: object
+        required: [action]
+        properties:
+          action: {type: string, enum: [recall, remember, correct, forget]}
+          query: {type: string, maxLength: 500}
+          text: {type: string, maxLength: 2000}
+          category: {type: string, enum: [identity, preference, project, decision, fact]}
+          project_id: {type: string, pattern: "^[a-z0-9][a-z0-9-]{0,39}$"}
+          record_id: {type: string, pattern: "^pm-[0-9]{8}T[0-9]{6}-[a-f0-9]{8}$"}
+          max_results: {type: integer, minimum: 1, maximum: 5}
+        additionalProperties: false
+      output_schema: two-head-wu.personal-memory.owner-air.v1
+      executor_kind: tool
+      adapter: memory:notebook
+      capability_version: 1
+      replay_class: idempotent-write
+      approval_policy: auto
+      summary: "仅登记的谷梓阳 Air 可通过精确 action 使用小本本；不开放私人路径、配置、备份或通用文件读取。"
+    - id: workflow:publish-site
+      name: 固定网站发布（owner step-up）
+      kind: workflow
+      location: mac-mini
+      exposure: callable
+      status: disabled
+      invocation_policy: confirm
+      side_effect: external-write
+      queueable: true
+      runtime_requires: [protected-owner-adapter, site-publisher]
+      command: "wu 调用能力 workflow:publish-site --input-json '<JSON>' --confirm"
+      data_location: registered-static-sites-only
+      input_schema:
+        type: object
+        required: [project_id, site_id, artifact_sha256]
+        properties:
+          project_id: {type: string, pattern: "^[a-z][a-z0-9-]{0,62}$"}
+          site_id: {type: string, enum: [private-site, public-site]}
+          artifact_sha256: {type: string, pattern: "^[a-f0-9]{64}$"}
+        additionalProperties: false
+      output_schema: two-head-wu.server-operations.publish.v1
+      executor_kind: workflow
+      adapter: workflow:publish-site
+      capability_version: 1
+      replay_class: owner-confirmation-required
+      approval_policy: owner-confirmation
+      summary: "预留的固定站点发布能力；接通精确适配器前保持 disabled，启用后必须验证 owner 密码解锁的一次性动作签名。"
+    - id: mcp:private-memory
+      name: 私人记忆（仅元数据）
+      kind: memory
+      location: mac-mini
+      exposure: metadata-only
+      status: active
+      invocation_policy: unavailable
+      side_effect: metadata-only
+      queueable: false
+      runtime_requires: []
+      data_location: mac-mini-only
+      summary: "私人记忆正文只留在 Mini；目前没有注册可供 Air 调用的具体 MCP 工具。"
+
+capability_inventory:
+  visibility: owner-air
+  source_device: mac-mini
+  credentials: forbidden
+  default_air_mode: metadata-only
+  # portable 模块由 modules.entries 自动覆盖；这里只声明可通过隔离 Codex 项目任务使用的普通工作 Skill。
+  remote_task_skills:
+    - academic-slides
+    - agent-reach
+    - doc-to-markdown
+    - document-to-markdown
+    - evo-memory
+    - evomath-tao
+    - experiment-craft
+    - experiment-iterative-coder
+    - experiment-pipeline
+    - imagegen
+    - nano-banana
+    - openai-docs
+    - paper-planning
+    - paper-rebuttal
+    - paper-review
+    - research-ideation
+    - research-survey
+    - review-agent
+    - social-science-paper-writing
+    - speech
+    - structure-diagrammer
+  metadata_only_skills:
+    - agent-identity
+    - plugin-creator
+    - remote-work-bootstrap
+    - server-operations
+    - skill-creator
+    - skill-installer
+    - skills-dashboard
+    - system-cartographer
+    - two-head-wu
+  skill_categories:
+    academic-research:
+      - academic-slides
+      - evo-memory
+      - evomath-tao
+      - experiment-craft
+      - experiment-iterative-coder
+      - experiment-pipeline
+      - paper-navigator
+      - paper-planning
+      - paper-rebuttal
+      - paper-review
+      - paper-writing
+      - research-ideation
+      - research-survey
+      - social-science-paper-writing
+    documents-media:
+      - doc-to-markdown
+      - document-to-markdown
+      - imagegen
+      - nano-banana
+      - speech
+      - structure-diagrammer
+    internet-knowledge:
+      - agent-reach
+      - openai-docs
+    engineering-quality:
+      - review-agent
+    system-management:
+      - agent-identity
+      - plugin-creator
+      - remote-work
+      - remote-work-bootstrap
+      - server-operations
+      - skill-creator
+      - skill-installer
+      - skills-dashboard
+      - system-cartographer
+      - two-head-wu
+  agent_modes:
+    two-head-wu: remote-queue
+    evoscientist: unavailable
+  mcp_modes:
+    github: remote-queue
+    openai-developer-docs: remote-auto
+    computer-use: unavailable
+    node_repl: unavailable
+    openclaw-gateway: unavailable
+  runtime_modes:
+    codex: remote-queue
+    claude-code: metadata-only
+    openclaw: metadata-only
+  callable_via:
+    "workflow:sync-air": workflow:sync-air
+    "mcp:openai-developer-docs": mcp-tool:openai-docs
+    "resource:private-data-service": research-library:search
+    "resource:local-mac": tool:resource-catalog
+    "resource:edge-server": tool:resource-catalog
+    "resource:private-services": tool:resource-catalog
+    "resource:standby-node": tool:resource-catalog
+    "resource:private-site": tool:resource-catalog
+    "resource:public-site": tool:resource-catalog
+    "workflow:refresh-documentation": workflow:refresh-documentation
+    "workflow:verify-change": workflow:verify-change
+    "workflow:capabilities-inventory": workflow:capabilities-inventory
+    "workflow:sync-skill-surfaces": workflow:sync-skill-surfaces
+    "workflow:refresh-topology": workflow:refresh-topology
+    "workflow:spec-kit-health": workflow:spec-kit-health
+    "workflow:server-operations-health": workflow:server-operations-health
+    "workflow:remote-work-bootstrap-health": workflow:remote-work-bootstrap-health
+    "workflow:remote-work-health": workflow:remote-work-health
+
+runtime_compatibility:
+  protocol_min: 2
+  protocol_max: 2
+  unknown_runtime: incompatible
+  schema_fingerprint: required
+  isolated_smoke_before_advertise: required
+  fail_closed_for_remote_execution: true
+
+project_bridge:
+  modes: [review, workspace-write, full-project]
+  default_mode: workspace-write
+  maximum_delta_bytes: 8388608
+  maximum_delta_entries: 256
+  lease_seconds: 21600
+  conflict_policy: reject-and-report
+  credential_paths: forbidden
+
+interaction_companion:
+  automatic_terminal: enabled
+  pending_only: true
+  silence_is_approval: false
+  cli_fallback: required
+
+jobs:
+  states:
+    - queued
+    - leased
+    - running
+    - waiting_user
+    - uploading
+    - succeeded
+    - failed
+    - cancelled
+    - expired
+  default_identity: owner-auto
+  automatic_identity_members: [owner-primary, owner-secondary]
+  automatic_identity_channels: [remote-work, openclaw-weixin]
+  switch_boundary: new-task-or-message-only
+  default_sandbox: workspace-write
+  auto_apply_result: forbidden
+  arbitrary_shell: forbidden
+  maximum_capsule_bytes: 52428800
+  maximum_result_bytes: 52428800
+  result_retention_days: 14
+  maximum_automatic_attempts: 3
+  stale_lease_token_required: true
+  replay_after_privileged_approval: owner-confirmation-required
+
+artifacts:
+  maximum_file_bytes: 52428800
+  maximum_per_job: 10
+  maximum_total_per_job_bytes: 52428800
+  retention_days: 14
+  credential_shaped_files: forbidden
+  automatic_publication: forbidden
+  automatic_result_application: forbidden
+
+capsule:
+  excluded_names:
+    - .git
+    - .env
+    - .env.local
+    - auth.json
+    - node_modules
+    - __pycache__
+    - .venv
+    - vendor
+    - target
+  excluded_suffixes:
+    - .key
+    - .pem
+    - .p12
+    - .pfx
+  exclude_hidden_credential_patterns: true

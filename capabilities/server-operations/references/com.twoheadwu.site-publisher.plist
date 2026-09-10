@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.twoheadwu.site-publisher</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/ruby</string>
+    <string>/Library/Application Support/TwoHeadWu/site-publisher/bin/site-publisher-service</string>
+    <string>serve</string>
+  </array>
+  <key>UserName</key>
+  <string>thw-publisher</string>
+  <key>GroupName</key>
+  <string>two-head-wu-publisher</string>
+  <key>WorkingDirectory</key>
+  <string>/</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

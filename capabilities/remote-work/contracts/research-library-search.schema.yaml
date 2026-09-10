@@ -1,0 +1,51 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Two-Headed-Wu remote research-library search result
+type: object
+required: [schema, source_device, observed_at, provider, partial, query, results]
+properties:
+  schema: {const: two-head-wu.research-library.search.v1}
+  source_device: {const: mac-mini-worker}
+  observed_at: {type: string}
+  provider: {const: research-library.search.v1}
+  partial: {type: boolean}
+  query: {type: string, minLength: 1, maxLength: 2000}
+  results:
+    type: array
+    maxItems: 100
+    items:
+      type: object
+      required: [work_id, version_id, artifact_id, canonical_title, kind, sha256, locator_fragment]
+      properties:
+        work_id: {$ref: "#/$defs/uuid"}
+        version_id: {$ref: "#/$defs/uuid"}
+        artifact_id: {$ref: "#/$defs/uuid"}
+        canonical_title: {type: string}
+        kind: {type: string}
+        language: {type: [string, "null"]}
+        publication_date: {type: [string, "null"]}
+        version_kind: {type: string}
+        doi: {type: [string, "null"]}
+        role: {type: string}
+        sha256: {type: string, pattern: "^[a-f0-9]{64}$"}
+        mime: {type: string}
+        locator_fragment: {type: string, maxLength: 2000}
+        score: {type: number}
+        score_source: {type: string}
+        creators:
+          type: array
+          items: {$ref: "#/$defs/creator"}
+        available_artifacts:
+          type: array
+          items: {type: string}
+      additionalProperties: false
+additionalProperties: false
+$defs:
+  uuid: {type: string, format: uuid}
+  creator:
+    type: object
+    required: [name, role, ordinal]
+    properties:
+      name: {type: string}
+      role: {type: string}
+      ordinal: {type: integer, minimum: 0}
+    additionalProperties: false

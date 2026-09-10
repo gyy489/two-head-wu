@@ -1,0 +1,93 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://two-head-wu.local/contracts/capability-release-registry.schema.yaml"
+title: "Capability Release Registry"
+type: object
+additionalProperties: false
+required: [schema_version, updated_at, policy, releases]
+properties:
+  schema_version: { const: 1 }
+  updated_at: { type: string }
+  policy:
+    type: object
+    additionalProperties: false
+    required:
+      - immutable_digest_required
+      - manifest_identity_required
+      - smoke_tests_before_activation
+      - network_sources_allowed
+      - stable_prereleases_allowed
+    properties:
+      immutable_digest_required: { const: true }
+      manifest_identity_required: { const: true }
+      smoke_tests_before_activation: { const: true }
+      network_sources_allowed: { const: false }
+      stable_prereleases_allowed: { const: false }
+  releases:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required:
+        - capability
+        - version
+        - channel
+        - status
+        - source
+        - interfaces
+        - permission_digest
+        - smoke_tests
+      properties:
+        capability: { type: string, pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$" }
+        version:
+          type: string
+          pattern: "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$"
+        channel: { enum: [stable, beta, candidate] }
+        status: { enum: [available, deprecated, disabled] }
+        source:
+          type: object
+          additionalProperties: false
+          required: [kind, path, digest]
+          properties:
+            kind: { enum: [directory, git-tree] }
+            path: { type: string }
+            digest: { type: string, pattern: "^sha256:[0-9a-f]{64}$" }
+            revision: { type: string }
+            tree: { type: string }
+          allOf:
+            - if:
+                properties:
+                  kind: { const: git-tree }
+              then:
+                required: [revision, tree]
+        interfaces:
+          type: object
+          minProperties: 1
+          propertyNames:
+            pattern: "^[a-z0-9]+(?:[.-][a-z0-9]+)*$"
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required: [version, entrypoint]
+            properties:
+              version:
+                type: string
+                pattern: "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$"
+              entrypoint: { type: string, minLength: 1 }
+        resource_bindings:
+          type: object
+          propertyNames:
+            pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required: [environment, value_key]
+            properties:
+              environment: { type: string, pattern: "^TWO_HEAD_WU_[A-Z0-9_]+$" }
+              value_key: { type: string, pattern: "^[a-z][a-z0-9_]*$" }
+        permission_digest: { type: string, pattern: "^sha256:[0-9a-f]{64}$" }
+        smoke_tests:
+          type: array
+          items:
+            type: array
+            minItems: 1
+            items: { type: string }

@@ -1,0 +1,1043 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "date"
+require "fileutils"
+require "json"
+require "open3"
+require "pathname"
+require "rbconfig"
+require "set"
+require "shellwords"
+require "time"
+require "uri"
+require "yaml"
+
+require_relative "../lib/function_catalog"
+require_relative "../lib/skill_policy"
+
+class WuDocsError < StandardError; end
+
+class WuDocs
+  STATUS_START = "<!-- WU-DOCS:RUNTIME-STATUS:START -->"
+  STATUS_END = "<!-- WU-DOCS:RUNTIME-STATUS:END -->"
+  SOURCE_OWNERS = %w[system-package-manager runtime-native two-head-wu external-service vendored].freeze
+  RUNTIME_MODES = %w[
+    source project-generated source-and-generated source-and-external-state
+    source-and-external-service source-and-protected-service
+  ].freeze
+  LARGE_ARTIFACT_STATES = %w[none external-volume-required].freeze
+  EXPOSED_COMPATIBILITY = %w[native compatible].freeze
+
+  def initialize(arguments)
+    @arguments = arguments.dup
+    @root = Pathname.new(__dir__).join("../..").expand_path.cleanpath
+    @errors = []
+  end
+
+  def run
+    command = @arguments.shift || "help"
+    raise WuDocsError, "unknown arguments: #{@arguments.join(' ')}" unless @arguments.empty?
+
+    case command
+    when "update"
+      update
+    when "verify"
+      verify
+    when "help", "--help", "-h"
+      puts "Usage: wu-docs update|verify"
+      0
+    else
+      raise WuDocsError, "unknown command: #{command}"
+    end
+  rescue WuDocsError, TwoHeadWu::FunctionCatalog::Error, KeyError, Psych::Exception => error
+    warn "ERROR: #{error.message}"
+    2
+  end
+
+  private
+
+  def update
+    validate_package_contracts(require_generated: false)
+    validate_documentation_registry(require_generated: false)
+    fail_if_errors!
+    ensure_storage_roots unless mirrored_source?
+    write_if_changed("PROJECT_MAP.md", project_map)
+    write_if_changed("inventories/capability_documentation.md", capability_index)
+    write_if_changed("inventories/function_catalog.md", function_catalog.markdown)
+    write_if_changed("inventories/function_catalog.json", JSON.pretty_generate(function_catalog.manifest) + "\n")
+    write_if_changed("docs/capability_management.md", capability_management_with_status)
+    run_required([path("scripts/capabilities-manager").to_s, "audit-updates", "--write"])
+    unless mirrored_source?
+      run_required([
+        RbConfig.ruby,
+        path("skills/工具skills/system-cartographer/scripts/update_topology.rb").to_s,
+        "--root",
+        @root.to_s
+      ])
+    end
+    puts "documentation and topology refreshed"
+    0
+  end
+
+  def verify
+    return verify_mirrored_source if mirrored_source?
+
+    puts "== package documentation and installation contracts =="
+    validate_package_contracts(require_generated: true)
+    validate_documentation_registry(require_generated: true)
+    compare_managed("PROJECT_MAP.md", project_map)
+    compare_managed("inventories/capability_documentation.md", capability_index)
+    compare_managed("inventories/function_catalog.md", function_catalog.markdown)
+    compare_managed("inventories/function_catalog.json", JSON.pretty_generate(function_catalog.manifest) + "\n")
+    compare_managed("docs/capability_management.md", capability_management_with_status)
+
+    puts "== generated capability inventory =="
+    verify_capability_inventory
+
+    puts "== documentation links and active Skill catalog =="
+    validate_markdown_links
+    validate_active_skill_catalog
+    validate_change_documentation_coupling
+
+    puts "== external large-asset placement =="
+    validate_storage_placement
+
+    puts "== generated topology =="
+    validate_topology
+
+    puts "== managers and package tests =="
+    run_check(
+      [path("capabilities/spec-kit-governance/adapters/change-governance").to_s, "validate-all"],
+      "Change Capsule governance"
+    )
+    run_check([path("scripts/skills-manager").to_s, "doctor"], "skills-manager doctor")
+    run_check([path("scripts/capabilities-manager").to_s, "doctor", "--strict"], "capabilities-manager doctor --strict")
+    run_package_tests
+
+    puts "== worktree whitespace =="
+    run_check(["git", "diff", "--check"], "git diff --check")
+
+    if @errors.empty?
+      puts "change verification ok"
+      0
+    else
+      @errors.each { |message| warn "ERROR: #{message}" }
+      warn "change verification failed: #{@errors.length} error(s)"
+      2
+    end
+  end
+
+  def verify_mirrored_source
+    puts "== committed mirror package and generated-document contracts =="
+    validate_package_contracts(require_generated: true)
+    validate_documentation_registry(require_generated: true)
+    compare_managed("PROJECT_MAP.md", project_map)
+    compare_managed("inventories/capability_documentation.md", capability_index)
+    compare_managed("inventories/function_catalog.md", function_catalog.markdown)
+    compare_managed("inventories/function_catalog.json", JSON.pretty_generate(function_catalog.manifest) + "\n")
+    compare_managed("docs/capability_management.md", capability_management_with_status)
+    verify_capability_inventory
+
+    puts "== committed mirror documentation and registered Skill catalog =="
+    validate_markdown_links
+    validate_active_skill_catalog
+    validate_topology
+    validate_storage_placement
+
+    puts "== committed mirror deterministic checks =="
+    run_check(
+      [path("capabilities/spec-kit-governance/adapters/change-governance").to_s, "validate-all"],
+      "Change Capsule governance"
+    )
+    run_check(
+      [path("scripts/capabilities-manager").to_s, "sync-skills", "--isolated"],
+      "capabilities-manager isolated registry check"
+    )
+    run_check(
+      [RbConfig.ruby, path("capabilities/remote-work/tests/test_remote_work.rb").to_s],
+      "remote-work mirror unit contracts"
+    )
+    run_check(
+      [path("capabilities/remote-work/adapters/remote-work-admin").to_s, "health"],
+      "remote-work mirror policy health"
+    )
+    run_check(["git", "diff", "--check"], "git diff --check")
+
+    if @errors.empty?
+      puts "committed source mirror verification ok"
+      0
+    else
+      @errors.each { |message| warn "ERROR: #{message}" }
+      warn "committed source mirror verification failed: #{@errors.length} error(s)"
+      2
+    end
+  end
+
+  def package_records
+    registry = load_yaml("catalog/packages_registry.yaml")
+    Array(registry.fetch("packages")).map do |entry|
+      manifest = load_yaml(entry.fetch("manifest"))
+      [entry, manifest]
+    end
+  end
+
+  def validate_package_contracts(require_generated:)
+    required = %w[
+      schema_version id version status summary documentation installation interfaces
+      components compatibility permissions dependencies recovery tests
+    ]
+    package_records.each do |entry, manifest|
+      id = entry.fetch("id")
+      required.each { |key| add_error("#{id}: manifest missing #{key}") unless manifest.key?(key) }
+      next unless manifest["documentation"].is_a?(Hash) && manifest["installation"].is_a?(Hash)
+
+      add_error("#{id}: package ID does not match manifest") unless manifest["id"] == id
+      add_error("#{id}: package version does not match registry") unless manifest["version"] == entry["version"]
+      add_error("#{id}: package status does not match registry") unless manifest["status"] == entry["status"]
+      add_error("#{id}: package summary differs between registry and manifest") unless manifest["summary"] == entry["summary"]
+
+      docs = manifest.fetch("documentation")
+      %w[overview skill_docs references generated].each do |key|
+        add_error("#{id}: documentation missing #{key}") unless docs.key?(key)
+      end
+      doc_paths = [docs["overview"], *Array(docs["skill_docs"]), *Array(docs["references"])]
+      doc_paths.concat(Array(docs["generated"])) if require_generated
+      doc_paths.compact.each do |relative|
+        add_error("#{id}: documentation path missing: #{relative}") unless path(relative).file?
+      end
+      add_error("#{id}: overview must be Markdown") unless docs["overview"].to_s.end_with?(".md")
+
+      installation = manifest.fetch("installation")
+      %w[source_owner runtime_mode managed_copy large_artifacts].each do |key|
+        add_error("#{id}: installation missing #{key}") unless installation.key?(key)
+      end
+      unless SOURCE_OWNERS.include?(installation["source_owner"])
+        add_error("#{id}: invalid installation source_owner")
+      end
+      unless RUNTIME_MODES.include?(installation["runtime_mode"])
+        add_error("#{id}: invalid installation runtime_mode")
+      end
+      unless [true, false].include?(installation["managed_copy"])
+        add_error("#{id}: managed_copy must be boolean")
+      end
+      unless LARGE_ARTIFACT_STATES.include?(installation["large_artifacts"])
+        add_error("#{id}: invalid large_artifacts policy")
+      end
+    end
+  end
+
+  def capability_index
+    tick = 96.chr
+    revision = load_yaml("catalog/packages_registry.yaml").fetch("updated_at").to_s
+    lines = [
+      "# Capability Documentation Index",
+      "",
+      "由 #{tick}wu 更新说明#{tick} 根据 #{tick}catalog/packages_registry.yaml#{tick} 和各能力包 manifest 生成。",
+      "注册表日期：#{tick}#{revision}#{tick}。不要手工编辑本文件。",
+      "",
+      "| Capability | 状态 | 功能 | 主说明 | 下层说明 | 安装归属 |",
+      "|---|---|---|---|---|---|"
+    ]
+    package_records.each do |entry, manifest|
+      docs = manifest.fetch("documentation")
+      deeper = [*Array(docs["skill_docs"]), *Array(docs["references"]), *Array(docs["generated"])]
+      deeper_links = deeper.map { |relative| markdown_link(Pathname.new(relative).basename.to_s, relative) }
+      deeper_text = deeper_links.empty? ? "—" : deeper_links.join("<br>")
+      install = manifest.fetch("installation")
+      copy = install.fetch("managed_copy") ? "两头乌受管副本" : "不复制"
+      ownership = [
+        code(install.fetch("source_owner")),
+        code(install.fetch("runtime_mode")),
+        copy,
+        code(install.fetch("large_artifacts"))
+      ].join("<br>")
+      lines << [
+        code(entry.fetch("id")),
+        code(entry.fetch("status")),
+        escape_table(entry.fetch("summary")),
+        markdown_link("README/主说明", docs.fetch("overview")),
+        deeper_text,
+        ownership
+      ].then { |cells| "| #{cells.join(' | ')} |" }
+    end
+    lines.concat([
+      "",
+      "## 规则",
+      "",
+      "- 系统包管理器或运行时原生安装仍由原工具维护；两头乌只登记，不复制二进制。",
+      "- 两头乌源码、受管生成面和受保护服务必须在 manifest 中声明各自的运行模式。",
+      "- 标记为 #{code('external-volume-required')} 的大型模型、缓存、环境和生成物进入 #{code('var/large-assets/')}。",
+      "- 修改能力后先运行 #{code('wu 更新说明')}，再运行 #{code('wu 验收修改')}。",
+      ""
+    ])
+    lines.join("\n")
+  end
+
+  def validate_documentation_registry(require_generated:)
+    registry = documentation_registry
+    add_error("documentation registry version must be 1") unless registry["version"] == 1
+    add_error("documentation registry updated_at is missing") if registry["updated_at"].to_s.empty?
+    required_policy = %w[public_entry ai_entry project_map module_entry_name generated_outputs]
+    policy = registry["policy"]
+    unless policy.is_a?(Hash)
+      add_error("documentation registry policy must be a mapping")
+      return
+    end
+    required_policy.each do |key|
+      add_error("documentation registry policy missing #{key}") unless policy.key?(key)
+    end
+
+    groups = Array(registry["groups"])
+    group_ids = unique_record_values(groups, "id", "documentation group")
+    groups.each do |group|
+      %w[id title purpose].each do |key|
+        add_error("documentation group #{group['id'] || '(unknown)'} missing #{key}") unless group.key?(key)
+      end
+      add_error("documentation group has invalid id: #{group['id']}") unless group["id"].to_s.match?(/\A[a-z0-9]+(?:-[a-z0-9]+)*\z/)
+    end
+
+    documents = Array(registry["documents"])
+    unique_record_values(documents, "id", "documentation record")
+    unique_record_values(documents, "path", "documentation path")
+    document_paths = documents.map { |item| item["path"] }.compact.to_set
+    %w[public_entry ai_entry project_map].each do |key|
+      unless document_paths.include?(policy[key])
+        add_error("documentation registry policy #{key} is not a registered document: #{policy[key]}")
+      end
+    end
+    allowed_kinds = %w[introduction navigation policy architecture module-entry specification decision report inventory runtime-guide historical]
+    allowed_authorities = %w[canonical generated contextual historical]
+    documents.each do |document|
+      id = document["id"] || "(unknown)"
+      %w[id path kind owner authority generated].each do |key|
+        add_error("documentation record #{id} missing #{key}") unless document.key?(key)
+      end
+      relative = document["path"]
+      next unless relative
+      add_error("registered documentation path is not project-relative: #{relative}") unless safe_relative_path?(relative)
+      add_error("registered documentation must be Markdown: #{relative}") unless relative.end_with?(".md")
+      add_error("documentation record #{id} has invalid kind: #{document['kind']}") unless allowed_kinds.include?(document["kind"])
+      add_error("documentation record #{id} has invalid authority: #{document['authority']}") unless allowed_authorities.include?(document["authority"])
+      unless [true, false].include?(document["generated"])
+        add_error("documentation record #{id} generated must be boolean")
+      end
+      if document["generated"] != (document["authority"] == "generated")
+        add_error("documentation record #{id} generated flag and authority disagree")
+      end
+      next if document["generated"] && !require_generated
+
+      source = path(relative)
+      add_error("registered documentation missing: #{relative}") unless source.file?
+      if source.file? && document["authority"] == "historical"
+        head = source.read(encoding: "UTF-8").lines.first(20).join
+        unless head.match?(/历史|快照|historical|snapshot|not (?:a )?current/i)
+          add_error("historical documentation lacks an explicit time-scope warning: #{relative}")
+        end
+      end
+    end
+
+    modules = Array(registry["modules"])
+    module_ids = unique_record_values(modules, "id", "project module")
+    known_ids = (module_ids + package_records.map { |entry, _manifest| entry.fetch("id") }).to_set
+    allowed_types = %w[control-plane subsystem integration data-boundary runtime-state governance]
+    allowed_statuses = %w[active compatibility planned historical]
+    modules.each do |mod|
+      id = mod["id"] || "(unknown)"
+      %w[id group type status root summary overview source_records dependencies interfaces verification].each do |key|
+        add_error("project module #{id} missing #{key}") unless mod.key?(key)
+      end
+      add_error("project module has invalid id: #{id}") unless id.to_s.match?(/\A[a-z0-9]+(?:-[a-z0-9]+)*\z/)
+      add_error("project module #{id} uses unknown group #{mod['group']}") unless group_ids.include?(mod["group"])
+      add_error("project module #{id} has invalid type: #{mod['type']}") unless allowed_types.include?(mod["type"])
+      add_error("project module #{id} has invalid status: #{mod['status']}") unless allowed_statuses.include?(mod["status"])
+      add_error("project module #{id} summary is empty") if mod["summary"].to_s.strip.empty?
+      add_error("project module root is not project-relative: #{id}: #{mod['root']}") unless safe_relative_path?(mod["root"])
+      add_error("project module root missing: #{id}: #{mod['root']}") unless safe_relative_path?(mod["root"]) && path(mod["root"]).directory?
+      add_error("project module overview missing: #{id}: #{mod['overview']}") unless safe_relative_path?(mod["overview"]) && path(mod["overview"]).file?
+      if mod["overview"] && !document_paths.include?(mod["overview"])
+        add_error("project module overview is not registered as documentation: #{id}: #{mod['overview']}")
+      end
+      if mod["status"] == "compatibility" && safe_relative_path?(mod["overview"]) && path(mod["overview"]).file?
+        head = path(mod["overview"]).read(encoding: "UTF-8").lines.first(30).join
+        unless head.match?(/compatibility|兼容|legacy|遗留/i)
+          add_error("compatibility module overview lacks a migration warning: #{id}: #{mod['overview']}")
+        end
+      end
+      Array(mod["source_records"]).each do |relative|
+        add_error("project module source record is not project-relative: #{id}: #{relative}") unless safe_relative_path?(relative)
+        add_error("project module source record missing: #{id}: #{relative}") unless safe_relative_path?(relative) && path(relative).exist?
+      end
+      %w[source_records dependencies interfaces verification].each do |key|
+        add_error("project module #{id} #{key} must be an array") unless mod[key].is_a?(Array)
+      end
+      Array(mod["dependencies"]).each do |dependency|
+        add_error("project module dependency is unknown: #{id} -> #{dependency}") unless known_ids.include?(dependency)
+      end
+    end
+
+    Array(policy["generated_outputs"]).each do |relative|
+      add_error("generated documentation path is not project-relative: #{relative}") unless safe_relative_path?(relative)
+      next unless require_generated
+
+      add_error("registered generated documentation missing: #{relative}") unless path(relative).file?
+    end
+  end
+
+  def project_map
+    registry = documentation_registry
+    revision = registry.fetch("updated_at").to_s
+    groups = Array(registry.fetch("groups"))
+    modules = Array(registry.fetch("modules"))
+    lines = [
+      "# Two-Headed-Wu Project Map",
+      "",
+      "> 由 `wu 更新说明` 根据 [文档导航注册表](catalog/documentation_registry.yaml)、",
+      "> [能力包注册表](catalog/packages_registry.yaml)和 Capability manifests 生成。登记日期：`#{revision}`。",
+      "> 本文件是导航视图，不是权限、秘密或运行时状态的事实源；不要手工编辑。",
+      "> AI 引用优先级：`canonical` / `generated` 表示当前规范或事实视图；`contextual` / `historical` 只作背景，不得覆盖前两者。",
+      "",
+      "## 阅读顺序",
+      "",
+      "1. [项目介绍](README.md)：了解两头乌的目标、边界和当前能力。",
+      "2. [Agent 入口](AGENTS.md)：了解项目内 AI 的工作顺序和硬性边界。",
+      "3. [项目宪法](.specify/memory/constitution.md)：确认不可默认违反的原则。",
+      "4. 先从 Capability Packages 按功能目标选择稳定接口；只在组装或维修时下钻组件。",
+      "5. 修改解析、注册、权限、运行状态或生成器时，再进入注册子系统。",
+      "6. 大型或跨能力修改从 [Change Capsule 规范](specs/004-ai-project-change-governance/spec.md) 开始。",
+      "",
+      "## 功能导航模型",
+      "",
+      "```text",
+      "Project / Agent -> Binding / Profile / allowlist",
+      "                         |",
+      "                         v",
+      "Capability Package -> Stable Interface -> selected on-demand component",
+      "   version / permissions / dependencies      Skill / MCP / Agent / Adapter / Workflow / Service / Script",
+      "   tests / recovery",
+      "```",
+      "",
+      "Capability 是完整功能的管理与交付单位，组件是可复用的实现与指令单位。",
+      "发现能力只返回紧凑契约；被选中的 Skill 说明、MCP schema 或 Workflow 参数才按需加载。",
+      "安装、发现或加载文档都不自动授权执行、秘密访问或外部写入。",
+      "",
+      "## Capability Packages",
+      "",
+      "能力包从 Package Registry 和各自 Manifest 合并，不在项目地图注册表中重复登记。",
+      "`Manifest 组件` 只统计 `components` 中的声明；MCP、Service 和 CLI 等对外面以接口类型显示。",
+      "",
+      "| 能力包 | 状态 / 版本 | 功能 | 主说明 | 公开接口 | Manifest 组件 | 依赖 | 验证 |",
+      "|---|---|---|---|---|---|---|---|"
+    ]
+    package_records.each do |entry, manifest|
+      interfaces = Array(manifest["interfaces"]).map do |interface|
+        "#{code(interface.fetch('id'))} · #{code(interface.fetch('type'))}<br>#{map_path_or_code(interface.fetch('entrypoint'))}"
+      end
+      component_labels = {
+        "skills" => "Skill",
+        "agents" => "Agent",
+        "adapters" => "Adapter",
+        "workflows" => "Workflow"
+      }
+      components = component_labels.map do |key, label|
+        count = Array(manifest.fetch("components", {})[key]).length
+        count.positive? ? "#{code(label)} × #{count}" : nil
+      end.compact
+      dependencies = Array(manifest["dependencies"]).map { |item| entity_link(item.fetch("id")) }
+      tests = Array(manifest["tests"]).map { |item| code(item) }
+      lines << [
+        code(entry.fetch("id")),
+        "#{code(entry.fetch('status'))}<br>#{code(entry.fetch('version'))}",
+        escape_table(entry.fetch("summary")),
+        map_link("README/主说明", manifest.dig("documentation", "overview")),
+        interfaces.empty? ? "—" : interfaces.join("<br>"),
+        components.empty? ? "—" : components.join("<br>"),
+        dependencies.empty? ? "—" : dependencies.join("<br>"),
+        tests.empty? ? "—" : tests.join("<br>")
+      ].then { |cells| "| #{cells.join(' | ')} |" }
+    end
+
+    lines.concat([
+      "",
+      "## 新功能开发入口",
+      "",
+      "1. 用 `wu search` / `wu resolve` 查找已有 Capability，优先复用或扩展。",
+      "2. 新建完整功能时，以 `capability.yaml` 声明稳定接口、组件、依赖、权限、测试和回滚。",
+      "3. 复用组件时引用单一权威源或声明能力依赖，不复制 Skill、MCP 或 Adapter 源码。",
+      "4. 项目通过 Binding 选择版本、运行时和 Interface；调用使用 `Capability ID + Interface ID`。",
+      "5. 完成前验证契约、最小功能、权限边界、兼容性和回滚。",
+      "",
+      "纯指令 Skill 或一次性脚本可留在组件层；当它们形成可复用、可部署或有独立权限的完整功能时再建包。",
+      "",
+      "## 模块树",
+      ""
+    ])
+
+    groups.each do |group|
+      lines << "- **#{group.fetch('title')}** — #{group.fetch('purpose')}"
+      modules.select { |mod| mod.fetch("group") == group.fetch("id") }.each do |mod|
+        lines << "  - [#{mod.fetch('id')}](#{mod.fetch('overview')}) — #{mod.fetch('summary')}"
+      end
+    end
+
+    lines.concat([
+      "",
+      "## 注册子系统",
+      "",
+      "这些是解析、索引、运行状态和工程治理的内部维护面，不是项目功能选择的第一层。",
+      "",
+      "| 模块 | 类型 / 状态 | 职责 | 根目录与主说明 | 依赖 | 接口 | 验证 |",
+      "|---|---|---|---|---|---|---|"
+    ])
+    modules.each do |mod|
+      roots = [code(mod.fetch("root")), map_link("主说明", mod.fetch("overview"))].join("<br>")
+      dependencies = list_or_dash(Array(mod["dependencies"])) { |item| entity_link(item) }
+      interfaces = list_or_dash(Array(mod["interfaces"])) { |item| map_path_or_code(item) }
+      verification = list_or_dash(Array(mod["verification"])) { |item| code(item) }
+      lines << "| #{code(mod.fetch('id'))} | #{code(mod.fetch('type'))}<br>#{code(mod.fetch('status'))} | #{escape_table(mod.fetch('summary'))} | #{roots} | #{dependencies} | #{interfaces} | #{verification} |"
+    end
+
+    lines.concat([
+      "",
+      "## 组件层按需导航",
+      "",
+      "- [Skills 模块入口](skills/README.md)：职责、结构、来源层和运行面。",
+      "- [Skills 管理规范](skills/docs/skills_management.md)：引入、审计、Release、Profile、加载、升级和退役。",
+      "- [Skills 功能清单](skills/inventories/skills_catalog.md)：每个 Skill 的摘要与 canonical `SKILL.md`。",
+      "- [MCP 发现与归属](catalog/mcp_registry.yaml)：所属 Capability/provider、状态和授权边界。",
+      "- [Agents 模块入口](agents/README.md)：身份、运行时选择和允许的能力集。",
+      "- [Workflows 模块入口](workflows/README.md)：工作流说明、Catalog 执行登记和审批策略。",
+      "- [统一功能清单](inventories/function_catalog.md)：全部 Skills、能力包、Agents、MCP、工作流、运行时与资源。",
+      "- [当前系统拓扑](skills/outputs/system-cartographer/topology/system-map.md)：逻辑与物理关系、错误和警告。",
+      "",
+      "## 文档与文件治理",
+      "",
+      "- [项目导航与文档治理](docs/documentation_governance.md)：文档层级、原子模块定义、事实源和更新规则。",
+      "- [根目录政策](docs/directory_policy.md)：顶层目录的唯一归属、生命周期和迁移门槛。",
+      "- [Git 变更门禁](docs/git_change_gates.md)：pre-commit、pre-push 和显式更新边界。",
+      "- [开发记录](development/README.md)：ADR、报告和过程笔记的归属。",
+      "- [统一功能清单](inventories/function_catalog.md)：全部 Skills、能力包、Agents、MCP、工作流、运行时与资源。",
+      "",
+      "文件树本身不授予权限。新增顶层目录需要目录政策或 ADR；新增原子模块需要稳定 ID、",
+      "主说明、事实记录、依赖、接口和验证命令。生成文件必须通过来源刷新，不能手工修补。",
+      "",
+      "## 变更闭环",
+      "",
+      "```text",
+      "PROJECT_MAP -> Spec / Plan / change.yaml -> bounded implementation",
+      "           -> wu 更新说明 -> wu 验收修改 -> fresh-context review -> atomic commit",
+      "```",
+      "",
+      "- 超过 10 个文件：需要 Spec、Plan 和 Change Capsule。",
+      "- 跨两个 Capability：需要显式依赖和实施顺序。",
+      "- 单个暂存提交超过 800 行有效变化：必须拆分。",
+      "- 一个 worktree 只允许一个 `in-progress` 或 `review` Capsule。",
+      "- 暂存路径超出 `writable_paths` 或进入 `forbidden_paths`：门禁失败。",
+      "- 文档、Catalog、注册表或运行面变化：运行 `wu 更新说明`。",
+      "- 完成前：运行 Capsule 验收命令和 `wu 验收修改`。",
+      "",
+      "常用入口：",
+      "",
+      "```bash",
+      "core/bin/wu 变更检查 status",
+      "core/bin/wu 变更检查 validate --change specs/<id>/change.yaml",
+      "core/bin/wu 变更检查 gate --scope worktree",
+      "core/bin/wu 更新说明",
+      "core/bin/wu 验收修改",
+      "```",
+      "",
+      "## 注册文档索引",
+      "",
+      "| 文档 | 类型 | 归属 | 权威性 | 生成 |",
+      "|---|---|---|---|---|"
+    ])
+    Array(registry.fetch("documents")).each do |document|
+      lines << "| #{map_link(document.fetch('id'), document.fetch('path'))} | #{code(document.fetch('kind'))} | #{code(document.fetch('owner'))} | #{code(document.fetch('authority'))} | #{document.fetch('generated') ? '是' : '否'} |"
+    end
+    lines << ""
+    lines.join("\n")
+  end
+
+  def capability_management_with_status
+    document_path = path("docs/capability_management.md")
+    text = document_path.read(encoding: "UTF-8")
+    replacement = runtime_status_block
+    pattern = /#{Regexp.escape(STATUS_START)}.*?#{Regexp.escape(STATUS_END)}/m
+    raise WuDocsError, "runtime status markers are missing from docs/capability_management.md" unless text.match?(pattern)
+
+    text.sub(pattern, replacement)
+  end
+
+  def runtime_status_block
+    tick = 96.chr
+    runtimes = load_yaml("registries/runtimes_registry.yaml").fetch("runtimes")
+    skill_policy = TwoHeadWu::SkillPolicy.new(@root)
+    skills = load_yaml("skills/registries/skills_registry.yaml").fetch("skills").to_h { |item| [item.fetch("name"), item] }
+    labels = {
+      "codex" => "已安装、可运行",
+      "claude-code" => "VS Code 版已安装",
+      "openclaw" => "已安装、Gateway 运行中"
+    }
+    lines = [
+      STATUS_START,
+      "| 运行时 | 当前状态 | Skill 运行面 | 当前数量 |",
+      "|---|---|---|---:|"
+    ]
+    runtimes.each do |runtime|
+      runtime_id = runtime.fetch("id")
+      desired = skill_policy.global_hot_skills(runtime_id)
+      surface = runtime.dig("skill_surface", "managed_path")
+      actual = desired.count do |name|
+        if mirrored_source?
+          skills[name]&.fetch("status", nil) == "active"
+        elsif runtime.dig("skill_surface", "mode") == "direct"
+          skill = skills[name]
+          skill && path(skill.fetch("path")).join(skill.fetch("entrypoint", "SKILL.md")).file?
+        else
+          path(surface).join(name, "SKILL.md").file?
+        end
+      end
+      label = labels.fetch(runtime_id, runtime.fetch("status"))
+      lines << "| #{runtime.fetch('name')} | #{label} | #{tick}#{surface}#{tick} | #{actual} / #{desired.length} |"
+    end
+    lines << STATUS_END
+    lines.join("\n")
+  end
+
+  def ensure_storage_roots
+    policy = load_yaml("catalog/policies/storage-placement.yaml")
+    roots = [policy.dig("policy", "active_external_root")]
+    roots.concat(Array(policy["storage_classes"]).map { |item| item.fetch("root") })
+    roots.concat(Array(policy["runtime_bindings"]).map { |item| item.fetch("target") })
+    roots.compact.each { |relative| FileUtils.mkdir_p(path(relative)) }
+  end
+
+  def validate_storage_placement
+    if mirrored_source?
+      puts "managed source mirror: canonical external-volume placement is preserved by the tracked policy"
+      return
+    end
+    policy = load_yaml("catalog/policies/storage-placement.yaml")
+    base_relative = policy.dig("policy", "active_external_root")
+    add_error("storage policy has no active external root") unless base_relative
+    return unless base_relative
+
+    base = path(base_relative)
+    add_error("project is not mounted below /Volumes: #{@root}") unless @root.to_s.start_with?("/Volumes/")
+    add_error("large-asset root is not a directory: #{base_relative}") unless base.directory?
+
+    root_parts = @root.each_filename.to_a
+    volume_root = Pathname.new(File::SEPARATOR).join(*root_parts.first(2))
+    stdout, _stderr, status = Open3.capture3("diskutil", "info", volume_root.to_s)
+    if !status.success?
+      add_error("cannot verify APFS placement with diskutil")
+    elsif !stdout.match?(/File System Personality:\s+APFS/)
+      add_error("project volume is not APFS")
+    end
+
+    base_prefix = "#{base.cleanpath}#{File::SEPARATOR}"
+    Array(policy["storage_classes"]).each do |item|
+      relative = item.fetch("root")
+      candidate = path(relative)
+      unless candidate.to_s.start_with?(base_prefix)
+        add_error("storage class escapes large-asset root: #{item.fetch('id')}")
+      end
+      add_error("storage class directory missing: #{relative}") unless candidate.directory?
+    end
+    Array(policy["runtime_bindings"]).each do |item|
+      relative = item.fetch("target")
+      target = path(relative)
+      unless target.to_s.start_with?(base_prefix)
+        add_error("runtime binding escapes large-asset root: #{item.fetch('id')}")
+      end
+      add_error("runtime binding target missing: #{relative}") unless target.directory?
+      next unless item.fetch("status") == "active-verified"
+
+      consumer = Pathname.new(item.fetch("consumer_path")).expand_path
+      add_error("runtime binding is not a symlink: #{item.fetch('id')}") unless consumer.symlink?
+      begin
+        add_error("runtime binding target drift: #{item.fetch('id')}") unless consumer.realpath == target.realpath
+      rescue Errno::ENOENT
+        add_error("runtime binding is broken: #{item.fetch('id')}")
+      end
+      unless item.fetch("secret_material_migrated") == false
+        add_error("runtime binding must not migrate secret material: #{item.fetch('id')}")
+      end
+    end
+    unless policy.dig("policy", "automatic_destructive_migration") == "forbidden"
+      add_error("automatic destructive migration must stay forbidden")
+    end
+    unless policy.dig("migration", "delete_old_copy_automatically") == false
+      add_error("old large-asset copies must not be deleted automatically")
+    end
+  rescue Errno::ENOENT
+    add_error("diskutil is unavailable; cannot verify external APFS placement")
+  end
+
+  def verify_capability_inventory
+    current, stderr, status = Open3.capture3(
+      path("scripts/capabilities-manager").to_s,
+      "audit-updates",
+      chdir: @root.to_s
+    )
+    unless status.success?
+      add_error("cannot generate current capability inventory: #{stderr.strip}")
+      return
+    end
+    saved_path = path("inventories/capabilities_inventory.md")
+    unless saved_path.file?
+      add_error("managed capability inventory is missing")
+      return
+    end
+    unless normalize_inventory(saved_path.read(encoding: "UTF-8")) == normalize_inventory(current)
+      add_error("capability inventory is stale; run wu 更新说明")
+    end
+  end
+
+  def normalize_inventory(text)
+    text.sub(/Generated: .+/, "Generated: <normalized>")
+  end
+
+  def validate_active_skill_catalog
+    registry = load_yaml("skills/registries/skills_registry.yaml")
+    active = Array(registry["skills"]).select { |item| item["status"] == "active" }
+    catalog_path = path("skills/inventories/skills_catalog.md")
+    unless catalog_path.file?
+      add_error("active Skill documentation catalog is missing")
+      return
+    end
+    catalog = catalog_path.read(encoding: "UTF-8")
+    tick = 96.chr
+    active.each do |skill|
+      name = skill.fetch("name")
+      skill_doc = path(skill.fetch("path")).join(skill.fetch("entrypoint", "SKILL.md"))
+      add_error("active Skill entrypoint missing: #{name}") unless mirrored_source? || skill_doc.file?
+      add_error("active Skill missing from skills_catalog.md: #{name}") unless catalog.include?("| #{tick}#{name}#{tick} |")
+      canonical_link = skill_doc.relative_path_from(catalog_path.dirname).to_s
+      unless catalog.include?("[Skill 说明](#{canonical_link})")
+        add_error("active Skill catalog does not use canonical registry path: #{name}")
+      end
+    end
+  end
+
+  def validate_markdown_links
+    documents = Array(documentation_registry.fetch("documents")).map { |item| item.fetch("path") }
+    documents.concat(Array(documentation_registry.fetch("modules")).map { |item| item.fetch("overview") })
+    package_records.each do |_entry, manifest|
+      docs = manifest.fetch("documentation")
+      documents.concat([docs["overview"], *Array(docs["skill_docs"]), *Array(docs["references"]), *Array(docs["generated"])])
+    end
+    documents = documents.compact.uniq
+    documents.each do |relative|
+      source = path(relative)
+      next add_error("documentation file missing: #{relative}") unless source.file?
+
+      text = source.read(encoding: "UTF-8")
+      validate_current_skill_path_references(relative, text)
+      text.scan(/!?\[[^\]]*\]\(([^)]+)\)/).flatten.each do |raw|
+        target = raw.strip.sub(/\A</, "").sub(/>\z/, "")
+        next if target.empty? || target.start_with?("#")
+        next if target.match?(/\A(?:https?|mailto|data):/i)
+
+        target = URI::DEFAULT_PARSER.unescape(target.split("#", 2).first.split("?", 2).first)
+        candidate = source.dirname.join(target).cleanpath
+        unstable_skill_roots = %w[skills/.active skills/.runtime skills/releases].map { |item| path(item) }
+        if unstable_skill_roots.any? { |item| candidate == item || candidate.to_s.start_with?("#{item}#{File::SEPARATOR}") }
+          add_error("#{relative}: noncanonical Skill documentation link #{raw}")
+          next
+        end
+
+        add_error("#{relative}: broken local link #{raw}") unless candidate.exist? || candidate.symlink?
+      end
+    end
+  end
+
+  def validate_current_skill_path_references(relative, text)
+    current_policy_documents = Set[
+      "README.md",
+      "00_project_charter.md",
+      "codex_cli_notes.md",
+      "docs/capability_management.md",
+      "workflows/capability-update-review.md",
+      "contexts/agents/two-head-wu/OPENCLAW.md",
+      "skills/README.md",
+      "skills/docs/skills_management.md",
+      "skills/inventories/skills_inventory.md"
+    ]
+    return unless current_policy_documents.include?(relative)
+
+    stale_patterns = {
+      %r{skills/\.active/[^\s`)]*(?:SKILL\.md|scripts/)} => "executable or Skill documentation path through compatibility catalog",
+      %r{~/\.codex/skills(?!/\.system)} => "legacy Codex whole-root Skill path",
+      %r{skills/\.runtime/(?:codex|claude-code|openclaw)/skills(?=[/`\s])} => "legacy runtime surface without global Profile"
+    }
+    text.each_line.with_index(1) do |line, line_number|
+      stale_patterns.each do |pattern, label|
+        add_error("#{relative}:#{line_number}: #{label}") if line.match?(pattern)
+      end
+    end
+  end
+
+  def validate_change_documentation_coupling
+    changed = changed_paths
+    return if changed.empty?
+
+    package_records.each do |entry, manifest|
+      prefix = "#{entry.fetch('path')}/"
+      package_changes = changed.select { |relative| relative.start_with?(prefix) }
+      next if package_changes.empty?
+
+      docs = manifest.fetch("documentation")
+      explanation_paths = [
+        entry.fetch("manifest"),
+        docs.fetch("overview"),
+        *Array(docs["skill_docs"]),
+        *Array(docs["references"])
+      ].to_set
+      implementation_changes = package_changes.reject do |relative|
+        explanation_paths.include?(relative) || relative.end_with?(".md")
+      end
+      if implementation_changes.any? && (changed.to_set & explanation_paths).empty?
+        add_error("#{entry.fetch('id')}: implementation changed without its manifest or explanation document")
+      end
+    end
+
+    core_changes = changed.select do |relative|
+      %w[.githooks/ core/ catalog/ registries/ mcp/ scripts/].any? { |prefix| relative.start_with?(prefix) }
+    end
+    core_docs = Set[
+      "README.md",
+      "PROJECT_MAP.md",
+      "catalog/documentation_registry.yaml",
+      "docs/capability_management.md",
+      "docs/documentation_governance.md",
+      "docs/directory_policy.md",
+      "capabilities/two-head-wu-core/capability.yaml"
+    ]
+    if core_changes.any? && (changed.to_set & core_docs).empty?
+      add_error("Core or Catalog changed without the Two-Headed-Wu overview, directory policy, or Core manifest")
+    end
+
+    skill_implementation = changed.select do |relative|
+      relative.start_with?("skills/") &&
+        !relative.start_with?(
+          "skills/docs/",
+          "skills/inventories/",
+          "skills/outputs/",
+          "skills/registries/",
+          "skills/audits/"
+        )
+    end
+    skill_docs = Set[
+      "skills/docs/skills_management.md",
+      "skills/inventories/skills_catalog.md",
+      "skills/registries/skills_registry.yaml"
+    ]
+    if skill_implementation.any? && (changed.to_set & skill_docs).empty?
+      add_error("Skill implementation changed without the Skill registry, catalog, or management explanation")
+    end
+  end
+
+  def changed_paths
+    stdout, stderr, status = Open3.capture3(
+      "git",
+      "status",
+      "--porcelain=v1",
+      "-z",
+      "--untracked-files=all",
+      chdir: @root.to_s
+    )
+    unless status.success?
+      add_error("cannot inspect changed files: #{stderr.strip}")
+      return []
+    end
+
+    entries = stdout.split("\0")
+    paths = []
+    index = 0
+    while index < entries.length
+      entry = entries[index]
+      status_code = entry[0, 2]
+      paths << entry[3..] if entry.length > 3
+      if status_code&.match?(/[RC]/)
+        index += 1
+        paths << entries[index] if entries[index]
+      end
+      index += 1
+    end
+    paths.compact.uniq
+  end
+
+  def validate_topology
+    %w[topology.yaml local-topology.yaml].each do |name|
+      relative = "skills/outputs/system-cartographer/topology/#{name}"
+      output = path(relative)
+      unless output.file?
+        add_error("topology output missing: #{relative}")
+        next
+      end
+      data = load_yaml(relative)
+      summary = data.fetch("summary", {})
+      add_error("#{name}: #{summary.fetch('errors', 'unknown')} error(s)") unless summary["errors"] == 0
+      add_error("#{name}: #{summary.fetch('warnings', 'unknown')} warning(s)") unless summary["warnings"] == 0
+    end
+
+    outputs = %w[
+      skills/outputs/system-cartographer/topology/topology.yaml
+      skills/outputs/system-cartographer/topology/local-topology.yaml
+    ].map { |relative| path(relative) }.select(&:file?)
+    inputs = [
+      path("registries/cartography_registry.yaml"),
+      path("skills/registries/skills_registry.yaml"),
+      path("catalog/documentation_registry.yaml"),
+      path("catalog/packages_registry.yaml"),
+      *package_records.map { |entry, _manifest| path(entry.fetch("manifest")) }
+    ]
+    if outputs.length == 2 && outputs.map(&:mtime).min < inputs.map(&:mtime).max
+      add_error("topology is older than its registered inputs; run wu 更新说明")
+    end
+  end
+
+  def run_package_tests
+    commands = package_records.flat_map { |_entry, manifest| Array(manifest["tests"]) }.uniq
+    commands.each do |command|
+      run_check(Shellwords.split(command), command)
+    end
+  end
+
+  def run_check(command, label)
+    puts "-- #{label}"
+    success = system(*command, chdir: @root.to_s)
+    add_error("#{label} failed") unless success
+  end
+
+  def run_required(command)
+    success = system(*command, chdir: @root.to_s)
+    raise WuDocsError, "command failed: #{command.join(' ')}" unless success
+  end
+
+  def compare_managed(relative, expected)
+    target = path(relative)
+    if !target.file?
+      add_error("managed documentation missing: #{relative}")
+    elsif target.read(encoding: "UTF-8") != expected
+      add_error("managed documentation is stale: #{relative}; run wu 更新说明")
+    end
+  end
+
+  def write_if_changed(relative, content)
+    target = path(relative)
+    return if target.file? && target.read(encoding: "UTF-8") == content
+
+    FileUtils.mkdir_p(target.dirname)
+    target.write(content, encoding: "UTF-8")
+    puts "wrote #{relative}"
+  end
+
+  def function_catalog
+    @function_catalog ||= TwoHeadWu::FunctionCatalog.new(@root)
+  end
+
+  def documentation_registry
+    @documentation_registry ||= load_yaml("catalog/documentation_registry.yaml")
+  end
+
+  def unique_record_values(records, key, label)
+    values = []
+    records.each do |record|
+      value = record[key]
+      next unless value
+
+      add_error("duplicate #{label} #{key}: #{value}") if values.include?(value)
+      values << value
+    end
+    values
+  end
+
+  def mirrored_source?
+    @root.join("MIRROR_COMMIT").file?
+  end
+
+  def markdown_link(label, relative)
+    "[#{label}](../#{relative})"
+  end
+
+  def map_link(label, relative)
+    "[#{label}](#{relative})"
+  end
+
+  def map_path_or_code(value)
+    path(value).exist? ? map_link(Pathname.new(value).basename.to_s, value) : code(value)
+  end
+
+  def list_or_dash(items)
+    return "—" if items.empty?
+
+    items.map { |item| yield(item) }.join("<br>")
+  end
+
+  def entity_link(id)
+    overview = entity_overviews[id]
+    overview ? map_link(id, overview) : code(id)
+  end
+
+  def entity_overviews
+    @entity_overviews ||= begin
+      result = Array(documentation_registry.fetch("modules")).to_h do |mod|
+        [mod.fetch("id"), mod.fetch("overview")]
+      end
+      package_records.each do |entry, manifest|
+        result[entry.fetch("id")] = manifest.dig("documentation", "overview")
+      end
+      result
+    end
+  end
+
+  def code(text)
+    tick = 96.chr
+    "#{tick}#{text}#{tick}"
+  end
+
+  def escape_table(text)
+    text.to_s.gsub("|", "&#124;").tr("\n", " ")
+  end
+
+  def add_error(message)
+    @errors << message unless @errors.include?(message)
+  end
+
+  def fail_if_errors!
+    return if @errors.empty?
+
+    raise WuDocsError, @errors.join("; ")
+  end
+
+  def path(relative)
+    @root.join(relative).cleanpath
+  end
+
+  def safe_relative_path?(relative)
+    return false unless relative.is_a?(String) && !relative.empty?
+    return false if Pathname.new(relative).absolute? || relative.include?("\\")
+    return false if relative.split("/").include?("..")
+
+    candidate = @root.join(relative).cleanpath
+    candidate == @root || candidate.to_s.start_with?("#{@root}#{File::SEPARATOR}")
+  end
+
+  def load_yaml(relative)
+    file = path(relative)
+    raise WuDocsError, "missing YAML: #{relative}" unless file.file?
+
+    data = YAML.safe_load(
+      file.read(encoding: "UTF-8"),
+      permitted_classes: [Date, Time],
+      aliases: false
+    )
+    raise WuDocsError, "YAML root is not a mapping: #{relative}" unless data.is_a?(Hash)
+
+    data
+  end
+end
+
+exit WuDocs.new(ARGV).run

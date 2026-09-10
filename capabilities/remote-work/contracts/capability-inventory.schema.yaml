@@ -1,0 +1,65 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Two-Headed-Wu signed Mini capability inventory
+type: object
+required: [schema_version, inventory_version, generated_at, source_device, entries, public_key_sha256, signature_base64]
+properties:
+  schema_version:
+    const: 1
+  inventory_version:
+    type: string
+    pattern: "^[a-f0-9]{16}$"
+  generated_at:
+    type: string
+    format: date-time
+  source_device:
+    const: mac-mini
+  public_key_sha256:
+    type: string
+    pattern: "^[a-f0-9]{64}$"
+  signature_base64:
+    type: string
+    minLength: 32
+  entries:
+    type: array
+    maxItems: 512
+    items:
+      type: object
+      required: [id, kind, name, summary, status, air_mode, location]
+      properties:
+        id:
+          type: string
+          pattern: "^(skill|package|agent|mcp|runtime|workflow|resource):[a-z][a-z0-9-]*$"
+        kind:
+          enum: [skill, capability-package, agent, mcp-server, runtime, workflow, resource]
+        name:
+          type: string
+          minLength: 1
+          maxLength: 160
+        summary:
+          type: string
+          minLength: 1
+          maxLength: 1000
+        status:
+          type: string
+          pattern: "^[a-z][a-z0-9-]{0,63}$"
+        air_mode:
+          enum: [local, portable, remote-auto, remote-queue, confirm, metadata-only, unavailable]
+        location:
+          enum: [air, mac-mini, aliyun, external]
+        version:
+          type: string
+          minLength: 1
+          maxLength: 160
+        native_status:
+          type: string
+          minLength: 1
+          maxLength: 160
+        category:
+          type: string
+          minLength: 1
+          maxLength: 160
+        callable_via:
+          type: string
+          pattern: "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"
+      additionalProperties: false
+additionalProperties: false

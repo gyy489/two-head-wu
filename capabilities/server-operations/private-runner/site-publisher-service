@@ -1,0 +1,159 @@
+#!/usr/bin/ruby
+# frozen_string_literal: true
+
+# Installation source for the protected local publisher service.  This file is
+# not the public client and must be copied to a service-account-owned location
+# outside the project before it is enabled.
+
+require "etc"
+require "json"
+require "optparse"
+require "pathname"
+require "socket"
+require "timeout"
+# The repository keeps this executable beside `lib/`; the root-owned production
+# install keeps it under `bin/` beside a root-owned `lib/`. Both locations are
+# fixed by the installation contract; no caller selects a load path.
+repository_library = File.expand_path("lib/private_site_publisher", __dir__)
+installed_library = File.expand_path("../lib/private_site_publisher", __dir__)
+require(File.file?("#{repository_library}.rb") ? repository_library : installed_library)
+
+class PrivateSitePublisherServiceCommand
+  DEFAULT_PRIVATE_ROOT = "/Library/Application Support/TwoHeadWu/site-publisher/private"
+  DEFAULT_SOCKET_PATH = "/Library/Application Support/TwoHeadWu/runtime/site-publisher.sock"
+  SOCKET_GROUP = "two-head-wu-publisher"
+  MAX_REQUEST_BYTES = 16 * 1024
+  REQUEST_READ_TIMEOUT_SECONDS = 15
+
+  def initialize(arguments)
+    @arguments = arguments.dup
+  end
+
+  def run
+    command = @arguments.shift || "help"
+    case command
+    when "help", "--help", "-h"
+      help
+    when "serve"
+      ensure_no_arguments!
+      serve
+    else
+      raise PrivateSitePublisherError, "publisher service did not start"
+    end
+    0
+  rescue OptionParser::ParseError, PrivateSitePublisherError, Errno::EACCES, Errno::EPERM, SocketError
+    warn "Error: protected publisher service did not start"
+    2
+  end
+
+  private
+
+  def help
+    puts <<~HELP
+      Usage: site-publisher-service serve
+
+      This is installation-source code for the protected executor. Its service
+      account owns one fixed private root and one fixed local socket. It accepts
+      no runtime configuration, target, host, source, SSH, or credential flags.
+    HELP
+  end
+
+  def serve
+    service = PrivateSitePublisherService.new(root: File::SEPARATOR, private_root: DEFAULT_PRIVATE_ROOT)
+    service.ready?
+    server = open_socket!
+    trap("TERM") { server.close }
+    trap("INT") { server.close }
+    loop do
+      connection = server.accept
+      handle_connection(service, connection)
+    rescue IOError, Errno::EBADF
+      break
+    end
+  ensure
+    server&.close unless server&.closed?
+    unlink_owned_socket!
+  end
+
+  def open_socket!
+    socket_path = Pathname.new(DEFAULT_SOCKET_PATH)
+    parent = socket_path.dirname
+    group = Etc.getgrnam(SOCKET_GROUP)
+    ensure_socket_directory!(parent, group.gid)
+
+    unlink_owned_socket!
+    server = UNIXServer.new(socket_path.to_s)
+    File.chown(-1, group.gid, socket_path.to_s)
+    File.chmod(0o660, socket_path.to_s)
+    server
+  rescue ArgumentError
+    raise PrivateSitePublisherError, "publisher service did not start"
+  end
+
+  # A root-owned installation step creates this directory once, then hands it
+  # to the dedicated publisher account. Group members receive execute-only
+  # access to the directory and read/write access only to the fixed socket;
+  # they cannot create, rename, or replace socket entries.
+  def ensure_socket_directory!(directory, expected_group_id)
+    stat = directory.lstat
+    secure = !stat.symlink? && stat.directory? && stat.uid == Process.euid &&
+             stat.gid == expected_group_id && (stat.mode & 0o700) == 0o700 &&
+             (stat.mode & 0o067).zero? && (stat.mode & 0o070) == 0o010
+    raise PrivateSitePublisherError, "publisher service did not start" unless secure
+  rescue Errno::ENOENT, Errno::EACCES
+    raise PrivateSitePublisherError, "publisher service did not start"
+  end
+
+  def unlink_owned_socket!
+    path = Pathname.new(DEFAULT_SOCKET_PATH)
+    return unless path.exist? || path.symlink?
+
+    stat = path.lstat
+    raise PrivateSitePublisherError, "publisher service did not start" unless stat.socket? && stat.uid == Process.euid
+
+    File.unlink(path.to_s)
+  rescue Errno::ENOENT
+    nil
+  end
+
+  def handle_connection(service, connection)
+    raw = Timeout.timeout(REQUEST_READ_TIMEOUT_SECONDS) { connection.gets(MAX_REQUEST_BYTES + 1) }
+    raise PrivateSitePublisherError, "publisher request is invalid" unless raw && raw.end_with?("\n") && raw.bytesize <= MAX_REQUEST_BYTES
+    payload = JSON.parse(raw.to_s)
+    artifact_io = receive_archive_io(connection, payload)
+    response = service.handle_request(payload, artifact_io: artifact_io)
+    write_response(connection, response)
+  rescue JSON::ParserError, PrivateSitePublisherError, TypeError, KeyError, Timeout::Error
+    write_response(connection, { "schema_version" => 1, "result" => "error", "error" => "publication did not complete" })
+  rescue Errno::EPIPE, Errno::ECONNRESET, Errno::ECONNABORTED, EOFError, IOError
+    nil
+  ensure
+    artifact_io&.close unless artifact_io&.closed?
+    connection&.close unless connection&.closed?
+  end
+
+  def receive_archive_io(connection, payload)
+    return nil unless payload.is_a?(Hash) && payload["schema_version"] == 2 && payload["action"] == "publish"
+
+    expected_keys = %w[schema_version action release_id project_id request]
+    valid_envelope = payload.keys.sort == expected_keys.sort && payload["release_id"].is_a?(String) &&
+                     payload["project_id"].is_a?(String) && payload["request"].is_a?(Hash)
+    raise PrivateSitePublisherError, "publisher request is invalid" unless valid_envelope
+
+    Timeout.timeout(REQUEST_READ_TIMEOUT_SECONDS) { connection.recv_io(File) }
+  rescue SocketError, SystemCallError, IOError
+    raise PrivateSitePublisherError, "publisher request is invalid"
+  end
+
+  def write_response(connection, response)
+    connection.write(JSON.generate(response) + "\n")
+  rescue Errno::EPIPE, Errno::ECONNRESET, Errno::ECONNABORTED, IOError
+    nil
+  end
+
+  def ensure_no_arguments!
+    raise PrivateSitePublisherError, "publisher service did not start" unless @arguments.empty?
+  end
+end
+
+exit PrivateSitePublisherServiceCommand.new(ARGV).run

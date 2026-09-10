@@ -1,0 +1,4 @@
+interface:
+  display_name: "账号身份管理"
+  short_description: "安全管理 Codex 多身份登录、启动、项目绑定与选择。"
+  default_prompt: "Use $agent-identity to register, log in to, or launch a managed Codex identity."

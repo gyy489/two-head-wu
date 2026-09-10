@@ -1,0 +1,82 @@
+schema_version: 1
+id: agent-identity
+version: "0.11.0"
+status: active
+summary: "Codex-only identity launcher with exact project-terminal recovery, owner session routing plus isolated no-pool member identities for remote work, one-shot or continuous quota-reset sleep insurance, and bounded lifecycle/turn-status metadata that never stores conversation content or credentials."
+
+documentation:
+  overview: "capabilities/agent-identity/README.md"
+  skill_docs:
+    - "capabilities/agent-identity/skills/agent-identity/SKILL.md"
+  references:
+    - "capabilities/agent-identity/references/maintenance-reference.md"
+  generated: []
+
+installation:
+  source_owner: two-head-wu
+  runtime_mode: source-and-external-state
+  managed_copy: false
+  large_artifacts: none
+
+interfaces:
+  - id: agent-identity
+    type: skill
+    entrypoint: "capabilities/agent-identity/skills/agent-identity/SKILL.md"
+  - id: agent-identity-adapter
+    type: adapter
+    entrypoint: "capabilities/agent-identity/adapters/agent-identity"
+  - id: agent-identity-thread-lifecycle
+    type: adapter
+    entrypoint: "capabilities/agent-identity/adapters/agent-identity"
+  - id: agent-identity-project-terminals
+    type: adapter
+    entrypoint: "capabilities/agent-identity/vscode/project-terminal-restorer"
+
+components:
+  skills:
+    - "skills/agent-identity"
+  agents: []
+  adapters:
+    - "adapters/agent-identity"
+    - "vscode/project-terminal-restorer"
+  workflows: []
+
+compatibility:
+  codex: native
+  claude-code: denied
+  openclaw: denied
+
+permissions:
+  risk_level: medium
+  network: "none in the manager; an explicit native `codex login` or launched Codex process may use its own approved network access"
+  secrets: "never read, copy, archive, parse, display, or place credentials in the repository; identity aliases and their Codex state roots stay in a repository-external private registry"
+  filesystem:
+    read:
+      - "repository-external private identity, terminal-continuation, project-terminal, thread-execution, and thread-continuation-task metadata; legacy terminal-session metadata; Codex state_5 thread rows; child-process rollout filenames; only the first session_meta record needed to verify native fork source and creation time; and bounded app-server quota-reset plus latest-turn UUID/status for one-shot or continuous conditional continuation, discarding and never storing returned turn items or message bodies"
+    write:
+      - "repository-external private identity, terminal-continuation, project-terminal, and thread-execution registries, legacy terminal-session cleanup state, isolated Codex roots, shared rollout directories, explicitly activated pool-level state database, and user-requested OpenClaw continuation cron jobs"
+
+dependencies:
+  - id: two-head-wu-core
+    version: ">=0.1.0"
+    purpose: "Project capability resolution and registered Skill exposure."
+  - id: sqlite3
+    version: "system"
+    purpose: "Consistent state snapshots, deterministic thread merge, and integrity validation."
+  - id: lsof
+    version: "system"
+    purpose: "Observe the exact rollout filename opened by a launched Codex child and refuse state migration while any member database is open."
+  - id: vscode
+    version: ">=1.90.0"
+    purpose: "Expose workspace startup and terminal close reasons to the local project-terminal connector."
+
+recovery:
+  source_of_truth: "tracked capability package plus identity-local native login roots and any explicitly enabled pool-level Codex state database outside the repository"
+  private_material: "alias registry, hashed terminal-continuation registry, exact project-terminal recovery registry, thread-to-latest-explicit-identity registry, thread-continuation-task registry, legacy terminal-session registry, isolated Codex roots, shared conversation pools, pool state database, and migration snapshots under the operator-owned private identity directory"
+  rebuild_command: "capabilities/agent-identity/tests/test_agent_identity.sh"
+  rollback: "Revert terminal-continuation launch routing to fresh-by-default; for state migrations, stop all Codex writers and restore databases from the registered private activation backup. Git rollback never deletes native sessions, pool databases, snapshots, or login roots."
+
+tests:
+  - "capabilities/agent-identity/tests/test_agent_identity.sh"
+  - "ruby capabilities/agent-identity/tests/test_thread_lifecycle.rb"
+  - "node capabilities/agent-identity/tests/test_project_terminal_extension.js"

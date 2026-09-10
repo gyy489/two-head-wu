@@ -1,0 +1,41 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Two-Headed-Wu personal remote artifact
+type: object
+required: [schema_version, id, request_id, owner, device_id, filename, media_type, sha256, size, state, created_at, expires_at]
+properties:
+  schema_version:
+    const: 1
+  id:
+    type: string
+    pattern: "^art-[a-f0-9]{24}$"
+  request_id:
+    type: string
+    pattern: "^call-[a-f0-9]{24}$"
+  owner:
+    const: example-owner
+  device_id:
+    type: string
+  filename:
+    type: string
+    minLength: 1
+    maxLength: 255
+  media_type:
+    type: string
+  sha256:
+    type: string
+    pattern: "^[a-f0-9]{64}$"
+  size:
+    type: integer
+    minimum: 1
+    maximum: 52428800
+  state:
+    enum: [active, removed, expired]
+  created_at:
+    type: string
+  expires_at:
+    type: integer
+  removed_at:
+    type: string
+  expired_at:
+    type: string
+additionalProperties: false

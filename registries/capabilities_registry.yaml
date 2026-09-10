@@ -1,0 +1,34 @@
+version: 1
+updated_at: "2026-09-10"
+project_root: "."
+policy:
+  default_visibility: deny
+  activation_requires_audit: true
+  runtime_compatibility_requires_explicit_state: true
+  agent_access_requires_allowlist: true
+  unknown_capabilities_after_update: inventory_only
+  compatibility_states: [native, compatible, needs-review, denied]
+skill_registry: skills/registries/skills_registry.yaml
+release_registry: skills/registries/skill_releases.json
+profile_registry: skills/registries/skill_profiles.yaml
+mcp_registry: catalog/mcp_registry.yaml
+agent_registry: registries/agents_registry.yaml
+runtime_registry: registries/runtimes_registry.yaml
+package_registry: catalog/packages_registry.yaml
+workflow_registry: catalog/workflows_registry.yaml
+global_packages: []
+skill_sets:
+  foundation-platform:
+    description: "两头乌基础平台的公开 Skill 入口。"
+    skills: [two-head-wu, agent-identity, skills-dashboard, server-operations, remote-work-bootstrap, remote-work]
+    compatibility:
+      codex: native
+      claude-code: needs-review
+      openclaw: needs-review
+compatibility_overrides: []
+runtime_provided_capabilities: {}
+delegation_policy:
+  topology: hub_and_spoke
+  controller: two-head-wu
+  direct_agent_to_agent_calls: denied
+  allowed_runtimes: [codex, claude-code]

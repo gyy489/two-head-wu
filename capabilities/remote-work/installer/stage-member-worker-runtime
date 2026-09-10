@@ -1,0 +1,28 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "optparse"
+require "pathname"
+
+require_relative "../lib/member_runtime_release"
+
+options = {}
+parser = OptionParser.new do |item|
+  item.banner = "Usage: stage-member-worker-runtime --output-root PATH [--source-root PATH]"
+  item.on("--output-root PATH") { |value| options[:output_root] = value }
+  item.on("--source-root PATH") { |value| options[:source_root] = value }
+end
+parser.parse!
+abort parser.to_s unless ARGV.empty? && options[:output_root]
+
+source_root = options[:source_root] || Pathname.new(__dir__).join("../../..").to_s
+release = RemoteWork::MemberRuntimeRelease.new(source_root: source_root).build(
+  output_root: options.fetch(:output_root)
+)
+puts JSON.pretty_generate({
+  "schema_version" => 1,
+  "result" => "staged",
+  "release_id" => release.basename.to_s,
+  "release_root" => release.to_s
+})

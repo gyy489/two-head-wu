@@ -1,0 +1,43 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://two-head-wu.local/contracts/resource.schema.yaml"
+title: "Two-Headed-Wu Redacted Resource Record"
+type: object
+additionalProperties: false
+required:
+  - id
+  - kind
+  - capability
+  - summary
+  - classification
+  - roles
+  - operations
+  - policy_ref
+  - private_ref
+properties:
+  id:
+    type: string
+    pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+  kind:
+    enum: [workstation, edge-server, private-server, standby-server, private-data-store, static-site]
+  capability:
+    type: string
+    pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+  summary:
+    type: string
+  classification:
+    enum: [public-service, private-operational]
+  roles:
+    type: array
+    items:
+      type: string
+  operations:
+    type: object
+  policy_ref:
+    type: string
+    pattern: "^policy://[a-z0-9-]+/[a-z0-9-]+$"
+  private_ref:
+    type: string
+    pattern: "^private://two-head-wu/[a-z0-9/-]+$"
+  secret_ref_count:
+    type: integer
+    minimum: 0

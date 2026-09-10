@@ -1,0 +1,78 @@
+schema_version: 1
+id: server-operations
+version: "0.3.0"
+status: active
+summary: "Codex-driven publication of checked static output to exactly two fixed sites: an unprivileged client passes a regular tar FD and the protected executor extracts only to private staging."
+
+documentation:
+  overview: "capabilities/server-operations/README.md"
+  skill_docs:
+    - "capabilities/server-operations/skills/server-operations/SKILL.md"
+  references:
+    - "capabilities/server-operations/references/production-installation.md"
+  generated: []
+
+installation:
+  source_owner: two-head-wu
+  runtime_mode: source-and-protected-service
+  managed_copy: true
+  large_artifacts: external-volume-required
+
+interfaces:
+  - id: server-operations
+    type: skill
+    entrypoint: "capabilities/server-operations/skills/server-operations/SKILL.md"
+  - id: server-operations-adapter
+    type: adapter
+    entrypoint: "capabilities/server-operations/adapters/server-operations"
+  - id: private-site-publisher
+    type: cli
+    entrypoint: "capabilities/server-operations/private-runner/site-publisher"
+  - id: server-operations-health
+    type: workflow
+    entrypoint: "catalog/workflows_registry.yaml"
+
+components:
+  skills:
+    - "skills/server-operations"
+  agents: []
+  adapters:
+    - "adapters/server-operations"
+    - "private-runner/site-publisher"
+  workflows:
+    - "server-operations-health"
+
+compatibility:
+  codex: native
+  claude-code: compatible
+  openclaw: denied
+
+permissions:
+  risk_level: high
+  network: "none in the public adapter and IPC client; only an installed protected executor outside this repository may use SSH and HTTPS for the two fixed registered sites"
+  secrets: "none in the public Skill, adapter, client, or repository; only the separately owned protected executor reads its dedicated deployment identity and mapping"
+  filesystem:
+    read:
+      - "catalog/resources/infrastructure.yaml"
+      - "catalog/deployments/personal-static-sites.yaml"
+      - "catalog/policies/server-operations.yaml"
+      - "registries/projects_registry.yaml"
+      - "caller-provided static source directory after preflight"
+    write:
+      - "var/server-ops/preflights"
+      - "var/server-ops/publish-requests"
+      - "var/server-ops/publish-staging"
+
+dependencies:
+  - id: two-head-wu-core
+    version: ">=0.1.0"
+    purpose: "Project, capability, and resource resolution."
+
+recovery:
+  source_of_truth: "tracked Catalog and capability files"
+  private_material: "configuration, identity, staging, audit, and state owned by the installed protected executor service account outside the project repository"
+  rebuild_command: "capabilities/server-operations/tests/test_server_operations.sh"
+  rollback: "Disable the Skill set and IPC client; stop or roll back the protected executor through its operator-managed service lifecycle. The public adapter has no direct remote or private-config access."
+
+tests:
+  - "capabilities/server-operations/tests/test_server_operations.sh"

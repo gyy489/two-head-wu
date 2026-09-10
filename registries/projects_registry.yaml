@@ -1,0 +1,33 @@
+version: 1
+updated_at: "2026-09-10"
+projects:
+  - id: two-head-wu
+    name: 两头乌公开基础平台
+    owner: example-owner
+    purpose: "展示并开发脱敏的两头乌基础平台。"
+    path: "."
+    allowed_runtimes: [codex, claude-code, openclaw]
+    capabilities:
+      packages:
+        - two-head-wu-core
+        - capability-release-management
+        - spec-kit-governance
+        - agent-identity
+        - agent-observability
+        - skills-dashboard
+        - server-operations
+        - remote-work-bootstrap
+        - remote-work
+        - personal-memory
+      skill_sets: [foundation-platform]
+      skills: []
+      mcp: []
+    resources:
+      allowed: [edge-server, private-site, public-site]
+    protected_assets:
+      allowed: []
+    permissions:
+      approval_profile: workspace_confined
+      external_write: require_explicit_confirmation
+      destructive_action: require_confirmation
+      secrets_access: references_only

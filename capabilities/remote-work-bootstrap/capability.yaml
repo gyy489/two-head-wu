@@ -1,0 +1,79 @@
+schema_version: 1
+id: remote-work-bootstrap
+version: "0.1.0"
+status: active
+summary: "Owner-authorized, fixed-target bootstrap of the Aliyun Two-Headed-Wu runtime area with a verified Keychain target reference, SSH credentials kept outside the repository, and registered websites guarded before and after changes."
+
+documentation:
+  overview: "capabilities/remote-work-bootstrap/README.md"
+  skill_docs:
+    - "capabilities/remote-work-bootstrap/skills/remote-work-bootstrap/SKILL.md"
+  references: []
+  generated: []
+
+installation:
+  source_owner: two-head-wu
+  runtime_mode: source-and-protected-service
+  managed_copy: true
+  large_artifacts: none
+
+interfaces:
+  - id: remote-work-bootstrap
+    type: skill
+    entrypoint: "capabilities/remote-work-bootstrap/skills/remote-work-bootstrap/SKILL.md"
+  - id: remote-work-bootstrap-adapter
+    type: adapter
+    entrypoint: "capabilities/remote-work-bootstrap/adapters/remote-work-bootstrap"
+  - id: remote-work-bootstrap-target-provider
+    type: adapter
+    entrypoint: "capabilities/remote-work-bootstrap/lib/protected_ssh_target.rb"
+  - id: remote-work-bootstrap-health
+    type: workflow
+    entrypoint: "catalog/workflows_registry.yaml"
+
+components:
+  skills:
+    - "skills/remote-work-bootstrap"
+  agents: []
+  adapters:
+    - "adapters/remote-work-bootstrap"
+    - "lib/protected_ssh_target.rb"
+  workflows:
+    - "remote-work-bootstrap-health"
+
+compatibility:
+  codex: native
+  claude-code: denied
+  openclaw: denied
+
+permissions:
+  risk_level: critical
+  network: "Only the registered edge-server resource: public HTTPS guards, TCP/SSH banner probe on port 22, and a fixed SSH action set after a direct owner request."
+  secrets: "The repository stores only secret://remote-work-bootstrap/edge-server/ssh-target; first installation accepts a process-scoped target, verifies the registered edge, and stores the fixed target reference in macOS Keychain. OpenSSH credentials are never printed or copied."
+  filesystem:
+    read:
+      - "catalog/resources/infrastructure.yaml"
+      - "catalog/deployments/personal-static-sites.yaml"
+      - "catalog/policies/remote-work-bootstrap.yaml"
+      - "registries/projects_registry.yaml"
+    write:
+      - "var/remote-work-bootstrap/receipts"
+      - "the fixed macOS Keychain target-reference item after explicit --approve"
+      - "fixed remote root /srv/two-head-wu after explicit --approve"
+
+dependencies:
+  - id: two-head-wu-core
+    version: ">=0.1.0"
+    purpose: "Resolve the project, capability, resource, and approval boundary."
+  - id: server-operations
+    version: ">=0.3.0"
+    purpose: "Keep the two registered static sites and their separate publisher boundary intact."
+
+recovery:
+  source_of_truth: "tracked capability, Catalog policy, and redacted resource registration"
+  private_material: "SSH target, credentials, known-host state, and any privileged executor configuration remain outside the repository"
+  rebuild_command: "capabilities/remote-work-bootstrap/tests/test_remote_work_bootstrap.sh"
+  rollback: "Disable this Skill set and adapter. The bootstrap only adds the twoheadwu system identity and /srv/two-head-wu; removal is an operator-reviewed action and is never automatic."
+
+tests:
+  - "capabilities/remote-work-bootstrap/tests/test_remote_work_bootstrap.sh"

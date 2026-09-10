@@ -1,0 +1,38 @@
+version: 1
+updated_at: "2026-09-10"
+project_root: "."
+policy:
+  default_capability_visibility: deny
+  generated_surfaces_are_disposable: true
+  external_runtime_directories_are_not_sources_of_truth: true
+runtimes:
+  - id: codex
+    name: Codex
+    kind: intelligence_runtime
+    status: available-if-installed
+    executable: { command: codex, version_args: ["--version"] }
+    skill_surface:
+      mode: generated
+      managed_path: skills/.runtime/codex/global/skills
+      skill_sets: [foundation-platform]
+    discovery_roots: []
+  - id: claude-code
+    name: Claude Code
+    kind: intelligence_runtime
+    status: optional
+    executable: { command: claude, version_args: ["--version"] }
+    skill_surface:
+      mode: generated
+      managed_path: skills/.runtime/claude-code/global/skills
+      skill_sets: [foundation-platform]
+    discovery_roots: []
+  - id: openclaw
+    name: OpenClaw
+    kind: orchestration_runtime
+    status: required-for-full-runtime
+    executable: { command: openclaw, version_args: ["--version"] }
+    skill_surface:
+      mode: generated
+      managed_path: skills/.runtime/openclaw/global/skills
+      skill_sets: [foundation-platform]
+    discovery_roots: []

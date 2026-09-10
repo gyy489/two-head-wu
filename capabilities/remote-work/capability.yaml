@@ -1,0 +1,128 @@
+schema_version: 1
+id: remote-work
+version: "0.12.0"
+status: experimental
+summary: "Unified hardware-bound macOS/Windows Air bridge with signed Skills and capabilities, one isolated Mini worker, recoverable project work, owner-device notebook access, and review-only results."
+
+documentation:
+  overview: "capabilities/remote-work/README.md"
+  skill_docs:
+    - "capabilities/remote-work/skills/remote-work/SKILL.md"
+  references:
+    - "capabilities/remote-work/native/windows/README.md"
+    - "capabilities/remote-work/native/macos/README.md"
+    - "capabilities/remote-work/contracts/capability-catalog.schema.yaml"
+    - "capabilities/remote-work/contracts/capability-inventory.schema.yaml"
+    - "capabilities/remote-work/contracts/invocation-result.schema.yaml"
+    - "capabilities/remote-work/contracts/runtime-compatibility.schema.yaml"
+    - "capabilities/remote-work/contracts/project-delta.schema.yaml"
+    - "capabilities/remote-work/contracts/multi-user-v2.schema.yaml"
+  generated: []
+
+installation:
+  source_owner: two-head-wu
+  runtime_mode: source-and-external-service
+  managed_copy: true
+  large_artifacts: external-volume-required
+
+interfaces:
+  - id: remote-work
+    type: skill
+    entrypoint: "capabilities/remote-work/skills/remote-work/SKILL.md"
+  - id: remote-work-client
+    type: adapter
+    entrypoint: "capabilities/remote-work/adapters/remote-work"
+  - id: remote-work-admin
+    type: adapter
+    entrypoint: "capabilities/remote-work/adapters/remote-work-admin"
+  - id: remote-work-deploy
+    type: adapter
+    entrypoint: "capabilities/remote-work/adapters/remote-work-deploy"
+  - id: remote-work-control-plane
+    type: service
+    entrypoint: "capabilities/remote-work/server/control_plane.py"
+  - id: remote-work-worker
+    type: adapter
+    entrypoint: "capabilities/remote-work/worker/ltw-worker"
+  - id: remote-work-air-mcp
+    type: service
+    entrypoint: "capabilities/remote-work/installer/two-head-wu-mcp"
+  - id: remote-work-air-client
+    type: adapter
+    entrypoint: "capabilities/remote-work/native/member-air/main.go"
+  - id: remote-work-air-worker-installer
+    type: adapter
+    entrypoint: "capabilities/remote-work/installer/install-member-worker-runtime"
+  - id: remote-work-owner-notebook-adapter
+    type: adapter
+    entrypoint: "capabilities/remote-work/worker/protected_owner_notebook.rb"
+
+components:
+  skills:
+    - "skills/remote-work"
+  agents: []
+  adapters:
+    - "adapters/remote-work"
+    - "adapters/air-sync-pipeline"
+    - "adapters/remote-work-admin"
+    - "adapters/remote-work-deploy"
+    - "worker/ltw-worker"
+    - "worker/member-research-library"
+    - "worker/protected_owner_notebook.rb"
+    - "installer/stage-member-worker-runtime"
+    - "installer/install-member-worker-runtime"
+    - "installer/render-member-worker-launchd"
+    - "installer/two-head-wu-mcp"
+    - "native/member-air/main.go"
+    - "native/macos/Build-AirPackage"
+    - "native/windows/Install-MemberAir.ps1"
+    - "native/windows/Update-MemberAir.ps1"
+    - "native/windows/Uninstall-MemberAir.ps1"
+    - "native/windows/Test-MemberAirInstallation.ps1"
+    - "native/windows/New-MemberAirPackage.ps1"
+  workflows:
+    - "sync-air"
+    - "remote-work-health"
+
+compatibility:
+  codex: native
+  claude-code: denied
+  openclaw: denied
+
+permissions:
+  risk_level: critical
+  network: "Air and Mini initiate outbound HTTPS to the registered edge-server relay; Mini opens no listener. Fixed SSH administration and deployment remain a separate Mini-owner channel."
+  secrets: "Pairing values, hardware private keys, approval private keys, Codex credentials, Keychain data, and Mini-local personal or infrastructure secrets remain outside Git and are never copied through the relay; the fixed four-space confirmation is a local mistake-prevention code, not an authentication secret."
+  filesystem:
+    read:
+      - "explicit portable component sources"
+      - "the project directory selected for one remote job, subject to capsule exclusions"
+      - "Air-user-selected artifacts attached to one job, subject to filename, size, ownership, and hash checks"
+      - "the fixed internal Mini mirror of committed Two-Headed-Wu Git source for workflow:sync-air"
+      - "a sanitized root-owned Air research index snapshot; never the owner research volume or original files"
+    write:
+      - "repository-local test and build state under var/remote-work"
+      - "the rebuildable internal Mini source mirror under ~/.local/share/two-head-wu/managed-source"
+      - "Air user installation roots selected by the guided installer"
+      - "the fixed remote root /srv/two-head-wu through the registered deploy adapter"
+      - "the dedicated low-privilege Mini Air runtime roots under /Library after explicit local approval"
+
+dependencies:
+  - id: two-head-wu-core
+    version: ">=0.1.0"
+    purpose: "Deterministic project and capability resolution."
+  - id: remote-work-bootstrap
+    version: ">=0.1.0"
+    purpose: "Pre-created remote system identity and /srv/two-head-wu boundary."
+  - id: agent-identity
+    version: ">=0.1.0"
+    purpose: "Launch Mini Codex work under each Air user's exact private-registry identity binding without copying credentials."
+
+recovery:
+  source_of_truth: "tracked protocol, unified Air client, service, worker, Skill, signed installer sources, contracts, and grant policies"
+  private_material: "device/approval private keys, passwords, enrollment tokens, server state, private identity mappings, and generated installers remain outside Git"
+  rebuild_command: "capabilities/remote-work/tests/test_remote_work.sh"
+  rollback: "Disable the service and worker, retain queued state for review, and remove only the versioned client installation; never delete projects or Codex identity roots automatically."
+
+tests:
+  - "capabilities/remote-work/tests/test_remote_work.sh"

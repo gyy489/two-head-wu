@@ -1,0 +1,184 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "open3"
+require "pathname"
+
+class TwoHeadWuMCP
+  PROTOCOL_VERSION = "2025-06-18"
+  VERSION = "0.12.0"
+
+  def initialize
+    @wu = Pathname.new(File.join(Dir.home, ".local", "bin", "wu"))
+  end
+
+  def run
+    STDOUT.sync = true
+    STDIN.each_line do |line|
+      next if line.strip.empty?
+      message = JSON.parse(line)
+      response = dispatch(message)
+      puts JSON.generate(response) if response
+    rescue JSON::ParserError
+      puts JSON.generate(error_response(nil, -32_700, "invalid JSON"))
+    rescue StandardError => error
+      puts JSON.generate(error_response(message && message["id"], -32_603, "bridge error: #{error.class}"))
+    end
+    0
+  end
+
+  private
+
+  def dispatch(message)
+    method = message["method"]
+    id = message["id"]
+    return nil if method.to_s.start_with?("notifications/")
+    case method
+    when "initialize"
+      result(id, {
+        "protocolVersion" => PROTOCOL_VERSION,
+        "capabilities" => { "tools" => { "listChanged" => false } },
+        "serverInfo" => { "name" => "two-head-wu", "version" => VERSION },
+        "instructions" => "先调用 two_head_wu_discover；Mini 离线时不得声称远端调用成功。"
+      })
+    when "ping"
+      result(id, {})
+    when "tools/list"
+      result(id, { "tools" => tools })
+    when "tools/call"
+      params = message["params"] || {}
+      result(id, call_tool(params["name"], params["arguments"] || {}))
+    else
+      error_response(id, -32_601, "method not found")
+    end
+  end
+
+  def tools
+    [
+      tool("two_head_wu_discover", "动态发现 Air 本地与 Mini 远端能力；调用 Mini 能力前先使用。", {
+        "type" => "object", "properties" => {
+          "scope" => { "type" => "string", "enum" => %w[all local remote], "default" => "all" }
+        }, "additionalProperties" => false
+      }),
+      tool("two_head_wu_invoke", "调用已登记且策略允许的 Mini 能力。返回值会证明实际执行位置；未成功调用 Mini 时会明确失败或排队。", {
+        "type" => "object", "required" => ["capability_id"], "properties" => {
+          "capability_id" => { "type" => "string", "pattern" => "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$" },
+          "input" => { "type" => "object", "default" => {} },
+          "timeout_seconds" => { "type" => "integer", "minimum" => 5, "maximum" => 600, "default" => 120 },
+          "owner_confirmed" => { "type" => "boolean", "default" => false }
+        }, "additionalProperties" => false
+      }),
+      tool("two_head_wu_submit_project", "把一个明确授权的 Air 项目快照交给 Mini Codex；结果进入审阅区，不自动覆盖 Air。", {
+        "type" => "object", "required" => %w[project instruction], "properties" => {
+          "project" => { "type" => "string" },
+          "instruction" => { "type" => "string", "minLength" => 1 },
+          "project_mode" => { "type" => "string", "enum" => %w[review workspace-write full-project], "default" => "workspace-write" },
+          "model" => { "type" => "string" },
+          "effort" => { "type" => "string" }
+        }, "additionalProperties" => false
+      }),
+      tool("two_head_wu_job", "查看、跟踪或接收一个 Mini 任务。接收只下载到审阅目录。", {
+        "type" => "object", "required" => %w[action job_id], "properties" => {
+          "action" => { "type" => "string", "enum" => %w[status follow fetch interactions] },
+          "job_id" => { "type" => "string", "pattern" => "^job-[a-z0-9-]+$" },
+          "timeout_seconds" => { "type" => "integer", "minimum" => 0, "maximum" => 600, "default" => 0 }
+        }, "additionalProperties" => false
+      }),
+      tool("two_head_wu_reply", "只把所有者已经明确给出的审批选择或问题答案回传 Mini；不能把沉默当成同意。", {
+        "type" => "object", "required" => %w[job_id interaction_id], "properties" => {
+          "job_id" => { "type" => "string", "pattern" => "^job-[a-z0-9-]+$" },
+          "interaction_id" => { "type" => "string", "pattern" => "^ask-[a-f0-9]{16}$" },
+          "decision" => { "type" => "string", "enum" => %w[accept acceptForSession decline cancel] },
+          "answers" => { "type" => "object", "additionalProperties" => { "type" => "string" } }
+        }, "additionalProperties" => false
+      })
+    ]
+  end
+
+  def tool(name, description, input_schema)
+    { "name" => name, "description" => description, "inputSchema" => input_schema }
+  end
+
+  def call_tool(name, arguments)
+    raise "wu client is unavailable" unless @wu.executable?
+    command = case name
+              when "two_head_wu_discover" then discover_command(arguments)
+              when "two_head_wu_invoke" then invoke_command(arguments)
+              when "two_head_wu_submit_project" then submit_command(arguments)
+              when "two_head_wu_job" then job_command(arguments)
+              when "two_head_wu_reply" then reply_command(arguments)
+              else return tool_error("unknown Two-Headed-Wu tool")
+              end
+    stdout, stderr, status = Open3.capture3({ "WU_REMOTE_SKIP_ON_USE_UPDATE" => "1" }, @wu.to_s, *command)
+    text = status.success? ? stdout : stderr
+    if !status.success? && name == "two_head_wu_invoke" && !text.include?("本轮未能成功调用两头乌 Mini")
+      text = "本轮未能成功调用两头乌 Mini。#{text}"
+    end
+    structured = parse_json(stdout) if status.success?
+    response = { "content" => [{ "type" => "text", "text" => text.to_s.strip[0, 200_000] }], "isError" => !status.success? }
+    response["structuredContent"] = structured if structured.is_a?(Hash)
+    response
+  rescue ArgumentError, KeyError => error
+    tool_error(error.message)
+  end
+
+  def discover_command(arguments)
+    scope = arguments.fetch("scope", "all")
+    action = { "all" => "list", "local" => "local", "remote" => "remote" }.fetch(scope)
+    ["remote", "abilities", action, "--json"]
+  end
+
+  def invoke_command(arguments)
+    capability_id = arguments.fetch("capability_id")
+    command = ["remote", "invoke", capability_id, "--json", "--timeout", Integer(arguments.fetch("timeout_seconds", 120)).to_s,
+               "--input-json", JSON.generate(arguments.fetch("input", {}))]
+    command << "--confirm" if arguments["owner_confirmed"] == true
+    command
+  end
+
+  def submit_command(arguments)
+    command = ["remote", "jobs", "submit", "--project", arguments.fetch("project"), "--project-mode", arguments.fetch("project_mode", "workspace-write")]
+    command.concat(["--model", arguments["model"]]) if arguments["model"]
+    command.concat(["--effort", arguments["effort"]]) if arguments["effort"]
+    command.concat(["--", arguments.fetch("instruction")])
+  end
+
+  def job_command(arguments)
+    job_id = arguments.fetch("job_id")
+    case arguments.fetch("action")
+    when "status" then ["remote", "jobs", "status", job_id]
+    when "follow" then ["remote", "jobs", "follow", job_id, "--timeout", Integer(arguments.fetch("timeout_seconds", 0)).to_s]
+    when "fetch" then ["remote", "jobs", "fetch", job_id]
+    when "interactions" then ["remote", "jobs", "interactions", job_id]
+    end
+  end
+
+  def reply_command(arguments)
+    command = ["remote", "jobs", "reply", arguments.fetch("job_id"), arguments.fetch("interaction_id")]
+    command.concat(["--decision", arguments["decision"]]) if arguments["decision"]
+    arguments.fetch("answers", {}).each { |key, value| command.concat(["--answer", "#{key}=#{value}"]) }
+    raise ArgumentError, "decision or answers are required" if command.length == 5
+    command
+  end
+
+  def parse_json(value)
+    JSON.parse(value)
+  rescue JSON::ParserError
+    nil
+  end
+
+  def tool_error(message)
+    { "content" => [{ "type" => "text", "text" => message.to_s[0, 2000] }], "isError" => true }
+  end
+
+  def result(id, value)
+    { "jsonrpc" => "2.0", "id" => id, "result" => value }
+  end
+
+  def error_response(id, code, message)
+    { "jsonrpc" => "2.0", "id" => id, "error" => { "code" => code, "message" => message } }
+  end
+end
+
+exit TwoHeadWuMCP.new.run if $PROGRAM_NAME == __FILE__

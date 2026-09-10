@@ -1,0 +1,99 @@
+schema_version: 1
+id: personal-memory
+version: "0.2.0"
+status: experimental
+summary: "Owner-only long-term memory with an explicit compact notebook, OpenClaw native sessions, portable Markdown, Chinese-capable FTS, Dreaming, and project-ID-aware recall."
+
+documentation:
+  overview: "capabilities/personal-memory/README.md"
+  skill_docs: []
+  references:
+    - "capabilities/personal-memory/docs/openclaw-upgrade.md"
+  generated: []
+
+installation:
+  source_owner: two-head-wu
+  runtime_mode: source-and-external-state
+  managed_copy: true
+  large_artifacts: none
+
+interfaces:
+  - id: personal-memory-adapter
+    type: adapter
+    entrypoint: "adapters/personal-memory"
+  - id: personal-memory.status.v1
+    type: adapter
+    entrypoint: "adapters/personal-memory"
+    side_effect: read-only
+  - id: personal-memory.recall.v1
+    type: adapter
+    entrypoint: "adapters/personal-memory"
+    provider_kind: personal-memory
+    side_effect: read-only
+    object_types: [owner-profile, conversation, durable-fact, decision, project-reference]
+  - id: personal-memory.remember.v1
+    type: adapter
+    entrypoint: "adapters/personal-memory"
+    side_effect: bounded-private-write
+  - id: personal-memory.correct.v1
+    type: adapter
+    entrypoint: "adapters/personal-memory"
+    side_effect: bounded-private-write
+  - id: personal-memory.forget.v1
+    type: adapter
+    entrypoint: "adapters/personal-memory"
+    side_effect: explicit-private-delete
+  - id: personal-memory.index.v1
+    type: adapter
+    entrypoint: "adapters/personal-memory"
+    side_effect: rebuild-derived-index
+  - id: personal-memory.backup.v1
+    type: adapter
+    entrypoint: "adapters/personal-memory"
+    side_effect: private-backup-write
+  - id: personal-memory.configure.v1
+    type: adapter
+    entrypoint: "adapters/personal-memory"
+    side_effect: owner-authorized-runtime-config
+
+components:
+  skills: []
+  agents: []
+  adapters:
+    - "adapters/personal-memory"
+  workflows: []
+
+compatibility:
+  codex: native
+  claude-code: compatible
+  openclaw: native
+
+permissions:
+  risk_level: medium
+  network: "none; the adapter invokes only the registered local OpenClaw CLI and loopback Gateway behavior"
+  secrets: "never reads or prints credential values; official backups may contain credentials and therefore remain owner-only private artifacts outside Git"
+  filesystem:
+    read:
+      - "the registered private OpenClaw main workspace and its Markdown memory"
+      - "non-secret OpenClaw version, config-policy paths, memory status, and session counts through the CLI"
+    write:
+      - "bounded managed records in workspace/memory/explicit.md"
+      - "OpenClaw config through one validated patch after an official verified backup"
+      - "derived OpenClaw memory indexes and owner-only backup archives outside Git"
+
+dependencies:
+  - id: two-head-wu-core
+    version: ">=0.5.0 <1.0.0"
+    purpose: "Project authorization and current project path/capability resolution."
+  - id: openclaw
+    version: ">=2026.7.1-2"
+    purpose: "Native session persistence, memory-core, session-memory, FTS, Dreaming, and snapshot-aware backup CLI."
+
+recovery:
+  source_of_truth: "Private workspace Markdown for durable memory, OpenClaw session files/state for raw conversation history, and registered project repositories for implementation facts."
+  private_material: "USER.md, MEMORY.md, memory/, DREAMS.md, session transcripts, OpenClaw state, credentials, indexes, and backups remain outside Git."
+  rebuild_command: "capabilities/personal-memory/adapters/personal-memory configure --apply"
+  rollback: "Restore a verified OpenClaw archive or the pre-change config, preserve private Markdown and session history, and rebuild only memory-owned indexes; never delete the complete per-Agent SQLite database."
+
+tests:
+  - "capabilities/personal-memory/tests/test_personal_memory.sh"

@@ -1,0 +1,225 @@
+schema_version: 1
+protocol_min: 2
+protocol_max: 2
+adapters:
+  - capability_id: tool:codex-status
+    adapter: builtin:codex-status
+    executor_kind: tool
+    side_effect: read-only
+    replay_class: safe-read
+    input_schema:
+      type: object
+      additionalProperties: false
+    output_schema: two-head-wu.codex-status.v1
+  - capability_id: tool:runtime-status
+    adapter: builtin:runtime-status
+    executor_kind: tool
+    side_effect: read-only
+    replay_class: safe-read
+    input_schema:
+      type: object
+      additionalProperties: false
+    output_schema: two-head-wu.runtime-status.v1
+  - capability_id: tool:module-catalog
+    adapter: builtin:module-catalog
+    executor_kind: tool
+    side_effect: read-only
+    replay_class: safe-read
+    input_schema:
+      type: object
+      additionalProperties: false
+    output_schema: two-head-wu.module-catalog.v1
+  - capability_id: tool:identity-catalog
+    adapter: builtin:identity-catalog
+    executor_kind: tool
+    side_effect: read-only
+    replay_class: safe-read
+    input_schema:
+      type: object
+      additionalProperties: false
+    output_schema: two-head-wu.identity-catalog.v1
+  - capability_id: tool:resource-catalog
+    adapter: builtin:resource-catalog
+    executor_kind: tool
+    side_effect: read-only
+    replay_class: safe-read
+    input_schema:
+      type: object
+      properties:
+        id: {type: string, maxLength: 63}
+      additionalProperties: false
+    output_schema: two-head-wu.resource-catalog.v1
+  - capability_id: mcp-tool:openai-docs
+    adapter: mcp:openai-docs
+    executor_kind: tool
+    side_effect: read-only
+    replay_class: safe-read
+    input_schema:
+      type: object
+      required: [action]
+      properties:
+        action: {type: string}
+        query: {type: string, maxLength: 2000}
+        limit: {type: integer}
+        cursor: {type: string, maxLength: 1024}
+        url: {type: string, maxLength: 2000}
+        anchor: {type: string, maxLength: 512}
+        languages: {type: array}
+        code_examples_only: {type: boolean}
+      additionalProperties: false
+    output_schema: two-head-wu.openai-docs.v1
+  - capability_id: research-library:search
+    adapter: research-library:search
+    executor_kind: tool
+    side_effect: read-only
+    replay_class: safe-read
+    input_schema:
+      type: object
+      required: [query]
+      properties:
+        query: {type: string, maxLength: 2000}
+        type:
+          type: string
+          enum: [article, conference-paper, thesis, book, chapter, interview, web-article, report, published-owner-work]
+        limit: {type: integer, minimum: 1, maximum: 100}
+      additionalProperties: false
+    output_schema: two-head-wu.research-library.search.v1
+  - capability_id: research-library:get
+    adapter: research-library:get
+    executor_kind: tool
+    side_effect: read-only
+    replay_class: safe-read
+    input_schema:
+      type: object
+      required: [work_id]
+      properties:
+        work_id: {type: string, pattern: "^[0-9a-fA-F-]{36}$"}
+        version: {type: string, maxLength: 36}
+      additionalProperties: false
+    output_schema: two-head-wu.research-library.get.v1
+  - capability_id: memory:notebook
+    adapter: memory:notebook
+    executor_kind: tool
+    side_effect: local-write
+    replay_class: idempotent-write
+    input_schema:
+      type: object
+      required: [action]
+      properties:
+        action: {type: string, enum: [recall, remember, correct, forget]}
+        query: {type: string, maxLength: 500}
+        text: {type: string, maxLength: 2000}
+        category: {type: string, enum: [identity, preference, project, decision, fact]}
+        project_id: {type: string, pattern: "^[a-z0-9][a-z0-9-]{0,39}$"}
+        record_id: {type: string, pattern: "^pm-[0-9]{8}T[0-9]{6}-[a-f0-9]{8}$"}
+        max_results: {type: integer, minimum: 1, maximum: 5}
+      additionalProperties: false
+    output_schema: two-head-wu.personal-memory.owner-air.v1
+  - capability_id: research-library:export
+    adapter: research-library:export
+    executor_kind: tool
+    side_effect: external-write
+    replay_class: owner-confirmation-required
+    requires_owner_confirmation: true
+    input_schema:
+      type: object
+      required: [artifact_id, expected_sha256]
+      properties:
+        artifact_id: {type: string, pattern: "^[0-9a-fA-F-]{36}$"}
+        expected_sha256: {type: string, pattern: "^[a-f0-9]{64}$"}
+      additionalProperties: false
+    output_schema: two-head-wu.research-library.export.v1
+  - capability_id: workflow:sync-air
+    adapter: workflow:sync-air
+    executor_kind: workflow
+    side_effect: external-write
+    replay_class: owner-confirmation-required
+    requires_owner_confirmation: true
+    structured_stdout: true
+    command: [capabilities/remote-work/adapters/air-sync-pipeline]
+    input_schema: {type: object, additionalProperties: false}
+    output_schema: two-head-wu.air-sync.v1
+  - capability_id: workflow:refresh-documentation
+    adapter: workflow:refresh-documentation
+    executor_kind: workflow
+    side_effect: local-write
+    replay_class: owner-confirmation-required
+    requires_owner_confirmation: true
+    command: [core/bin/wu-docs, update]
+    input_schema: {type: object, additionalProperties: false}
+    output_schema: two-head-wu.workflow-result.v1
+  - capability_id: workflow:verify-change
+    adapter: workflow:verify-change
+    executor_kind: workflow
+    side_effect: read-only
+    replay_class: safe-read
+    requires_owner_confirmation: false
+    command: [core/bin/wu-docs, verify]
+    input_schema: {type: object, additionalProperties: false}
+    output_schema: two-head-wu.workflow-result.v1
+  - capability_id: workflow:capabilities-inventory
+    adapter: workflow:capabilities-inventory
+    executor_kind: workflow
+    side_effect: local-write
+    replay_class: owner-confirmation-required
+    requires_owner_confirmation: true
+    command: [scripts/capabilities-manager, audit-updates, --write]
+    input_schema: {type: object, additionalProperties: false}
+    output_schema: two-head-wu.workflow-result.v1
+  - capability_id: workflow:sync-skill-surfaces
+    adapter: workflow:sync-skill-surfaces
+    executor_kind: workflow
+    side_effect: local-write
+    replay_class: owner-confirmation-required
+    requires_owner_confirmation: true
+    command: [scripts/capabilities-manager, sync-skills, --apply]
+    input_schema: {type: object, additionalProperties: false}
+    output_schema: two-head-wu.workflow-result.v1
+  - capability_id: workflow:refresh-topology
+    adapter: workflow:refresh-topology
+    executor_kind: workflow
+    side_effect: local-write
+    replay_class: owner-confirmation-required
+    requires_owner_confirmation: true
+    command: [skills/工具skills/system-cartographer/scripts/update_topology.rb, --root, .]
+    input_schema: {type: object, additionalProperties: false}
+    output_schema: two-head-wu.workflow-result.v1
+  - capability_id: workflow:spec-kit-health
+    adapter: workflow:spec-kit-health
+    executor_kind: workflow
+    side_effect: read-only
+    replay_class: safe-read
+    requires_owner_confirmation: false
+    command: [capabilities/spec-kit-governance/adapters/spec-kit-governance, doctor]
+    input_schema: {type: object, additionalProperties: false}
+    output_schema: two-head-wu.workflow-result.v1
+  - capability_id: workflow:server-operations-health
+    adapter: workflow:server-operations-health
+    executor_kind: workflow
+    side_effect: read-only
+    replay_class: safe-read
+    requires_owner_confirmation: false
+    command: [capabilities/server-operations/adapters/server-operations, health]
+    input_schema: {type: object, additionalProperties: false}
+    output_schema: two-head-wu.workflow-result.v1
+  - capability_id: workflow:remote-work-bootstrap-health
+    adapter: workflow:remote-work-bootstrap-health
+    executor_kind: workflow
+    side_effect: read-only
+    replay_class: safe-read
+    requires_owner_confirmation: false
+    command: [capabilities/remote-work-bootstrap/adapters/remote-work-bootstrap, health]
+    input_schema: {type: object, additionalProperties: false}
+    output_schema: two-head-wu.workflow-result.v1
+  - capability_id: workflow:remote-work-health
+    adapter: workflow:remote-work-health
+    executor_kind: workflow
+    side_effect: read-only
+    replay_class: safe-read
+    requires_owner_confirmation: false
+    command: [capabilities/remote-work/adapters/remote-work-admin, health]
+    input_schema: {type: object, additionalProperties: false}
+    output_schema: two-head-wu.workflow-result.v1
+
+# MCP、数据库、记忆和其他 Agent 只有在这里拥有具体适配器、在签名能力目录登记，且通过
+# 运行时兼容检查后才会对 Air 变成 callable。不存在“看到模块名字就自动获得权限”的旁路。

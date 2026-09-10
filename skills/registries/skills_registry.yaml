@@ -1,0 +1,72 @@
+version: 2
+updated_at: "2026-09-10"
+project_root: "."
+management:
+  paradigm: "source -> immutable release -> audit -> approval -> profile -> generated surface"
+  unified_interface: core/bin/wu
+  manager_script: scripts/skills-manager
+  capability_manager_script: scripts/capabilities-manager
+  capability_registry: registries/capabilities_registry.yaml
+  release_registry: skills/registries/skill_releases.json
+  profile_registry: skills/registries/skill_profiles.yaml
+skills:
+  - name: two-head-wu
+    category: system/capability-interface
+    provenance: public-source
+    status: active
+    path: capabilities/two-head-wu-core/skills/two-head-wu
+    entrypoint: SKILL.md
+    risk_level: low
+    network_access: none
+    filesystem_access: read_catalog_write_audit_log
+    purpose: "通过确定性的 wu 接口解析两头乌能力。"
+  - name: agent-identity
+    category: system/codex-identity
+    provenance: public-source
+    status: active
+    path: capabilities/agent-identity/skills/agent-identity
+    entrypoint: SKILL.md
+    risk_level: medium
+    network_access: native_codex_login_only
+    filesystem_access: external_private_identity_registry
+    purpose: "管理命名 Codex 身份和会话路由，不读取凭据正文。"
+  - name: skills-dashboard
+    category: system/architecture
+    provenance: public-source
+    status: active
+    path: capabilities/skills-dashboard/skills/skills-dashboard
+    entrypoint: SKILL.md
+    risk_level: low
+    network_access: loopback_only
+    filesystem_access: read_registries_write_own_runtime_state
+    purpose: "查看 Skill、能力包和运行时关系。"
+  - name: server-operations
+    category: infrastructure/static-sites
+    provenance: public-source
+    status: active
+    path: capabilities/server-operations/skills/server-operations
+    entrypoint: SKILL.md
+    risk_level: high
+    network_access: protected_example_targets_only
+    filesystem_access: checked_static_source_and_redacted_receipts
+    purpose: "通过受保护执行器发布已检查的静态内容。"
+  - name: remote-work-bootstrap
+    category: system/remote-operations
+    provenance: public-source
+    status: active
+    path: capabilities/remote-work-bootstrap/skills/remote-work-bootstrap
+    entrypoint: SKILL.md
+    risk_level: critical
+    network_access: fixed_registered_example_target_only
+    filesystem_access: declared_remote_runtime_root_after_approval
+    purpose: "初始化固定远程运行环境。"
+  - name: remote-work
+    category: system/multi-device-codex
+    provenance: public-source
+    status: active
+    path: capabilities/remote-work/skills/remote-work
+    entrypoint: SKILL.md
+    risk_level: critical
+    network_access: registered_control_plane_only
+    filesystem_access: filtered_project_capsules_and_review_only_results
+    purpose: "连接获准设备、能力和可恢复 Codex 任务。"

@@ -1,0 +1,94 @@
+name: two-head-wu-agent-observability
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server@sha256:4b14982a78c47d9ecc76ac3b13a0bfd2a31eed1f486fff6e944bcc5e08da2da9
+    platform: linux/arm64
+    environment:
+      CLICKHOUSE_PASSWORD: ${OPENLIT_DB_PASSWORD}
+      CLICKHOUSE_USER: ${OPENLIT_DB_USER:-openlit}
+      CLICKHOUSE_DATABASE: ${OPENLIT_DB_NAME:-openlit}
+      CLICKHOUSE_ALWAYS_RUN_INITDB_SCRIPTS: "true"
+    volumes:
+      - ${TWO_HEAD_WU_OBSERVABILITY_DATA_ROOT}/clickhouse:/var/lib/clickhouse
+      - ./clickhouse-config.xml:/etc/clickhouse-server/config.d/two-head-wu.xml:ro
+      - ./clickhouse-init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - clickhouse-client --user="$${CLICKHOUSE_USER}" --password="$${CLICKHOUSE_PASSWORD}" --query='SELECT 1' || exit 1
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  openlit:
+    image: ghcr.io/openlit/openlit@sha256:13369868868680efee0fbbdf6a109b8229a364f02e3310ce28a0c6cd95f149e2
+    platform: linux/arm64
+    environment:
+      TELEMETRY_ENABLED: "false"
+      INIT_DB_HOST: clickhouse
+      INIT_DB_PORT: "8123"
+      INIT_DB_DATABASE: ${OPENLIT_DB_NAME:-openlit}
+      INIT_DB_USERNAME: ${OPENLIT_DB_USER:-openlit}
+      INIT_DB_PASSWORD: ${OPENLIT_DB_PASSWORD}
+      SQLITE_DATABASE_URL: file:/app/client/data/data.db
+      PORT: "3000"
+      DOCKER_PORT: "3000"
+      OPAMP_ENVIRONMENT: production
+      OPAMP_CERTS_DIR: /app/opamp/certs
+      OPAMP_TLS_INSECURE_SKIP_VERIFY: "false"
+      OPAMP_TLS_REQUIRE_CLIENT_CERT: "true"
+      OPAMP_TLS_MIN_VERSION: "1.2"
+      OPAMP_TLS_MAX_VERSION: "1.3"
+      OPAMP_LOG_LEVEL: warn
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - ${TWO_HEAD_WU_OBSERVABILITY_DATA_ROOT}/openlit:/app/client/data
+      - ./otel-collector-config.yaml:/etc/otel/otel-collector-config.yaml:ro
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 45s
+    restart: unless-stopped
+
+  collector:
+    image: ghcr.io/openlit/openlit@sha256:13369868868680efee0fbbdf6a109b8229a364f02e3310ce28a0c6cd95f149e2
+    platform: linux/arm64
+    entrypoint: ["/app/opamp/otelcontribcol"]
+    command: ["--config=/etc/otel/otel-collector-config.yaml"]
+    environment:
+      INIT_DB_HOST: clickhouse
+      INIT_DB_PORT: "8123"
+      INIT_DB_DATABASE: ${OPENLIT_DB_NAME:-openlit}
+      INIT_DB_USERNAME: ${OPENLIT_DB_USER:-openlit}
+      INIT_DB_PASSWORD: ${OPENLIT_DB_PASSWORD}
+    ports:
+      - "127.0.0.1:4319:4318"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel/otel-collector-config.yaml:ro
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:13133').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped

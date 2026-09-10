@@ -1,0 +1,30 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://two-head-wu.local/contracts/protected-asset.schema.yaml"
+title: "Two-Headed-Wu Protected Asset Record"
+type: object
+additionalProperties: false
+required:
+  - id
+  - kind
+  - summary
+  - classification
+  - status
+  - access
+  - private_ref
+properties:
+  id:
+    type: string
+    pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+  kind:
+    enum: [recovery-record, secret-store, protected-binding]
+  summary:
+    type: string
+  classification:
+    enum: [private-operational, secret-critical]
+  status:
+    enum: [owner-confirmed-present, migration-pending, protected]
+  access:
+    enum: [human-recovery-only, protected-executor-only, references-only]
+  private_ref:
+    type: string
+    pattern: "^private://two-head-wu/[a-z0-9/-]+$"

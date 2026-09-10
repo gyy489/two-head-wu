@@ -1,0 +1,471 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "date"
+require "json"
+require "net/http"
+require "open3"
+require "optparse"
+require "pathname"
+require "securerandom"
+require "socket"
+require "time"
+require "timeout"
+require "uri"
+require "yaml"
+
+require_relative "../lib/protected_ssh_target"
+
+class RemoteWorkBootstrapError < StandardError; end
+
+class RemoteWorkBootstrap
+  RESOURCE_ID = "edge-server"
+  PROJECT_ID = "two-head-wu"
+  PACKAGE_ID = "remote-work-bootstrap"
+  SITE_IDS = %w[private-site public-site].freeze
+  REQUIRED_ACTIONS = %w[probe-remote-work-ssh bootstrap-remote-work-storage].freeze
+  STORAGE_ROOT = "/srv/two-head-wu"
+  SYSTEM_IDENTITY = "twoheadwu"
+  SSH_TARGET_ENV = "TWO_HEAD_WU_ALIYUN_SSH_TARGET"
+  TARGET_PATTERN = /\A(?:[a-z_][a-z0-9_-]*@)?[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\z/i
+  SSH_OPTIONS = [
+    "-oBatchMode=yes",
+    "-oPasswordAuthentication=no",
+    "-oKbdInteractiveAuthentication=no",
+    "-oChallengeResponseAuthentication=no",
+    "-oStrictHostKeyChecking=yes",
+    "-oConnectTimeout=8",
+    "-oConnectionAttempts=1",
+    "-oLogLevel=ERROR"
+  ].freeze
+
+  INSPECT_SCRIPT = <<~'SH'.freeze
+    set -eu
+    printf 'kernel=%s\n' "$(uname -s)"
+    if id twoheadwu >/dev/null 2>&1; then
+      printf 'system_identity=present\n'
+    else
+      printf 'system_identity=absent\n'
+    fi
+    if [ -L /srv/two-head-wu ]; then
+      printf 'runtime_root=unsafe-symlink\n'
+    elif [ -d /srv/two-head-wu ]; then
+      printf 'runtime_root=present\n'
+    elif [ -e /srv/two-head-wu ]; then
+      printf 'runtime_root=unsafe-nondirectory\n'
+    else
+      printf 'runtime_root=absent\n'
+    fi
+    if [ "$(id -u)" -eq 0 ]; then
+      printf 'bootstrap_privilege=root\n'
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+      printf 'bootstrap_privilege=passwordless-sudo\n'
+    else
+      printf 'bootstrap_privilege=unavailable\n'
+    fi
+  SH
+
+  BOOTSTRAP_SCRIPT = <<~'SH'.freeze
+    set -eu
+    runtime_root=/srv/two-head-wu
+    runtime_user=twoheadwu
+
+    as_root() {
+      if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+      else
+        sudo -n "$@"
+      fi
+    }
+
+    if [ "$(id -u)" -ne 0 ]; then
+      command -v sudo >/dev/null 2>&1 || { printf 'result=privilege-unavailable\n'; exit 73; }
+      sudo -n true >/dev/null 2>&1 || { printf 'result=privilege-unavailable\n'; exit 73; }
+    fi
+    [ ! -L "$runtime_root" ] || { printf 'result=unsafe-runtime-root\n'; exit 74; }
+    if [ -e "$runtime_root" ] && [ ! -d "$runtime_root" ]; then
+      printf 'result=unsafe-runtime-root\n'
+      exit 74
+    fi
+    if [ -d "$runtime_root" ] && [ -n "$(find "$runtime_root" -mindepth 1 -maxdepth 1 -print -quit)" ] && [ ! -f "$runtime_root/state/bootstrap-v1" ]; then
+      printf 'result=conflicting-runtime-root\n'
+      exit 75
+    fi
+
+    nologin_path=$(command -v nologin || true)
+    [ -n "$nologin_path" ] || nologin_path=/usr/sbin/nologin
+    if id "$runtime_user" >/dev/null 2>&1; then
+      account_record=$(getent passwd "$runtime_user" || true)
+      account_home=$(printf '%s' "$account_record" | cut -d: -f6)
+      account_shell=$(printf '%s' "$account_record" | cut -d: -f7)
+      account_group=$(id -gn "$runtime_user")
+      [ "$account_home" = "$runtime_root" ] || { printf 'result=conflicting-system-identity\n'; exit 76; }
+      [ "$account_group" = "$runtime_user" ] || { printf 'result=conflicting-system-identity\n'; exit 76; }
+      case "$account_shell" in
+        */nologin|*/false) ;;
+        *) printf 'result=conflicting-system-identity\n'; exit 76 ;;
+      esac
+    else
+      command -v useradd >/dev/null 2>&1 || { printf 'result=useradd-unavailable\n'; exit 77; }
+      as_root useradd --system --user-group --home-dir "$runtime_root" --shell "$nologin_path" "$runtime_user"
+    fi
+
+    as_root install -d -o "$runtime_user" -g "$runtime_user" -m 0750 "$runtime_root"
+    for directory in components jobs jobs/inbox jobs/results state backups; do
+      as_root install -d -o "$runtime_user" -g "$runtime_user" -m 0750 "$runtime_root/$directory"
+    done
+    as_root install -d -o "$runtime_user" -g "$runtime_user" -m 0700 "$runtime_root/tmp"
+
+    marker=$(mktemp)
+    trap 'rm -f "$marker"' EXIT HUP INT TERM
+    printf 'schema_version=1\nresource=edge-server\nidentity_role=two-head-wu-remote-runtime\n' >"$marker"
+    as_root install -o "$runtime_user" -g "$runtime_user" -m 0640 "$marker" "$runtime_root/state/bootstrap-v1"
+    printf 'result=ok\nsystem_identity=ready\nruntime_root=ready\n'
+  SH
+
+  def initialize(arguments)
+    @arguments = arguments.dup
+    @root = Pathname.new(__dir__).join("../../..").expand_path.cleanpath
+  end
+
+  def run
+    command = @arguments.shift || "help"
+    case command
+    when "help", "--help", "-h" then help
+    when "health" then health
+    when "install-target" then install_target
+    when "target-status" then target_status
+    when "probe" then probe
+    when "auth-check" then auth_check
+    when "inspect" then inspect_remote
+    when "bootstrap" then bootstrap
+    else raise RemoteWorkBootstrapError, "unknown command: #{command}"
+    end
+  rescue OptionParser::ParseError
+    warn "Error: invalid command options"
+    2
+  rescue RemoteWorkBootstrapError, KeyError, Psych::Exception, SocketError, SystemCallError, Timeout::Error => error
+    warn "Error: #{error.message}"
+    2
+  end
+
+  private
+
+  def help
+    puts <<~HELP
+      Usage: remote-work-bootstrap COMMAND [OPTIONS]
+
+      Commands:
+        health
+        install-target --project two-head-wu --approve  # reads TWO_HEAD_WU_ALIYUN_SSH_TARGET once
+        target-status
+        probe      --project two-head-wu
+        auth-check --project two-head-wu
+        inspect    --project two-head-wu
+        bootstrap  --project two-head-wu --approve
+
+      Fixed resource: edge-server
+      Fixed root:     /srv/two-head-wu
+      No host, user, path, key, config, or remote-command argument is accepted.
+    HELP
+    0
+  end
+
+  def health
+    ensure_no_arguments!
+    catalogs = load_catalogs
+    validate_catalogs!(catalogs)
+    puts "remote-work-bootstrap health ok"
+    puts "resource: edge-server"
+    puts "runtime identity role: two-head-wu-remote-runtime"
+    puts "websites protected: private-site, public-site"
+    _value, source = ProtectedSshTarget.read(SSH_TARGET_ENV)
+    puts "ssh target: #{source == 'keychain' ? 'protected Keychain reference ready' : 'process-scoped reference required for authentication'}"
+    0
+  end
+
+  def install_target
+    options = parse_project_options!(allow_approve: true)
+    raise RemoteWorkBootstrapError, "--approve is required to store the local protected target" unless options[:approve]
+    catalogs = authorized_catalogs!(options.fetch(:project))
+    value = ENV.fetch(SSH_TARGET_ENV, "").strip
+    raise RemoteWorkBootstrapError, "the process-scoped SSH target is required for installation" if value.empty?
+    validate_ssh_target!(value)
+    validate_target_resource!(value, catalogs)
+    ProtectedSshTarget.install(value)
+    puts "resource: edge-server"
+    puts "ssh_target_reference: keychain-ready"
+    0
+  rescue RuntimeError => error
+    raise RemoteWorkBootstrapError, error.message
+  end
+
+  def target_status
+    ensure_no_arguments!
+    value, source = ProtectedSshTarget.read(SSH_TARGET_ENV)
+    ready = !value.empty? && TARGET_PATTERN.match?(value)
+    puts "resource: edge-server"
+    puts "ssh_target_reference: #{ready ? 'ready' : 'missing'}"
+    puts "source: #{ready ? source : 'none'}"
+    ready ? 0 : 2
+  end
+
+  def probe
+    options = parse_project_options!
+    catalogs = authorized_catalogs!(options.fetch(:project))
+    site_status = check_sites!(catalogs)
+    host = public_probe_host(catalogs)
+    protocol = ssh_banner_protocol(host)
+    puts "resource: edge-server"
+    puts "dns_tcp_22: ok"
+    puts "ssh_banner: ok (#{protocol})"
+    print_site_status(site_status)
+    write_receipt("probe", site_status, "ssh-banner-ok")
+    0
+  end
+
+  def auth_check
+    options = parse_project_options!
+    catalogs = authorized_catalogs!(options.fetch(:project))
+    ssh_target
+    site_status = check_sites!(catalogs)
+    _stdout, stderr, status = run_ssh("printf 'two-head-wu-ssh-ok\\n'")
+    raise RemoteWorkBootstrapError, "SSH authentication failed: #{classify_ssh_error(stderr)}" unless status.success?
+
+    puts "resource: edge-server"
+    puts "ssh_authentication: ok"
+    print_site_status(site_status)
+    write_receipt("auth-check", site_status, "ssh-authentication-ok")
+    0
+  end
+
+  def inspect_remote
+    options = parse_project_options!
+    catalogs = authorized_catalogs!(options.fetch(:project))
+    site_status = check_sites!(catalogs)
+    stdout, stderr, status = run_ssh("sh -s", stdin_data: INSPECT_SCRIPT)
+    raise RemoteWorkBootstrapError, "SSH inspection failed: #{classify_ssh_error(stderr)}" unless status.success?
+
+    fields = parse_remote_fields(stdout, %w[kernel system_identity runtime_root bootstrap_privilege])
+    puts "resource: edge-server"
+    fields.each { |key, value| puts "#{key}: #{value}" }
+    print_site_status(site_status)
+    write_receipt("inspect", site_status, fields)
+    0
+  end
+
+  def bootstrap
+    options = parse_project_options!(allow_approve: true)
+    raise RemoteWorkBootstrapError, "--approve is required for the external bootstrap" unless options[:approve]
+
+    catalogs = authorized_catalogs!(options.fetch(:project))
+    before = check_sites!(catalogs)
+    stdout, stderr, status = run_ssh("sh -s", stdin_data: BOOTSTRAP_SCRIPT)
+    unless status.success?
+      result = safe_remote_result(stdout)
+      reason = result || classify_ssh_error(stderr)
+      raise RemoteWorkBootstrapError, "remote bootstrap stopped: #{reason}"
+    end
+    fields = parse_remote_fields(stdout, %w[result system_identity runtime_root])
+    raise RemoteWorkBootstrapError, "remote bootstrap returned an invalid result" unless fields["result"] == "ok"
+
+    after = check_sites!(catalogs)
+    raise RemoteWorkBootstrapError, "registered website status changed during bootstrap" unless equivalent_site_status?(before, after)
+
+    puts "resource: edge-server"
+    puts "remote bootstrap: ok"
+    puts "system identity: two-head-wu-remote-runtime ready"
+    puts "runtime root: ready"
+    print_site_status(after)
+    write_receipt("bootstrap", after, "runtime-ready")
+    0
+  end
+
+  def parse_project_options!(allow_approve: false)
+    options = {}
+    parser = OptionParser.new do |item|
+      item.on("--project ID") { |value| options[:project] = value }
+      item.on("--approve") { options[:approve] = true } if allow_approve
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    raise RemoteWorkBootstrapError, "--project is required" unless options[:project]
+    options
+  end
+
+  def ensure_no_arguments!
+    raise RemoteWorkBootstrapError, "unexpected arguments" unless @arguments.empty?
+  end
+
+  def load_catalogs
+    {
+      resources: Array(load_yaml("catalog/resources/infrastructure.yaml").fetch("resources")),
+      sites: Array(load_yaml("catalog/deployments/personal-static-sites.yaml").fetch("sites")),
+      policy: load_yaml("catalog/policies/remote-work-bootstrap.yaml"),
+      projects: Array(load_yaml("registries/projects_registry.yaml").fetch("projects"))
+    }
+  end
+
+  def load_yaml(relative_path)
+    YAML.safe_load(@root.join(relative_path).read(encoding: "UTF-8"), permitted_classes: [Date, Time], aliases: false)
+  end
+
+  def authorized_catalogs!(project_id)
+    catalogs = load_catalogs
+    validate_catalogs!(catalogs)
+    project = catalogs.fetch(:projects).find { |item| item.fetch("id") == project_id }
+    raise RemoteWorkBootstrapError, "unknown project: #{project_id}" unless project
+    raise RemoteWorkBootstrapError, "only project two-head-wu may use this bootstrap" unless project_id == PROJECT_ID
+    packages = Array(project.dig("capabilities", "packages"))
+    raise RemoteWorkBootstrapError, "project is not bound to remote-work-bootstrap" unless packages.include?(PACKAGE_ID)
+    resources = Array(project.dig("resources", "allowed"))
+    required = [RESOURCE_ID] + SITE_IDS
+    raise RemoteWorkBootstrapError, "project is missing required registered resources" unless (required - resources).empty?
+    catalogs
+  end
+
+  def validate_catalogs!(catalogs)
+    resource = catalogs.fetch(:resources).find { |item| item.fetch("id") == RESOURCE_ID }
+    raise RemoteWorkBootstrapError, "edge-server is not registered" unless resource
+    actions = Array(resource.dig("operations", "allowed_actions"))
+    raise RemoteWorkBootstrapError, "edge-server bootstrap actions are not registered" unless (REQUIRED_ACTIONS - actions).empty?
+    sites = catalogs.fetch(:sites).select { |item| SITE_IDS.include?(item.fetch("id")) }
+    raise RemoteWorkBootstrapError, "the two registered websites are incomplete" unless sites.map { |item| item.fetch("id") }.sort == SITE_IDS
+    raise RemoteWorkBootstrapError, "a registered website no longer targets edge-server" unless sites.all? { |item| item.fetch("target_resource") == RESOURCE_ID }
+    policy = catalogs.fetch(:policy)
+    raise RemoteWorkBootstrapError, "bootstrap policy ID mismatch" unless policy.fetch("id") == PACKAGE_ID
+    raise RemoteWorkBootstrapError, "runtime root drift" unless policy.dig("remote_runtime", "root") == STORAGE_ROOT
+    raise RemoteWorkBootstrapError, "system identity drift" unless policy.dig("remote_runtime", "system_identity") == SYSTEM_IDENTITY
+    raise RemoteWorkBootstrapError, "website guard must forbid content changes" unless policy.dig("website_guard", "content_change") == "forbidden"
+  end
+
+  def public_probe_host(catalogs)
+    site = catalogs.fetch(:sites).find { |item| item.fetch("id") == "public-site" }
+    uri = URI(site.fetch("public_url"))
+    raise RemoteWorkBootstrapError, "public probe endpoint must use HTTPS" unless uri.scheme == "https"
+    uri.host
+  end
+
+  def ssh_banner_protocol(host)
+    socket = Socket.tcp(host, 22, connect_timeout: 8)
+    line = Timeout.timeout(8) { socket.gets&.strip }
+    raise RemoteWorkBootstrapError, "TCP 22 opened but no SSH banner was received" unless line&.match?(/\ASSH-(?:2\.0|1\.99)-/)
+    line.split("-", 3).first(2).join("-")
+  ensure
+    socket&.close
+  end
+
+  def check_sites!(catalogs)
+    SITE_IDS.each_with_object({}) do |site_id, result|
+      site = catalogs.fetch(:sites).find { |item| item.fetch("id") == site_id }
+      uri = URI(site.fetch("public_url"))
+      raise RemoteWorkBootstrapError, "registered site must use HTTPS" unless uri.scheme == "https"
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = true
+      http.open_timeout = 8
+      http.read_timeout = 12
+      request = Net::HTTP::Get.new(uri.request_uri, "User-Agent" => "two-head-wu-remote-work-bootstrap/0.1")
+      response = http.request(request)
+      code = response.code.to_i
+      acceptable = (200..399).cover?(code) || (site_id == "private-site" && [401, 403].include?(code))
+      raise RemoteWorkBootstrapError, "registered website guard failed for #{site_id}" unless acceptable
+      result[site_id] = code
+    end
+  rescue OpenSSL::SSL::SSLError, Net::OpenTimeout, Net::ReadTimeout, Errno::ECONNREFUSED => error
+    raise RemoteWorkBootstrapError, "registered website guard failed: #{error.class}"
+  end
+
+  def print_site_status(status)
+    status.each { |site_id, code| puts "site #{site_id}: reachable (HTTP #{code})" }
+  end
+
+  def equivalent_site_status?(before, after)
+    before.keys.sort == after.keys.sort && before.all? do |site_id, code|
+      code == after.fetch(site_id)
+    end
+  end
+
+  def ssh_target
+    value, = ProtectedSshTarget.read(SSH_TARGET_ENV)
+    if value.empty?
+      raise RemoteWorkBootstrapError,
+            "protected SSH target is not installed for secret://remote-work-bootstrap/edge-server/ssh-target"
+    end
+    validate_ssh_target!(value)
+    value
+  end
+
+  def validate_ssh_target!(value)
+    raise RemoteWorkBootstrapError, "protected SSH target has an invalid shape" unless TARGET_PATTERN.match?(value)
+  end
+
+  def validate_target_resource!(value, catalogs)
+    target_host = value.split("@", 2).last
+    registered_host = public_probe_host(catalogs)
+    target_addresses = Socket.getaddrinfo(target_host, nil, Socket::AF_UNSPEC, Socket::SOCK_STREAM).map { |item| item[3] }.uniq
+    registered_addresses = Socket.getaddrinfo(registered_host, nil, Socket::AF_UNSPEC, Socket::SOCK_STREAM).map { |item| item[3] }.uniq
+    if (target_addresses & registered_addresses).empty?
+      raise RemoteWorkBootstrapError, "protected SSH target does not resolve to the registered edge-server resource"
+    end
+  rescue SocketError
+    raise RemoteWorkBootstrapError, "cannot verify the protected SSH target against edge-server"
+  end
+
+  def run_ssh(remote_command, stdin_data: nil)
+    command = ["ssh", *SSH_OPTIONS, ssh_target, remote_command]
+    Open3.capture3({ "LC_ALL" => "C" }, *command, stdin_data: stdin_data.to_s)
+  end
+
+  def classify_ssh_error(stderr)
+    text = stderr.to_s.downcase
+    return "host-key-not-trusted" if text.include?("host key verification failed") || text.include?("no host key is known")
+    return "public-key-authentication-failed" if text.include?("permission denied")
+    return "connection-timeout" if text.include?("timed out") || text.include?("operation timed out")
+    return "connection-refused" if text.include?("connection refused")
+    return "name-resolution-failed" if text.include?("could not resolve") || text.include?("name or service not known")
+    "ssh-command-failed"
+  end
+
+  def parse_remote_fields(output, allowed_keys)
+    values = {}
+    output.to_s.each_line do |line|
+      key, value = line.strip.split("=", 2)
+      next unless allowed_keys.include?(key)
+      raise RemoteWorkBootstrapError, "remote response contains an invalid value" unless value&.match?(/\A[a-zA-Z0-9._-]+\z/)
+      values[key] = value
+    end
+    missing = allowed_keys - values.keys
+    raise RemoteWorkBootstrapError, "remote response is missing required fields" unless missing.empty?
+    values
+  end
+
+  def safe_remote_result(output)
+    line = output.to_s.lines.find { |item| item.start_with?("result=") }
+    value = line&.split("=", 2)&.last&.strip
+    value if value&.match?(/\A[a-z0-9-]+\z/)
+  end
+
+  def write_receipt(operation, site_status, result)
+    directory = @root.join("var/remote-work-bootstrap/receipts")
+    FileUtils.mkdir_p(directory.to_s, mode: 0o700)
+    File.chmod(0o700, directory.to_s)
+    timestamp = Time.now.utc
+    request_id = "rwb-#{timestamp.strftime('%Y%m%dT%H%M%SZ')}-#{SecureRandom.hex(4)}"
+    receipt = {
+      "schema_version" => 1,
+      "request_id" => request_id,
+      "operation" => operation,
+      "timestamp" => timestamp.iso8601,
+      "resource" => RESOURCE_ID,
+      "site_guard" => site_status,
+      "result" => result
+    }
+    path = directory.join("#{request_id}.json")
+    File.open(path.to_s, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+      file.write(JSON.pretty_generate(receipt) + "\n")
+    end
+  end
+end
+
+exit RemoteWorkBootstrap.new(ARGV).run

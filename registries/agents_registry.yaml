@@ -1,0 +1,16 @@
+version: 1
+updated_at: "2026-09-10"
+agents:
+  - id: two-head-wu
+    name: 两头乌 OpenClaw 适配器
+    kind: compatibility_runtime_agent
+    category: integration
+    status: public-reference
+    manifest: agents/manifests/two-head-wu.yaml
+    runtime_host: openclaw
+    brain_runtime: codex
+    fallback_runtime: claude-code
+    capability_registry: registries/capabilities_registry.yaml
+    mcp_registry: catalog/mcp_registry.yaml
+    permissions_profile: workspace_confined
+    owner: example-owner

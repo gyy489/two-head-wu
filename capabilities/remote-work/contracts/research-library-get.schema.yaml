@@ -1,0 +1,52 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Two-Headed-Wu remote research-library document metadata
+type: object
+required: [schema, source_device, observed_at, document]
+properties:
+  schema: {const: two-head-wu.research-library.get.v1}
+  source_device: {const: mac-mini-worker}
+  observed_at: {type: string}
+  document: {$ref: "#/$defs/document"}
+additionalProperties: false
+$defs:
+  uuid: {type: string, format: uuid}
+  creator:
+    type: object
+    required: [name, role, ordinal]
+    properties:
+      name: {type: string}
+      role: {type: string}
+      ordinal: {type: integer, minimum: 0}
+    additionalProperties: false
+  document:
+    type: object
+    required: [id, work_id, version_id, role, sha256, bytes, canonical_title, kind, export_available, citation_authority]
+    properties:
+      id: {$ref: "#/$defs/uuid"}
+      work_id: {$ref: "#/$defs/uuid"}
+      version_id: {$ref: "#/$defs/uuid"}
+      role: {type: string}
+      sha256: {type: string, pattern: "^[a-f0-9]{64}$"}
+      mime: {type: string}
+      bytes: {type: integer, minimum: 1}
+      language: {type: [string, "null"]}
+      generator: {type: [string, "null"]}
+      quality_status: {type: [string, "null"]}
+      authoritative: {type: [integer, boolean]}
+      created_at: {type: string}
+      canonical_title: {type: string}
+      kind: {type: string}
+      publication_date: {type: [string, "null"]}
+      version_kind: {type: string}
+      doi: {type: [string, "null"]}
+      publisher: {type: [string, "null"]}
+      journal: {type: [string, "null"]}
+      volume: {type: [string, "null"]}
+      issue: {type: [string, "null"]}
+      pages: {type: [string, "null"]}
+      creators:
+        type: array
+        items: {$ref: "#/$defs/creator"}
+      export_available: {type: boolean}
+      citation_authority: {enum: [original, non-authoritative]}
+    additionalProperties: false

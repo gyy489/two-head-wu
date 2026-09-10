@@ -1,0 +1,513 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "date"
+require "digest"
+require "fileutils"
+require "json"
+require "optparse"
+require "pathname"
+require "securerandom"
+require "time"
+require "yaml"
+
+class SitePublisherError < StandardError; end
+
+# Public side of the personal site-publishing capability. It intentionally has no SSH,
+# rsync, private-config, or remote-server access. Codex uses it to turn a local static
+# directory into a checked, immutable publication request; the separate private executor
+# then performs the fixed two-site upload without receiving arbitrary connection arguments.
+class ServerOperations
+  SITE_IDS = %w[private-site public-site].freeze
+  FORBIDDEN_RESOURCE_KEYS = %w[address ip port hostname host username ssh_alias ssh_profile credential password token private_key key_path remote_path config configuration].freeze
+  FORBIDDEN_VALUE_PATTERNS = [/(?:\d{1,3}\.){3}\d{1,3}/, /-----BEGIN [A-Z ]+-----/].freeze
+  FORBIDDEN_FILE_EXTENSIONS = %w[.pem .key .p12 .pfx .kdbx .sqlite .sqlite3 .db .sql .dump .bak].freeze
+  FORBIDDEN_DYNAMIC_EXTENSIONS = %w[.php .phtml .cgi .fcgi .pl .py .rb .sh .bash .zsh .ps1].freeze
+  FORBIDDEN_FILE_NAMES = %w[id_rsa id_dsa id_ecdsa id_ed25519 authorized_keys credentials secrets .htaccess nginx.conf caddyfile].freeze
+  BUILD_OUTPUT_DIRECTORY_NAMES = %w[dist build out public _site export].freeze
+
+  def initialize(arguments)
+    @arguments = arguments.dup
+    @root = Pathname.new(__dir__).join("../../..").expand_path.cleanpath
+  end
+
+  def run
+    command = @arguments.shift || "help"
+    case command
+    when "help", "--help", "-h" then help
+    when "health" then health
+    when "preflight" then preflight
+    when "publish" then publish
+    when "plan", "apply" then retired_command(command)
+    else raise SitePublisherError, "unknown command: #{command}"
+    end
+  rescue OptionParser::ParseError
+    warn "Error: invalid command options"
+    2
+  rescue SitePublisherError, KeyError, Psych::Exception => error
+    warn "Error: #{error.message}"
+    2
+  end
+
+  private
+
+  def help
+    puts <<~HELP
+      Usage: server-operations COMMAND [OPTIONS]
+
+      Commands:
+        health
+        preflight --project ID --site SITE_ID --source DIRECTORY
+        publish --project ID --site SITE_ID --source DIRECTORY
+
+      Registered sites: private-site, public-site
+      This public adapter has no SSH, rsync, private-config, network, or generic server command.
+    HELP
+    0
+  end
+
+  def health
+    ensure_no_arguments!
+    catalogs = load_catalogs
+    validate_catalogs!(catalogs)
+    puts "server-operations health ok"
+    puts "resources: #{catalogs.fetch(:resources).length}"
+    puts "sites:     #{catalogs.fetch(:sites).length}"
+    puts "publisher: Codex-driven automatic publication preparation ready; private executor configuration is checked separately"
+    0
+  end
+
+  def preflight
+    options = parse_preflight_options!
+    catalogs = load_catalogs
+    validate_catalogs!(catalogs)
+    site, project = authorized_site!(catalogs, options.fetch(:project), options.fetch(:site))
+    source = authorized_source_directory!(options.fetch(:source), project)
+    artifact = scan_source!(source)
+    receipt = build_preflight(options.fetch(:project), site, artifact)
+    path = write_receipt(project, "preflights", receipt.fetch("preflight_id"), receipt)
+
+    puts "preflight_id: #{receipt.fetch('preflight_id')}"
+    puts "site: #{receipt.fetch('site_id')}"
+    puts "artifact_digest: #{receipt.fetch('artifact_digest')}"
+    puts "files: #{receipt.fetch('file_count')}"
+    puts "bytes: #{receipt.fetch('total_bytes')}"
+    puts "receipt: #{display_receipt_path(project, path)}"
+    puts "next: Codex may prepare an automatic publication without --approve"
+    0
+  end
+
+  def publish
+    options = parse_publish_options!
+    catalogs = load_catalogs
+    validate_catalogs!(catalogs)
+    site, project = authorized_site!(catalogs, options.fetch(:project), options.fetch(:site))
+    source = authorized_source_directory!(options.fetch(:source), project)
+    source_artifact = scan_source!(source)
+    preflight = build_preflight(options.fetch(:project), site, source_artifact)
+    write_receipt(project, "preflights", preflight.fetch("preflight_id"), preflight)
+
+    stamp = Time.now.utc
+    publication_id = receipt_id("publish", site.fetch("id"), stamp)
+    snapshot = freeze_snapshot!(
+      source,
+      project,
+      publication_id,
+      site,
+      source_artifact.fetch("artifact_digest"),
+      stamp
+    )
+    snapshot_artifact = scan_source!(snapshot)
+    snapshot_source_artifact = scan_source!(snapshot, skip_release_marker: true)
+    unless snapshot_source_artifact.fetch("artifact_digest") == source_artifact.fetch("artifact_digest")
+      raise SitePublisherError, "source directory changed during snapshot"
+    end
+    request = build_publication_request(
+      publication_id,
+      options.fetch(:project),
+      site,
+      preflight,
+      source_artifact,
+      snapshot_artifact,
+      stamp
+    )
+    request_path = write_receipt(project, "publish-requests", publication_id, request)
+
+    puts "publication_id: #{publication_id}"
+    puts "preflight_id: #{preflight.fetch('preflight_id')}"
+    puts "site: #{site.fetch('id')}"
+    puts "artifact_digest: #{snapshot_artifact.fetch('artifact_digest')}"
+    puts "files: #{snapshot_artifact.fetch('file_count')}"
+    puts "bytes: #{snapshot_artifact.fetch('total_bytes')}"
+    puts "request: #{display_receipt_path(project, request_path)}"
+    puts "next: private-site-publisher publish --release #{publication_id}"
+    0
+  end
+
+  def retired_command(command)
+    raise SitePublisherError,
+          "#{command} was retired: this private Skill only supports resource query and static-artifact preflight"
+  end
+
+  def parse_preflight_options!
+    options = {}
+    parser = OptionParser.new do |item|
+      item.on("--project ID") { |value| options[:project] = value }
+      item.on("--site ID") { |value| options[:site] = value }
+      item.on("--source DIRECTORY") { |value| options[:source] = value }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    %i[project site source].each { |key| raise SitePublisherError, "--#{key} is required" unless options[key] }
+    options
+  end
+
+  def parse_publish_options!
+    options = {}
+    parser = OptionParser.new do |item|
+      item.on("--project ID") { |value| options[:project] = value }
+      item.on("--site ID") { |value| options[:site] = value }
+      item.on("--source DIRECTORY") { |value| options[:source] = value }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    %i[project site source].each { |key| raise SitePublisherError, "--#{key} is required" unless options[key] }
+    options
+  end
+
+  def load_catalogs
+    infrastructure = load_yaml("catalog/resources/infrastructure.yaml")
+    deployments = load_yaml("catalog/deployments/personal-static-sites.yaml")
+    policy = load_yaml("catalog/policies/server-operations.yaml")
+    projects = load_yaml("registries/projects_registry.yaml")
+    {
+      resources: Array(infrastructure.fetch("resources")).select do |resource|
+        resource["capability"] == "server-operations"
+      end,
+      sites: Array(deployments.fetch("sites")),
+      policy: policy,
+      projects: Array(projects.fetch("projects"))
+    }
+  end
+
+  def validate_catalogs!(catalogs)
+    resources = catalogs.fetch(:resources)
+    sites = catalogs.fetch(:sites)
+    raise SitePublisherError, "resource IDs are duplicated" unless resources.map { |item| item.fetch("id") }.uniq.length == resources.length
+    raise SitePublisherError, "site IDs are duplicated" unless sites.map { |item| item.fetch("id") }.uniq.length == sites.length
+    raise SitePublisherError, "this private publisher must have exactly four registered machines" unless resources.length == 4
+    raise SitePublisherError, "this private publisher must have exactly two registered sites" unless sites.map { |item| item.fetch("id") }.sort == SITE_IDS
+    resources.each { |resource| validate_resource!(resource) }
+    sites.each { |site| validate_site!(site, resources) }
+
+    publisher_policy = catalogs.fetch(:policy).fetch("personal_site_publisher")
+    raise SitePublisherError, "policy must name exactly the two registered sites" unless Array(publisher_policy.fetch("allowed_sites")).sort == SITE_IDS
+    raise SitePublisherError, "generic remote shell must remain denied" unless Array(publisher_policy.fetch("denied_operations")).include?("remote-shell")
+  end
+
+  def validate_resource!(resource)
+    %w[id kind summary classification roles operations policy_ref private_ref secret_ref_count].each do |key|
+      raise SitePublisherError, "resource #{resource.fetch('id', 'unknown')} missing #{key}" unless resource.key?(key)
+    end
+    scan_forbidden!(resource)
+    raise SitePublisherError, "invalid private reference" unless resource.fetch("private_ref").start_with?("private://two-head-wu/")
+  end
+
+  def validate_site!(site, resources)
+    %w[id public_url access content_mode lifecycle target_resource publication_policy private_ref].each do |key|
+      raise SitePublisherError, "site #{site.fetch('id', 'unknown')} missing #{key}" unless site.key?(key)
+    end
+    raise SitePublisherError, "site is not registered for this publisher" unless SITE_IDS.include?(site.fetch("id"))
+    raise SitePublisherError, "site must be static-only" unless site.fetch("content_mode") == "static_only"
+    raise SitePublisherError, "site must be persistent mutable" unless site.fetch("lifecycle") == "persistent_mutable"
+    raise SitePublisherError, "site target is not registered" unless resources.any? { |resource| resource.fetch("id") == site.fetch("target_resource") }
+    raise SitePublisherError, "invalid private reference" unless site.fetch("private_ref").start_with?("private://two-head-wu/")
+    raise SitePublisherError, "site publication is not protected by a private executor" unless site.dig("publication_policy", "execution_status") == "codex-driven-private-executor-required"
+    scan_forbidden!(site)
+    if site.fetch("id") == "public-site"
+      raise SitePublisherError, "public-site must have no expiry" unless site.fetch("expiry") == "none"
+      raise SitePublisherError, "public-site must be public" unless site.fetch("access") == "public"
+    end
+  end
+
+  def scan_forbidden!(value)
+    case value
+    when Hash
+      value.each do |key, child|
+        raise SitePublisherError, "forbidden resource field: #{key}" if FORBIDDEN_RESOURCE_KEYS.include?(key.to_s)
+        scan_forbidden!(child)
+      end
+    when Array
+      value.each { |child| scan_forbidden!(child) }
+    when String
+      raise SitePublisherError, "forbidden raw network or key value" if FORBIDDEN_VALUE_PATTERNS.any? { |pattern| pattern.match?(value) }
+    end
+  end
+
+  def authorized_site!(catalogs, project_id, site_id)
+    site = find_record(catalogs.fetch(:sites), site_id, "site")
+    project = catalogs.fetch(:projects).find { |item| item.fetch("id") == project_id }
+    raise SitePublisherError, "unknown project: #{project_id}" unless project
+    packages = Array(project.dig("capabilities", "packages"))
+    raise SitePublisherError, "project #{project_id} is not bound to server-operations" unless packages.include?("server-operations")
+    allowed_resources = Array(project.dig("resources", "allowed"))
+    unless allowed_resources.include?(site.fetch("id")) && allowed_resources.include?(site.fetch("target_resource"))
+      raise SitePublisherError, "project #{project_id} is not bound to site #{site.fetch('id')}"
+    end
+
+    [site, project]
+  end
+
+  def authorized_source_directory!(raw_source, project)
+    source = secure_source_directory!(raw_source)
+    workspace = project_workspace!(project)
+    prefix = "#{workspace}#{File::SEPARATOR}"
+    raise SitePublisherError, "source directory is outside the registered project workspace" unless source.to_s.start_with?(prefix)
+    raise SitePublisherError, "source directory must be a static build output" unless BUILD_OUTPUT_DIRECTORY_NAMES.include?(source.basename.to_s)
+
+    source
+  rescue Errno::ENOENT, Errno::EACCES
+    raise SitePublisherError, "registered project workspace is unavailable"
+  end
+
+  def scan_source!(raw_source, skip_release_marker: false)
+    source = secure_source_directory!(raw_source)
+
+    digest = Digest::SHA256.new
+    report = { "file_count" => 0, "total_bytes" => 0 }
+    scan_directory!(source, source, digest, report, skip_release_marker: skip_release_marker)
+    raise SitePublisherError, "source directory has no files to publish" if report.fetch("file_count").zero?
+
+    report.merge("artifact_digest" => digest.hexdigest)
+  rescue Errno::ENOENT, Errno::EACCES
+    raise SitePublisherError, "source directory is unavailable"
+  end
+
+  def secure_source_directory!(raw_source)
+    source = Pathname.new(raw_source).expand_path
+    raise SitePublisherError, "source directory must not be a symbolic link" if source.symlink?
+    raise SitePublisherError, "source directory is unavailable" unless source.directory?
+
+    Pathname.new(File.realpath(source.to_s)).cleanpath
+  rescue Errno::ENOENT, Errno::EACCES
+    raise SitePublisherError, "source directory is unavailable"
+  end
+
+  def scan_directory!(root, directory, digest, report, skip_release_marker:)
+    Dir.children(directory).sort.each do |name|
+      path = directory.join(name)
+      relative = path.relative_path_from(root).to_s
+      next if skip_release_marker && relative == ".two-head-wu-release.json"
+
+      stat = path.lstat
+      raise SitePublisherError, "artifact contains a symbolic link" if stat.symlink?
+      raise SitePublisherError, "artifact contains a prohibited secret, private, or server-executable file" if forbidden_artifact_path?(relative)
+
+      if stat.directory?
+        digest.update("D\0#{relative}\0")
+        scan_directory!(root, path, digest, report, skip_release_marker: skip_release_marker)
+      elsif stat.file?
+        file_digest = Digest::SHA256.file(path.to_s).hexdigest
+        digest.update("F\0#{relative}\0#{stat.size}\0#{file_digest}\0")
+        report["file_count"] += 1
+        report["total_bytes"] += stat.size
+      else
+        raise SitePublisherError, "artifact contains an unsupported filesystem entry"
+      end
+    end
+  end
+
+  def forbidden_artifact_path?(relative)
+    components = relative.split(File::SEPARATOR)
+    return true if components.any? { |component| %w[.git .hg .svn].include?(component) }
+
+    name = components.last.downcase
+    return true if name.start_with?(".env")
+    return true if FORBIDDEN_FILE_NAMES.include?(name)
+    extension = File.extname(name)
+    FORBIDDEN_FILE_EXTENSIONS.include?(extension) || FORBIDDEN_DYNAMIC_EXTENSIONS.include?(extension)
+  end
+
+  def build_preflight(project_id, site, artifact)
+    stamp = Time.now.utc
+    {
+      "schema_version" => 1,
+      "preflight_id" => receipt_id("preflight", site.fetch("id"), stamp),
+      "created_at" => stamp.iso8601,
+      "project_id" => project_id,
+      "site_id" => site.fetch("id"),
+      "artifact_digest" => artifact.fetch("artifact_digest"),
+      "file_count" => artifact.fetch("file_count"),
+      "total_bytes" => artifact.fetch("total_bytes"),
+      "checks" => ["static-directory", "no-symbolic-links", "no-private-or-secret-files", "no-server-executable-files", "non-empty-artifact"],
+      "network_access" => "none"
+    }
+  end
+
+  def freeze_snapshot!(source, project, publication_id, site, source_artifact_digest, stamp)
+    staging_root = receipt_directory(project, "publish-staging")
+    release_root = staging_root.join(publication_id)
+    artifact_root = release_root.join("artifact")
+    FileUtils.mkdir_p(release_root.to_s, mode: 0o700)
+    File.chmod(0o700, release_root.to_s)
+    FileUtils.mkdir_p(artifact_root.to_s, mode: 0o700)
+    File.chmod(0o700, artifact_root.to_s)
+    copy_directory_contents!(source, source, artifact_root)
+    marker = {
+      "schema_version" => 2,
+      "publication_id" => publication_id,
+      "site_id" => site.fetch("id"),
+      "source_artifact_digest" => source_artifact_digest,
+      "prepared_at" => stamp.iso8601
+    }
+    marker_path = artifact_root.join(".two-head-wu-release.json")
+    File.open(marker_path.to_s, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+      file.write(JSON.generate(marker) + "\n")
+    end
+    artifact_root
+  rescue SystemCallError
+    raise SitePublisherError, "could not freeze publication snapshot"
+  end
+
+  def copy_directory_contents!(source_root, source_directory, destination_directory)
+    ensure_directory_within_root!(source_root, source_directory, "source directory changed during snapshot")
+    Dir.children(source_directory).sort.each do |name|
+      source_path = source_directory.join(name)
+      relative = source_path.relative_path_from(source_root).to_s
+      stat = source_path.lstat
+      raise SitePublisherError, "source directory changed during snapshot" if stat.symlink? || forbidden_artifact_path?(relative)
+
+      destination_path = destination_directory.join(name)
+      if stat.directory?
+        ensure_directory_within_root!(source_root, source_path, "source directory changed during snapshot")
+        FileUtils.mkdir_p(destination_path.to_s, mode: 0o700)
+        File.chmod(0o700, destination_path.to_s)
+        copy_directory_contents!(source_root, source_path, destination_path)
+      elsif stat.file?
+        copy_regular_file!(source_path, destination_path, stat)
+      else
+        raise SitePublisherError, "source directory changed during snapshot"
+      end
+    end
+  rescue Errno::ENOENT, Errno::EACCES
+    raise SitePublisherError, "source directory changed during snapshot"
+  end
+
+  def copy_regular_file!(source_path, destination_path, expected_stat)
+    flags = File::RDONLY
+    flags |= File::NOFOLLOW if File.const_defined?(:NOFOLLOW)
+    File.open(source_path.to_s, flags) do |input|
+      actual = input.stat
+      unchanged = actual.file? && actual.dev == expected_stat.dev && actual.ino == expected_stat.ino && actual.size == expected_stat.size
+      raise SitePublisherError, "source directory changed during snapshot" unless unchanged
+
+      File.open(destination_path.to_s, File::WRONLY | File::CREAT | File::EXCL, 0o600) { |output| IO.copy_stream(input, output) }
+    end
+  rescue Errno::ELOOP
+    raise SitePublisherError, "source directory changed during snapshot"
+  end
+
+  def ensure_directory_within_root!(source_root, candidate, message)
+    stat = candidate.lstat
+    raise SitePublisherError, message if stat.symlink? || !stat.directory?
+    root = Pathname.new(File.realpath(source_root.to_s)).cleanpath
+    resolved = Pathname.new(File.realpath(candidate.to_s)).cleanpath
+    prefix = "#{root}#{File::SEPARATOR}"
+    raise SitePublisherError, message unless resolved == root || resolved.to_s.start_with?(prefix)
+  rescue Errno::ENOENT, Errno::EACCES
+    raise SitePublisherError, message
+  end
+
+  def build_publication_request(publication_id, project_id, site, preflight, source_artifact, artifact, stamp)
+    {
+      "schema_version" => 2,
+      "publication_id" => publication_id,
+      "created_at" => stamp.iso8601,
+      "project_id" => project_id,
+      "site_id" => site.fetch("id"),
+      "preflight_id" => preflight.fetch("preflight_id"),
+      "artifact_digest" => artifact.fetch("artifact_digest"),
+      "source_artifact_digest" => source_artifact.fetch("artifact_digest"),
+      "file_count" => artifact.fetch("file_count"),
+      "total_bytes" => artifact.fetch("total_bytes"),
+      "execution" => "codex-driven-protected-executor"
+    }
+  end
+
+  def receipt_id(kind, site_id, stamp)
+    "#{kind}-#{stamp.strftime('%Y%m%dT%H%M%SZ')}-#{site_id}-#{SecureRandom.hex(4)}"
+  end
+
+  def receipt_path(project, kind, receipt_id)
+    directory = receipt_directory(project, kind)
+    directory.join("#{receipt_id}.json")
+  end
+
+  def write_receipt(project, kind, receipt_id, receipt)
+    path = receipt_path(project, kind, receipt_id)
+    serialized = JSON.pretty_generate(receipt) + "\n"
+    File.open(path.to_s, File::WRONLY | File::CREAT | File::EXCL, 0o600) { |file| file.write(serialized) }
+    path
+  rescue Errno::EEXIST
+    raise SitePublisherError, "receipt ID collision"
+  rescue SystemCallError
+    raise SitePublisherError, "could not write local receipt"
+  end
+
+  def receipt_directory(project, kind)
+    raise SitePublisherError, "invalid receipt category" unless %w[preflights publish-requests publish-staging].include?(kind)
+
+    workspace = project_workspace!(project)
+    var_directory = workspace.join("var")
+    server_operations_directory = var_directory.join("server-ops")
+    ensure_real_directory!(var_directory)
+    ensure_real_directory!(server_operations_directory)
+    directory = server_operations_directory.join(kind)
+    ensure_real_directory!(directory)
+    directory
+  end
+
+  def display_receipt_path(project, path)
+    path.relative_path_from(project_workspace!(project)).to_s
+  rescue ArgumentError
+    raise SitePublisherError, "could not write local receipt"
+  end
+
+  def project_workspace!(project)
+    workspace = Pathname.new(project["workspace"] || project.fetch("path")).expand_path
+    workspace = Pathname.new(File.realpath(workspace.to_s)).cleanpath
+    raise SitePublisherError, "registered project workspace is unavailable" unless workspace.directory? && !workspace.symlink?
+
+    workspace
+  rescue Errno::ENOENT, Errno::EACCES
+    raise SitePublisherError, "registered project workspace is unavailable"
+  end
+
+  def ensure_real_directory!(path)
+    FileUtils.mkdir_p(path.to_s, mode: 0o700) unless path.exist?
+    File.chmod(0o700, path.to_s)
+    raise SitePublisherError, "local receipt directory is invalid" unless path.directory? && !path.symlink? && (path.stat.mode & 0o077).zero?
+  rescue SystemCallError
+    raise SitePublisherError, "local receipt directory is unavailable"
+  end
+
+  def find_record(records, id, kind)
+    item = records.find { |record| record.fetch("id") == id }
+    raise SitePublisherError, "unknown #{kind}: #{id}" unless item
+
+    item
+  end
+
+  def load_yaml(relative_path)
+    path = @root.join(relative_path)
+    raise SitePublisherError, "missing required file: #{relative_path}" unless path.file?
+
+    YAML.safe_load(path.read(encoding: "UTF-8"), permitted_classes: [Date, Time], aliases: false) || {}
+  end
+
+  def ensure_no_arguments!
+    raise SitePublisherError, "unknown command arguments supplied" unless @arguments.empty?
+  end
+end
+
+exit ServerOperations.new(ARGV).run

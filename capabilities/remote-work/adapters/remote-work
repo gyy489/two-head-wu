@@ -1,0 +1,2333 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "base64"
+require "fileutils"
+require "json"
+require "optparse"
+require "pathname"
+require "securerandom"
+require "shellwords"
+require "time"
+require "tmpdir"
+require "uri"
+require "yaml"
+
+require_relative "../lib/remote_work"
+
+class RemoteWorkClient
+  TERMINAL_STATES = %w[succeeded failed cancelled expired].freeze
+  POLICY_MODES = %w[off metadata-only on-demand auto-update pinned].freeze
+  MODULE_ID = /\A[a-z][a-z0-9-]*:[a-z][a-z0-9-]*\z/.freeze
+  JOB_ID = /\Ajob-[a-z0-9-]+\z/.freeze
+  INTERACTION_ID = /\Aask-[a-f0-9]{16}\z/.freeze
+  REQUEST_ID = /\Acall-[a-f0-9]{24}\z/.freeze
+  ARTIFACT_ID = /\Aart-[a-f0-9]{24}\z/.freeze
+  ON_USE_UPDATE_INTERVAL_SECONDS = 900
+
+  def initialize(arguments)
+    @arguments = arguments.dup
+    @root = Pathname.new(__dir__).join("../../..").expand_path.cleanpath
+    release_candidate = Pathname.new(__dir__).join("..").expand_path.cleanpath
+    @package_root = release_candidate.join("bin/wu").file? ? release_candidate : @root.join("capabilities/remote-work")
+    @config = RemoteWork::Config.new
+  end
+
+  def run
+    command = @arguments.shift || "help"
+    case command
+    when "help", "--help", "-h" then help
+    when "health" then health
+    when "enroll" then enroll
+    when "sync" then sync
+    when "abilities" then abilities
+    when "invoke" then invoke
+    when "bridge" then bridge
+    when "companion" then companion
+    when "projects" then projects
+    when "modules" then modules
+    when "models" then models
+    when "tools" then tools
+    when "devices" then devices
+    when "artifacts" then artifacts
+    when "policy" then policy
+    when "jobs" then jobs
+    when "update" then client_update
+    when "diagnose" then diagnose
+    else raise RemoteWork::Error, "未知 remote-work 命令：#{command}"
+    end
+  rescue OptionParser::ParseError => error
+    warn "错误：#{error.message}"
+    2
+  rescue RemoteWork::Error, KeyError, JSON::ParserError, Psych::Exception, Errno::EACCES, Errno::ENOENT => error
+    warn "错误：#{error.message}"
+    if @active_request_id
+      recovery = @active_request_kind == "artifact" ? "wu remote artifacts recover" : "wu remote jobs recover"
+      warn "提交恢复 ID：#{@active_request_id}（连接恢复后运行 #{recovery} #{@active_request_id}）"
+    end
+    2
+  end
+
+  private
+
+  def help
+    puts <<~HELP
+      两头乌多端工作（个人版 #{RemoteWork::VERSION}）
+
+      常用中文入口：
+        wu 同步两头乌Air
+        wu 能做什么
+        wu 本地能力
+        wu 远端能力
+        wu 同步能力
+        wu 调用能力 CAPABILITY_ID
+        wu 查看账号
+        wu 查看资源 [RESOURCE_ID]
+        wu 查OpenAI文档 QUERY
+        wu 运行工作流 WORKFLOW_ID [--confirm]
+        wu 同步项目 [JOB_ID]
+        wu 查看项目桥 [JOB_ID]
+        wu 安装能力桥
+        wu 查看能力桥
+        wu 查看交互伴侣
+        wu 查看模块
+        wu 查看附件
+        wu 上传附件 FILE
+        wu 附件任务 ARTIFACT_ID INSTRUCTION
+        wu 查看额度
+        wu 查看设备
+        wu 拉取模块 MODULE_ID
+        wu 自动更新 MODULE_ID
+        wu 远程任务 INSTRUCTION
+        wu 查看任务 [JOB_ID]
+        wu 接收结果 JOB_ID
+        wu 诊断
+
+      结构化命令：
+        wu remote enroll --endpoint URL --device NAME --token-env ENV [--secret-store keychain|file]
+        wu remote sync air
+        wu remote abilities list|local|remote [--json] [--cached]
+        wu remote abilities sync
+        wu remote invoke CAPABILITY_ID [--input-json JSON] [--timeout SECONDS] [--confirm] [--json]
+        wu remote bridge install|status
+        wu remote companion install|status|once|run|prompt
+        wu remote projects status|sync [JOB_ID]
+        wu remote modules list|status|pull|update
+        wu remote models list
+        wu remote tools list
+        wu remote tools invoke TOOL_ID [--json] [--timeout SECONDS]
+        wu remote devices list
+        wu remote artifacts upload|list|fetch|remove|recover
+        wu remote policy set MODULE_ID off|metadata-only|on-demand|auto-update|pinned
+        wu remote jobs submit --project PATH [--artifact ARTIFACT_ID] [--request-id CALL_ID] -- INSTRUCTION
+        wu remote jobs status [JOB_ID]
+        wu remote jobs events JOB_ID [--after N]
+        wu remote jobs interactions JOB_ID
+        wu remote jobs reply JOB_ID INTERACTION_ID [--decision DECISION] [--answer ID=TEXT]
+        wu remote jobs follow JOB_ID [--timeout SECONDS]
+        wu remote jobs fetch JOB_ID
+        wu remote jobs cancel JOB_ID
+        wu remote jobs retry JOB_ID
+        wu remote jobs recover REQUEST_ID
+        wu remote update status|check|install|all
+        wu remote update channel stable|dev
+        wu remote update pin RELEASE_ID|unpin
+        wu remote diagnose
+    HELP
+    0
+  end
+
+  def health
+    ensure_no_arguments!
+    raise RemoteWork::Error, "客户端尚未配置" unless @config.configured?
+    device = http.get("me").fetch("device")
+    raise RemoteWork::Error, "客户端设备角色无效" unless %w[owner-air mac-mini-worker].include?(device.fetch("role"))
+    puts "remote-work health ok"
+    puts "version: #{RemoteWork::VERSION}"
+    puts "scope: owner-only"
+    puts "identity: owner-auto (owner-primary, owner-secondary)"
+    puts "configured: yes"
+    puts "role: #{device.fetch('role')}"
+    0
+  end
+
+  def sync
+    command = @arguments.shift
+    raise RemoteWork::Error, "未知 sync 命令：#{command}" unless command == "air"
+    sync_air
+  end
+
+  def client_update
+    command = @arguments.shift || "status"
+    case command
+    when "status" then client_update_status
+    when "check" then client_update_check
+    when "install" then client_update_install
+    when "all" then client_update_all
+    when "auto" then client_update_auto
+    when "channel" then client_update_channel
+    when "pin" then client_update_pin
+    when "unpin" then client_update_unpin
+    else raise RemoteWork::Error, "未知 update 命令：#{command}"
+    end
+  end
+
+  def client_update_status
+    ensure_no_arguments!
+    policy = update_policy
+    puts JSON.pretty_generate({
+      "current_release" => current_release_id,
+      "channel" => policy.fetch("channel"),
+      "pinned_release" => policy["pinned_release"],
+      "last_success" => policy["last_success"],
+      "last_checked_at" => policy["last_checked_at"],
+      "air_sync" => @config.state["air_sync"],
+      "on_use" => on_use_update_status.merge(
+        "enabled" => true,
+        "interval_seconds" => on_use_update_interval
+      )
+    }.compact)
+    0
+  end
+
+  def client_update_check
+    ensure_no_arguments!
+    manifest = selected_release_manifest
+    save_update_policy(update_policy.merge("last_checked_at" => Time.now.utc.iso8601))
+    puts JSON.pretty_generate({
+      "current_release" => current_release_id,
+      "available_release" => manifest.fetch("release_id"),
+      "channel" => manifest.fetch("channel"),
+      "update_available" => manifest.fetch("release_id") != current_release_id,
+      "signature" => "verified"
+    })
+    0
+  end
+
+  def client_update_install
+    ensure_no_arguments!
+    manifest = selected_release_manifest
+    changed = manifest.fetch("release_id") != current_release_id
+    installed = install_client_release(manifest)
+    pipeline = changed ? run_air_sync_pipeline(trigger: "client-update", quiet: false) : nil
+    installed = install_latest_after_pipeline if pipeline == :completed
+    record_on_use_update(
+      "last_result" => update_result_label(changed, pipeline),
+      "release_id" => installed
+    )
+    puts "客户端版本\t#{installed}\tcurrent"
+    pipeline == :failed ? 2 : 0
+  end
+
+  def client_update_all
+    ensure_no_arguments!
+    manifest = selected_release_manifest
+    changed = manifest.fetch("release_id") != current_release_id
+    installed = install_client_release(manifest)
+    pipeline = changed ? run_air_sync_pipeline(trigger: "client-update", quiet: false) : nil
+    installed = install_latest_after_pipeline if pipeline == :completed
+    record_on_use_update(
+      "last_result" => update_result_label(changed, pipeline),
+      "release_id" => installed
+    )
+    puts "客户端版本\t#{installed}\tcurrent"
+    modules_update
+    sync_capability_directory!(quiet: false)
+    pipeline == :failed ? 2 : 0
+  end
+
+  def client_update_auto
+    ensure_no_arguments!
+    return 0 unless @config.configured?
+
+    FileUtils.mkdir_p(@config.home.to_s, mode: 0o700)
+    File.open(on_use_update_lock_path.to_s, File::WRONLY | File::CREAT, 0o600) do |lock|
+      File.chmod(0o600, lock.path)
+      return 0 unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+      return 0 unless on_use_update_due?
+
+      attempted_at = Time.now.utc.iso8601
+      record_on_use_update("last_attempt_at" => attempted_at, "last_result" => "checking")
+      manifest = selected_release_manifest
+      changed = manifest.fetch("release_id") != current_release_id
+      installed = install_client_release(manifest)
+      pipeline = changed ? run_air_sync_pipeline(trigger: "client-update", quiet: true) : nil
+      installed = install_latest_after_pipeline if pipeline == :completed
+      if changed && pipeline != :failed
+        modules_update
+        sync_capability_directory!(quiet: true)
+      end
+      save_update_policy(update_policy.merge("last_checked_at" => attempted_at)) unless changed
+      record_on_use_update(
+        "last_attempt_at" => attempted_at,
+        "last_success_at" => Time.now.utc.iso8601,
+        "last_result" => update_result_label(changed, pipeline),
+        "release_id" => installed
+      )
+    rescue RemoteWork::Error, KeyError, JSON::ParserError, Errno::EACCES, Errno::ENOENT => error
+      record_on_use_update(
+        "last_attempt_at" => attempted_at || Time.now.utc.iso8601,
+        "last_result" => "failed",
+        "last_error" => error.message
+      )
+    ensure
+      lock.flock(File::LOCK_UN) rescue nil
+    end
+    0
+  end
+
+  def sync_air
+    ensure_no_arguments!
+    first_manifest = selected_release_manifest
+    first_changed = first_manifest.fetch("release_id") != current_release_id
+    installed = install_client_release(first_manifest)
+    puts "客户端预同步\t#{installed}\t#{first_changed ? 'updated' : 'current'}"
+
+    pipeline = run_air_sync_pipeline(trigger: "explicit-air-sync", quiet: false)
+    installed = install_latest_after_pipeline if pipeline == :completed
+    modules_update
+    sync_capability_directory!(quiet: false)
+    record_on_use_update(
+      "last_attempt_at" => Time.now.utc.iso8601,
+      "last_success_at" => Time.now.utc.iso8601,
+      "last_result" => "air-sync-#{pipeline}",
+      "release_id" => installed
+    )
+    puts "客户端最终版本\t#{installed}\tcurrent"
+    puts "Air 同步\t#{air_sync_label(pipeline)}"
+    pipeline == :failed ? 2 : 0
+  end
+
+  def run_air_sync_pipeline(trigger:, quiet:)
+    envelope = invoke_capability(
+      "workflow:sync-air", input: {}, timeout: 600, confirmed: true, wait: true
+    )
+    job_id = envelope["job_id"]
+    case envelope.fetch("state")
+    when "queued", "waiting_user"
+      save_air_sync_state(trigger: trigger, status: "queued", job_id: job_id, reason: envelope["fallback_reason"] || envelope["error"])
+      unless quiet
+        puts "Mini 流水线\t已排队\t#{job_id}"
+        puts "说明\tMini 恢复后继续；Air 交互伴侣会在完成时拉取新客户端、模块和能力目录"
+      end
+      :queued
+    when "succeeded"
+      output = envelope.fetch("output")
+      raise RemoteWork::Error, "Air 同步流水线返回了不受支持的结果" unless output["schema"] == "two-head-wu.air-sync.v1"
+      status = output.fetch("status")
+      case status
+      when "completed"
+        save_air_sync_state(trigger: trigger, status: "completed", job_id: job_id, catalog_version: output["catalog_version"])
+        puts "Mini 流水线\t完成\t#{job_id}" unless quiet
+        :completed
+      when "review-required"
+        pending = Array(output["pending_review"])
+        save_air_sync_state(trigger: trigger, status: "review-required", job_id: job_id, pending_review: pending)
+        unless quiet
+          puts "Mini 流水线\t等待审核\t#{job_id}"
+          pending.each { |item| puts "待审核\t#{item['skill']}\t#{item['runtime']}" }
+          puts "说明\t未知组件没有被自动授权或发布"
+        end
+        :review_required
+      else
+        save_air_sync_state(trigger: trigger, status: "failed", job_id: job_id, reason: "unknown pipeline status")
+        warn "Mini 流水线\t失败\t返回状态 #{status}" unless quiet
+        :failed
+      end
+    else
+      reason = envelope["error"] || envelope["fallback_reason"] || "本轮未能成功调用两头乌 Mini"
+      save_air_sync_state(trigger: trigger, status: "failed", job_id: job_id, reason: reason)
+      warn "Mini 流水线\t失败\t#{reason}" unless quiet
+      :failed
+    end
+  rescue RemoteWork::Error => error
+    save_air_sync_state(trigger: trigger, status: "failed", reason: error.message)
+    warn "Mini 流水线\t失败\t#{error.message}" unless quiet
+    :failed
+  end
+
+  def install_latest_after_pipeline
+    manifest = selected_release_manifest
+    install_client_release(manifest)
+  end
+
+  def save_air_sync_state(trigger:, status:, job_id: nil, reason: nil, catalog_version: nil, pending_review: nil)
+    state = @config.state
+    state["air_sync"] = {
+      "trigger" => trigger,
+      "status" => status,
+      "job_id" => job_id,
+      "reason" => reason.to_s[0, 1000],
+      "catalog_version" => catalog_version,
+      "pending_review" => pending_review,
+      "updated_at" => Time.now.utc.iso8601
+    }.compact
+    @config.save_state(state)
+  end
+
+  def update_result_label(changed, pipeline)
+    return "current" unless changed
+    return "updated" unless pipeline
+
+    "updated-pipeline-#{pipeline.to_s.tr('_', '-')}"
+  end
+
+  def air_sync_label(status)
+    {
+      completed: "completed",
+      queued: "queued",
+      review_required: "review-required",
+      failed: "failed"
+    }.fetch(status)
+  end
+
+  def client_update_channel
+    channel = @arguments.shift
+    ensure_no_arguments!
+    raise RemoteWork::Error, "更新通道必须是 stable 或 dev" unless %w[stable dev].include?(channel)
+    policy = update_policy.merge("channel" => channel)
+    policy.delete("pinned_release")
+    save_update_policy(policy)
+    reset_on_use_update_schedule!
+    puts "更新通道\t#{channel}"
+    0
+  end
+
+  def client_update_pin
+    release_id = @arguments.shift
+    ensure_no_arguments!
+    validate_release_id!(release_id)
+    manifest = http.get("client/releases/#{release_id}/manifest")
+    verify_release_manifest!(manifest)
+    save_update_policy(update_policy.merge("pinned_release" => release_id))
+    reset_on_use_update_schedule!
+    puts "固定版本\t#{release_id}"
+    0
+  end
+
+  def client_update_unpin
+    ensure_no_arguments!
+    policy = update_policy
+    policy.delete("pinned_release")
+    save_update_policy(policy)
+    reset_on_use_update_schedule!
+    puts "固定版本\t已取消"
+    0
+  end
+
+  def selected_release_manifest
+    policy = update_policy
+    pinned = policy["pinned_release"]
+    manifest = if pinned
+                 http.get("client/releases/#{validate_release_id!(pinned)}/manifest")
+               else
+                 http.get("client/releases/channels/#{policy.fetch('channel')}")
+               end
+    verify_release_manifest!(manifest)
+    manifest
+  end
+
+  def verify_release_manifest!(manifest)
+    RemoteWork::ReleaseSignature.verify!(manifest, release_public_key.read)
+    manifest
+  end
+
+  def install_client_release(manifest)
+    release_id = manifest.fetch("release_id")
+    return release_id if release_id == current_release_id
+
+    bytes = http.get_bytes("client/releases/#{validate_release_id!(release_id)}/archive")
+    raise RemoteWork::Error, "客户端更新包大小不匹配" unless bytes.bytesize == manifest.fetch("size")
+    actual = Digest::SHA256.hexdigest(bytes)
+    raise RemoteWork::Error, "客户端更新包哈希不匹配" unless secure_equal?(actual, manifest.fetch("sha256"))
+
+    install_base = Pathname.new(File.join(Dir.home, ".local", "share", "two-head-wu", "remote-work"))
+    releases = install_base.join("releases")
+    target = releases.join(release_id)
+    FileUtils.mkdir_p(releases.to_s, mode: 0o755)
+    unless target.directory?
+      Dir.mktmpdir(".release-", releases.to_s) do |temporary|
+        stage = Pathname.new(temporary)
+        archive = stage.join("release.tar.gz")
+        content = stage.join("content")
+        File.open(archive.to_s, "wb", 0o600) { |file| file.write(bytes) }
+        RemoteWork::Archive.unpack(archive, content)
+        validate_client_release!(content, manifest)
+        File.rename(content.to_s, target.to_s)
+      end
+    end
+    validate_client_release!(target, manifest)
+    run_release_health!(target)
+    switch_client_release!(target)
+    policy = update_policy.merge(
+      "last_success" => release_id,
+      "last_checked_at" => Time.now.utc.iso8601,
+      "previous_release" => current_release_id
+    )
+    save_update_policy(policy)
+    release_id
+  end
+
+  def validate_client_release!(root, manifest)
+    required = %w[bin/wu bin/wu-codex-status bin/two-head-wu-mcp adapters/remote-work lib/remote_work.rb VERSION RELEASE_ID share/release-signing-public.pub]
+    raise RemoteWork::Error, "客户端更新包不完整" unless required.all? { |relative| root.join(relative).file? }
+    raise RemoteWork::Error, "客户端更新包版本漂移" unless root.join("RELEASE_ID").read.strip == manifest.fetch("release_id")
+    embedded = OpenSSL::PKey::RSA.new(root.join("share/release-signing-public.pub").read)
+    trusted = OpenSSL::PKey::RSA.new(release_public_key.read)
+    raise RemoteWork::Error, "客户端更新包替换了受信任公钥" unless secure_equal?(Digest::SHA256.hexdigest(embedded.to_der), Digest::SHA256.hexdigest(trusted.to_der))
+    true
+  rescue OpenSSL::PKey::PKeyError
+    raise RemoteWork::Error, "客户端更新包公钥无效"
+  end
+
+  def run_release_health!(release)
+    _stdout, _stderr, status = Open3.capture3(
+      { "WU_REMOTE_SKIP_ON_USE_UPDATE" => "1" }, release.join("bin/wu").to_s, "remote", "health"
+    )
+    raise RemoteWork::Error, "新客户端健康检查失败，未切换版本" unless status.success?
+  end
+
+  def switch_client_release!(release)
+    bin_root = Pathname.new(File.join(Dir.home, ".local", "bin"))
+    FileUtils.mkdir_p(bin_root.to_s, mode: 0o755)
+    links = {
+      bin_root.join("wu") => release.join("bin/wu"),
+      bin_root.join("wu-codex-status") => release.join("bin/wu-codex-status"),
+      bin_root.join("two-head-wu-mcp") => release.join("bin/two-head-wu-mcp")
+    }
+    previous = {}
+    links.each_key do |link|
+      raise RemoteWork::Error, "更新目标已存在且不是两头乌管理的链接：#{link}" if link.exist? && !link.symlink?
+      previous[link] = link.symlink? ? File.readlink(link.to_s) : nil
+    end
+    links.each { |link, target| atomic_symlink(target, link) }
+    install_update_launch_agent(bin_root.join("wu"))
+    install_companion_launch_agent(bin_root.join("wu"))
+    ensure_codex_bridge!(bin_root.join("two-head-wu-mcp")) if command_available?("codex")
+    _stdout, _stderr, status = Open3.capture3(
+      { "WU_REMOTE_SKIP_ON_USE_UPDATE" => "1" }, release.join("bin/wu").to_s, "诊断"
+    )
+    raise RemoteWork::Error, "新客户端切换后诊断失败" unless status.success?
+  rescue StandardError
+    previous&.each do |link, target|
+      target ? atomic_symlink(Pathname.new(target), link) : FileUtils.rm_f(link.to_s)
+    end
+    raise
+  end
+
+  def atomic_symlink(target, link)
+    temporary = link.dirname.join(".#{link.basename}.#{Process.pid}.#{SecureRandom.hex(3)}")
+    File.symlink(target.to_s, temporary.to_s)
+    File.rename(temporary.to_s, link.to_s)
+  ensure
+    FileUtils.rm_f(temporary.to_s) if defined?(temporary) && temporary
+  end
+
+  def install_update_launch_agent(wu_link)
+    plist = Pathname.new(File.join(Dir.home, "Library", "LaunchAgents", "com.twoheadwu.remote-update.plist"))
+    log_root = @config.home
+    content = <<~PLIST
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+      <plist version="1.0"><dict>
+        <key>Label</key><string>com.twoheadwu.remote-update</string>
+        <key>ProgramArguments</key><array>
+          <string>#{xml_escape(wu_link.to_s)}</string><string>remote</string><string>update</string><string>all</string>
+        </array>
+        <key>StartInterval</key><integer>21600</integer>
+        <key>RunAtLoad</key><true/>
+        <key>StandardOutPath</key><string>#{xml_escape(log_root.join('update.log').to_s)}</string>
+        <key>StandardErrorPath</key><string>#{xml_escape(log_root.join('update-error.log').to_s)}</string>
+      </dict></plist>
+    PLIST
+    RemoteWork::Atomic.write(plist, content, mode: 0o600)
+    domain = "gui/#{Process.uid}"
+    system("launchctl", "bootout", domain, plist.to_s, out: File::NULL, err: File::NULL)
+    raise RemoteWork::Error, "无法启动客户端自动更新任务" unless system("launchctl", "bootstrap", domain, plist.to_s, out: File::NULL, err: File::NULL)
+  rescue Errno::ENOENT
+    raise RemoteWork::Error, "当前系统没有 launchctl，无法安装自动更新任务"
+  end
+
+  def update_policy
+    state = @config.state
+    state.fetch("client_update", {}).merge("channel" => state.dig("client_update", "channel") || "stable")
+  end
+
+  def save_update_policy(policy)
+    state = @config.state
+    state["client_update"] = policy
+    @config.save_state(state)
+  end
+
+  def on_use_update_interval
+    raw = ENV.fetch("WU_REMOTE_ON_USE_UPDATE_INTERVAL_SECONDS", ON_USE_UPDATE_INTERVAL_SECONDS.to_s)
+    value = Integer(raw, 10)
+    raise RemoteWork::Error, "使用时更新检查间隔无效" unless value.between?(0, 86_400)
+    value
+  rescue ArgumentError
+    raise RemoteWork::Error, "使用时更新检查间隔无效"
+  end
+
+  def on_use_update_due?
+    last_attempt = on_use_update_status["last_attempt_at"]
+    return true unless last_attempt
+
+    Time.now.utc - Time.iso8601(last_attempt) >= on_use_update_interval
+  rescue ArgumentError
+    true
+  end
+
+  def on_use_update_status
+    return {} unless on_use_update_status_path.file?
+    JSON.parse(on_use_update_status_path.read(encoding: "UTF-8")).slice(
+      "last_attempt_at", "last_success_at", "last_result", "last_error", "release_id"
+    )
+  rescue JSON::ParserError
+    {}
+  end
+
+  def record_on_use_update(values)
+    status = on_use_update_status.merge(values)
+    status.delete("last_error") unless values["last_result"] == "failed"
+    RemoteWork::Atomic.json(on_use_update_status_path, status, mode: 0o600)
+  end
+
+  def reset_on_use_update_schedule!
+    FileUtils.rm_f(on_use_update_status_path.to_s)
+  end
+
+  def on_use_update_status_path
+    @config.home.join("update-on-use.json")
+  end
+
+  def on_use_update_lock_path
+    @config.home.join("update-on-use.lock")
+  end
+
+  def current_release_id
+    path = @package_root.join("RELEASE_ID")
+    path.file? ? path.read.strip : "legacy-#{RemoteWork::VERSION}"
+  end
+
+  def release_public_key
+    override = ENV["WU_REMOTE_RELEASE_PUBLIC_KEY_FILE"]
+    path = if override && !override.empty?
+             Pathname.new(override).expand_path
+           elsif @package_root.join("share/release-signing-public.pub").file?
+             @package_root.join("share/release-signing-public.pub")
+           else
+             @package_root.join("keys/release-signing-public.pub")
+           end
+    raise RemoteWork::Error, "客户端缺少受信任的发布公钥；请使用最新版一次性安装器升级" unless path.file?
+    path
+  end
+
+  def validate_release_id!(value)
+    raise RemoteWork::Error, "发布 ID 无效" unless value && RemoteWork::ReleaseSignature::RELEASE_ID.match?(value)
+    value
+  end
+
+  def xml_escape(value)
+    value.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;").gsub('"', "&quot;").gsub("'", "&apos;")
+  end
+
+  def enroll
+    options = { secret_store: nil }
+    parser = OptionParser.new do |item|
+      item.on("--endpoint URL") { |value| options[:endpoint] = value }
+      item.on("--device NAME") { |value| options[:device] = value }
+      item.on("--token-env ENV") { |value| options[:token_env] = value }
+      item.on("--secret-store STORE") { |value| options[:secret_store] = value }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    endpoint = options.fetch(:endpoint) { raise RemoteWork::Error, "缺少 --endpoint" }
+    device = options.fetch(:device) { raise RemoteWork::Error, "缺少 --device" }
+    raise RemoteWork::Error, "设备名称无效" unless device.match?(/\A[a-z][a-z0-9-]{0,62}\z/)
+    token_env = options.fetch(:token_env) { raise RemoteWork::Error, "缺少 --token-env" }
+    raise RemoteWork::Error, "配对环境变量名称无效" unless token_env.match?(/\A[A-Z][A-Z0-9_]{0,63}\z/)
+    token = ENV[token_env].to_s
+    raise RemoteWork::Error, "配对环境变量为空" if token.empty?
+
+    result = RemoteWork::HTTPClient.enroll(
+      endpoint: endpoint,
+      token: token,
+      device_name: device,
+      secret_store: options[:secret_store],
+      config: @config
+    )
+    puts JSON.pretty_generate(result.merge("result" => "enrolled"))
+    0
+  end
+
+  def abilities
+    command = @arguments.shift || "list"
+    case command
+    when "list" then abilities_show(:all)
+    when "local" then abilities_show(:local)
+    when "remote" then abilities_show(:remote)
+    when "sync"
+      ensure_no_arguments!
+      sync_capability_directory!(quiet: false)
+      0
+    else
+      raise RemoteWork::Error, "未知 abilities 命令：#{command}"
+    end
+  end
+
+  def abilities_show(scope)
+    options = { json: false, cached: false }
+    parser = OptionParser.new do |item|
+      item.on("--json") { options[:json] = true }
+      item.on("--cached") { options[:cached] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    directory, source, warning = load_capability_directory(cached: options.fetch(:cached))
+    view = capability_view(directory, source: source, warning: warning)
+    view["local_capabilities"] = [] if scope == :remote
+    if scope == :local
+      view["remote_capabilities"] = []
+      view["models"] = []
+    end
+    inventory_entries = Array(view.dig("mini_inventory", "entries"))
+    inventory_entries = inventory_entries.select { |entry| %w[local portable].include?(entry["air_mode"]) } if scope == :local
+    inventory_entries = inventory_entries.reject { |entry| entry["air_mode"] == "local" } if scope == :remote
+    view["mini_inventory"] = inventory_summary(view.fetch("mini_inventory"), inventory_entries)
+    options.fetch(:json) ? puts(JSON.pretty_generate(view)) : print_capability_view(view, scope)
+    0
+  end
+
+  def sync_capability_directory!(quiet: false)
+    directory = http.get("capabilities")
+    verify_capability_directory!(directory)
+    cached = directory.merge("cached_at" => Time.now.utc.iso8601)
+    RemoteWork::Atomic.json(capability_cache_path, cached, mode: 0o600)
+    unless quiet
+      puts "能力目录\t已同步"
+      puts "目录版本\t#{directory.fetch('catalog').fetch('catalog_version')}"
+      puts "目录签名\tverified"
+      puts "观测时间\t#{directory.fetch('observed_at')}"
+    end
+    [directory, "live", nil]
+  end
+
+  def load_capability_directory(cached: false)
+    return [read_cached_capability_directory!, "cache", nil] if cached
+
+    sync_capability_directory!(quiet: true)
+  rescue RemoteWork::Error => error
+    raise unless error.message.start_with?("无法连接两头乌控制面") && capability_cache_path.file?
+
+    [read_cached_capability_directory!, "cache", error.message]
+  end
+
+  def read_cached_capability_directory!
+    raise RemoteWork::Error, "Air 尚无可信能力目录缓存；联网后运行 wu 同步能力" unless capability_cache_path.file?
+
+    value = JSON.parse(capability_cache_path.read(encoding: "UTF-8"))
+    verify_capability_directory!(value)
+    value
+  rescue JSON::ParserError
+    raise RemoteWork::Error, "Air 能力目录缓存无效；联网后运行 wu 同步能力"
+  end
+
+  def verify_capability_directory!(directory)
+    raise RemoteWork::Error, "能力目录响应格式不受支持" unless directory.fetch("schema_version") == 1
+    raise RemoteWork::Error, "控制面协议版本不兼容" unless directory.fetch("protocol_version") == RemoteWork::PROTOCOL_VERSION
+    RemoteWork::CapabilityCatalogSignature.verify!(directory.fetch("catalog"), release_public_key.read)
+    RemoteWork::CapabilityInventorySignature.verify!(directory.fetch("inventory"), release_public_key.read)
+    RemoteWork::ModuleSignature.verify!(directory.fetch("modules"), release_public_key.read)
+    runtime = directory.fetch("runtime")
+    raise RemoteWork::Error, "能力目录运行状态无效" unless runtime.is_a?(Hash) && runtime["devices"].is_a?(Array) && runtime["models"].is_a?(Hash)
+    raise RemoteWork::Error, "能力目录模型状态无效" unless runtime.dig("models", "models").is_a?(Array)
+    Array(runtime["devices"]).select { |item| item["role"] == "mac-mini-worker" }.each do |worker|
+      catalog = worker["runtime_catalog"]
+      valid = catalog.is_a?(Hash) && catalog["schema_version"] == 1 && catalog["protocol_min"].is_a?(Integer) &&
+              catalog["protocol_max"].is_a?(Integer) && catalog["runtimes"].is_a?(Array)
+      raise RemoteWork::Error, "Mini 运行时兼容目录无效" unless valid
+    end
+    true
+  rescue KeyError
+    raise RemoteWork::Error, "能力目录响应不完整"
+  end
+
+  def capability_cache_path
+    @config.home.join("capability-directory.json")
+  end
+
+  def capability_view(directory, source:, warning:)
+    catalog = directory.fetch("catalog")
+    modules = directory.fetch("modules")
+    runtime = directory.fetch("runtime")
+    worker = Array(runtime.fetch("devices")).find { |item| item["role"] == "mac-mini-worker" }
+    worker_compatible = worker && worker.fetch("compatibility", "incompatible") == "compatible"
+    live_worker = source == "live" && worker && worker["online"] && worker_compatible
+    provided = live_worker ? Array(worker["capabilities"]) : []
+    local = local_builtin_capabilities + local_module_capabilities(Array(modules.fetch("modules")))
+    remote = Array(catalog.fetch("capabilities")).select { |item| item["location"] != "air" }.map do |entry|
+      requirements = Array(entry["runtime_requires"])
+      availability = if entry["status"] != "active"
+                       "disabled"
+                     elsif entry["exposure"] == "metadata-only" || entry["invocation_policy"] == "unavailable"
+                       "metadata-only"
+                     elsif source == "cache"
+                       "unknown-cached"
+                     elsif worker && worker["online"] && !worker_compatible && entry["queueable"]
+                       "queueable-incompatible"
+                     elsif worker && worker["online"] && !worker_compatible
+                       "runtime-incompatible"
+                     elsif requirements.empty?
+                       "ready"
+                     elsif live_worker && (requirements - provided).empty?
+                       "ready"
+                     elsif !live_worker && entry["queueable"]
+                       "queueable-offline"
+                     elsif !live_worker
+                       "offline"
+                     else
+                       "runtime-missing"
+                     end
+      entry.slice(
+        "id", "name", "kind", "location", "exposure", "invocation_policy", "side_effect", "queueable",
+        "runtime_requires", "command", "data_location", "input_schema", "output_schema", "executor_kind",
+        "adapter", "capability_version", "replay_class", "approval_policy", "summary"
+      ).merge("availability" => availability)
+    end
+    remote_ids = remote.map { |entry| entry.fetch("id") }
+    Array(modules.fetch("modules")).select { |item| item["classification"] == "remote-only" && !remote_ids.include?(item["id"]) }.each do |item|
+      remote << {
+        "id" => item.fetch("id"),
+        "kind" => item.fetch("id").start_with?("mcp:") ? "mcp-tool" : "capability",
+        "location" => "mac-mini",
+        "exposure" => "metadata-only",
+        "invocation_policy" => "unavailable",
+        "side_effect" => "metadata-only",
+        "queueable" => false,
+        "runtime_requires" => [],
+        "summary" => item.fetch("summary"),
+        "availability" => "metadata-only"
+      }
+    end
+    local_by_id = local.each_with_object({}) { |entry, output| output[entry.fetch("id")] = entry }
+    remote_by_id = remote.each_with_object({}) { |entry, output| output[entry.fetch("id")] = entry }
+    inventory_manifest = directory.fetch("inventory")
+    inventory_entries = Array(inventory_manifest.fetch("entries")).map do |entry|
+      route = entry["callable_via"] && remote_by_id[entry["callable_via"]]
+      availability = if !%w[active experimental].include?(entry.fetch("status"))
+                       "unavailable"
+                     else
+                       case entry.fetch("air_mode")
+                       when "local" then "ready"
+                       when "portable" then local_by_id.fetch(entry.fetch("id"), {}).fetch("availability", "not-installed")
+                       when "remote-auto", "remote-queue", "confirm"
+                         route ? route.fetch("availability") : "unavailable"
+                       when "metadata-only" then "metadata-only"
+                       when "unavailable" then "unavailable"
+                       end
+                     end
+      entry.merge("availability" => availability).tap do |record|
+        record["via_availability"] = route["availability"] if route
+      end
+    end
+    models = Array(runtime.dig("models", "models")).each_with_object([]) do |model, output|
+      next unless model.is_a?(Hash) && model["id"].is_a?(String)
+      output << {
+        "id" => model["id"],
+        "display_name" => model["display_name"] || model["id"],
+        "default_effort" => model["default_effort"],
+        "efforts" => Array(model["efforts"]),
+        "is_default" => !!model["is_default"],
+        "availability" => source == "cache" ? "unknown-cached" : (live_worker ? "ready" : "offline")
+      }.compact
+    end
+    {
+      "schema_version" => 1,
+      "client_version" => RemoteWork::VERSION,
+      "catalog_version" => catalog.fetch("catalog_version"),
+      "catalog_generated_at" => catalog.fetch("generated_at"),
+      "catalog_signature" => "verified",
+      "inventory_version" => inventory_manifest.fetch("inventory_version"),
+      "inventory_generated_at" => inventory_manifest.fetch("generated_at"),
+      "inventory_signature" => "verified",
+      "directory_source" => source,
+      "observed_at" => directory["observed_at"],
+      "cached_at" => directory["cached_at"],
+      "warning" => warning,
+      "mini" => {
+        "online" => source == "live" ? !!(worker && worker["online"]) : nil,
+        "compatible" => source == "live" ? !!worker_compatible : nil,
+        "status" => if source == "cache"
+                      "unknown"
+                    elsif worker && worker["online"] && !worker_compatible
+                      "incompatible"
+                    elsif live_worker
+                      "online"
+                    else
+                      "offline"
+                    end,
+        "last_seen_at" => worker && worker["last_seen_at"],
+        "runtime_version" => worker && worker["runtime_version"],
+        "runtime_catalog" => worker && worker["runtime_catalog"],
+        "advertised_capabilities" => source == "live" ? provided : []
+      }.compact,
+      "local_capabilities" => local.sort_by { |entry| entry.fetch("id") },
+      "remote_capabilities" => remote.sort_by { |entry| entry.fetch("id") },
+      "mini_inventory" => inventory_summary(inventory_manifest, inventory_entries),
+      "models" => models.sort_by { |entry| [entry["is_default"] ? 0 : 1, entry.fetch("id")] },
+      "policy_note" => "Mini 功能表用于动态发现，不等于授权；每次调用仍会重新验证执行入口、参数、设备、身份与权限。"
+    }.compact
+  end
+
+  def inventory_summary(manifest, entries)
+    {
+      "version" => manifest.fetch("inventory_version", manifest["version"]),
+      "generated_at" => manifest.fetch("generated_at"),
+      "source_device" => manifest.fetch("source_device", "mac-mini"),
+      "signature" => "verified",
+      "total" => entries.length,
+      "counts_by_kind" => entries.group_by { |entry| entry.fetch("kind") }.transform_values(&:length).sort.to_h,
+      "counts_by_air_mode" => entries.group_by { |entry| entry.fetch("air_mode") }.transform_values(&:length).sort.to_h,
+      "entries" => entries.sort_by { |entry| [entry.fetch("kind"), entry.fetch("category", ""), entry.fetch("id")] }
+    }
+  end
+
+  def local_builtin_capabilities
+    [
+      {
+        "id" => "client:capability-discovery", "kind" => "capability", "location" => "air",
+        "name" => "能力动态发现",
+        "availability" => "ready", "invocation_policy" => "auto", "side_effect" => "read-only",
+        "command" => "wu 能做什么", "summary" => "验证签名目录，并动态区分 Air 本地能力与 Mini 远端能力。"
+      },
+      {
+        "id" => "client:module-manager", "kind" => "capability", "location" => "air",
+        "name" => "便携模块管理",
+        "availability" => "ready", "invocation_policy" => "manual", "side_effect" => "local-write",
+        "command" => "wu 查看模块", "summary" => "查看、拉取、更新、固定、停用或回滚获准的 portable 模块。"
+      },
+      {
+        "id" => "client:job-control", "kind" => "capability", "location" => "air",
+        "name" => "远程任务控制",
+        "availability" => "ready", "invocation_policy" => "manual", "side_effect" => "local-write",
+        "command" => "wu 查看任务", "summary" => "提交和跟踪后台任务、回复问题、接收审阅结果；取消和重试仍需确认。"
+      },
+      {
+        "id" => "client:artifact-manager", "kind" => "artifact", "location" => "air",
+        "name" => "附件管理",
+        "availability" => "ready", "invocation_policy" => "confirm", "side_effect" => "external-write",
+        "command" => "wu 查看附件", "summary" => "上传、查看和下载受控附件；上传或删除前保留明确的用户意图。"
+      },
+      {
+        "id" => "client:signed-update", "kind" => "capability", "location" => "air",
+        "name" => "签名自动更新",
+        "availability" => "ready", "invocation_policy" => "auto", "side_effect" => "local-write",
+        "command" => "wu remote update status", "summary" => "检查并安装 RSA 验签的客户端和 portable 模块更新，失败时回滚。"
+      },
+      {
+        "id" => "client:diagnose", "kind" => "capability", "location" => "air",
+        "name" => "客户端诊断",
+        "availability" => "ready", "invocation_policy" => "auto", "side_effect" => "read-only",
+        "command" => "wu 诊断", "summary" => "检查 Air 配置、设备密钥状态和控制面连通性。"
+      }
+    ]
+  end
+
+  def local_module_capabilities(modules)
+    state = @config.state
+    installed = state.fetch("installed_modules", {})
+    policies = state.fetch("module_policies", {})
+    modules.select { |item| item["classification"] == "portable" }.map do |item|
+      local = installed[item.fetch("id")] || {}
+      mode = policies[item.fetch("id")] || item.fetch("default_mode", "on-demand")
+      local_version = local["version"]
+      available = local_version && local["path"] && Pathname.new(local["path"]).directory?
+      availability = if item["status"] != "active"
+                       "revoked"
+                     elsif %w[off metadata-only].include?(mode)
+                       available ? "disabled" : "not-installed"
+                     elsif !available
+                       "not-installed"
+                     elsif local_version == item["version"]
+                       "ready"
+                     else
+                       "outdated"
+                     end
+      {
+        "id" => item.fetch("id"),
+        "name" => item.fetch("id").split(":", 2).last,
+        "kind" => "skill",
+        "location" => "air",
+        "availability" => availability,
+        "invocation_policy" => availability == "ready" ? "auto" : "manual",
+        "side_effect" => "read-only",
+        "module_mode" => mode,
+        "installed_version" => local_version,
+        "available_version" => item["version"],
+        "command" => available ? nil : "wu 拉取模块 #{item.fetch('id')}",
+        "summary" => item.fetch("summary")
+      }.compact
+    end
+  end
+
+  def print_capability_view(view, scope)
+    source = view.fetch("directory_source") == "live" ? "实时目录" : "已验证缓存"
+    mini_state = if view.dig("mini", "online") == true
+                   "online"
+                 elsif view.dig("mini", "online") == false
+                   "offline"
+                 else
+                   "unknown（缓存）"
+                 end
+    puts "两头乌能力目录（#{source}，签名 verified）"
+    puts "目录版本：#{view.fetch('catalog_version')}　Mini：#{mini_state}　观测：#{view.fetch('observed_at', '-')}"
+    puts "警告：#{view['warning']}" if view["warning"]
+    if scope != :remote
+      puts "\nAir 本地能力"
+      print_capability_rows(view.fetch("local_capabilities"))
+    end
+    if scope != :local
+      puts "\nMini 可执行入口"
+      print_capability_rows(view.fetch("remote_capabilities"))
+      puts "\nMini 完整功能表（#{view.dig('mini_inventory', 'total')} 项）"
+      print_inventory_rows(view.dig("mini_inventory", "entries"))
+      unless view.fetch("models").empty?
+        puts "\nMini 模型"
+        view.fetch("models").each do |model|
+          marker = model["is_default"] ? "默认" : "可选"
+          puts "- [#{availability_label(model.fetch('availability'))}] #{model.fetch('id')}（#{marker}）"
+        end
+      end
+    end
+    puts "\n说明：#{view.fetch('policy_note')}"
+  end
+
+  def print_inventory_rows(entries)
+    puts "- 暂无已登记功能" if entries.empty?
+    entries.group_by { |entry| entry.fetch("kind") }.sort.each do |kind, items|
+      puts "#{inventory_kind_label(kind)}（#{items.length}）"
+      items.each do |entry|
+        category = entry["category"] ? " / #{entry['category']}" : ""
+        puts "- [#{air_mode_label(entry.fetch('air_mode'))} / #{availability_label(entry.fetch('availability'))}] #{entry.fetch('name')}（#{entry.fetch('id')}）#{category}：#{entry.fetch('summary')}"
+      end
+    end
+  end
+
+  def inventory_kind_label(value)
+    {
+      "skill" => "Skills", "capability-package" => "能力包", "agent" => "Agents",
+      "mcp-server" => "MCP / 集成", "runtime" => "运行时", "workflow" => "工作流", "resource" => "资源"
+    }.fetch(value, value)
+  end
+
+  def air_mode_label(value)
+    {
+      "local" => "Air 本地", "portable" => "可安装到 Air", "remote-auto" => "远端自动调用",
+      "remote-queue" => "远端任务调用", "confirm" => "远端调用前确认", "metadata-only" => "仅发现",
+      "unavailable" => "当前不可用"
+    }.fetch(value, value)
+  end
+
+  def print_capability_rows(entries)
+    puts "- 暂无已登记能力" if entries.empty?
+    entries.each do |entry|
+      policy = invocation_label(entry.fetch("invocation_policy"))
+      command = entry["command"] ? "；入口：#{entry['command']}" : ""
+      name = entry["name"] ? "#{entry['name']}（#{entry.fetch('id')}）" : entry.fetch("id")
+      puts "- [#{availability_label(entry.fetch('availability'))} / #{policy}] #{name}：#{entry.fetch('summary')}#{command}"
+    end
+  end
+
+  def availability_label(value)
+    {
+      "ready" => "可用", "not-installed" => "未安装", "outdated" => "待更新", "disabled" => "已停用",
+      "revoked" => "已撤销", "metadata-only" => "仅元数据", "queueable-offline" => "Mini 离线/可排队",
+      "offline" => "Mini 离线", "runtime-missing" => "运行能力缺失", "unknown-cached" => "缓存/待联网",
+      "queueable-incompatible" => "Mini 不兼容/可排队", "runtime-incompatible" => "Mini 运行时不兼容",
+      "unavailable" => "不可用"
+    }.fetch(value, value)
+  end
+
+  def invocation_label(value)
+    {
+      "auto" => "允许自动调用", "queue" => "允许自动派发", "confirm" => "调用前确认",
+      "manual" => "显式操作", "unavailable" => "不可调用"
+    }.fetch(value, value)
+  end
+
+  def invoke
+    capability_id = validate_module_id!(@arguments.shift)
+    options = { input: {}, timeout: 120, confirmed: false, json: false, wait: nil }
+    parser = OptionParser.new do |item|
+      item.on("--input-json JSON") { |value| options[:input] = parse_capability_input(value) }
+      item.on("--input-file PATH") { |value| options[:input] = parse_capability_input(Pathname.new(value).expand_path.read(encoding: "UTF-8")) }
+      item.on("--timeout SECONDS", Integer) { |value| options[:timeout] = value }
+      item.on("--confirm") { options[:confirmed] = true }
+      item.on("--json") { options[:json] = true }
+      item.on("--wait") { options[:wait] = true }
+      item.on("--no-wait") { options[:wait] = false }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    raise RemoteWork::Error, "等待时间必须在 5 到 600 秒之间" unless options.fetch(:timeout).between?(5, 600)
+
+    envelope = invoke_capability(
+      capability_id,
+      input: options.fetch(:input),
+      timeout: options.fetch(:timeout),
+      confirmed: options.fetch(:confirmed),
+      wait: options[:wait]
+    )
+    if options.fetch(:json)
+      puts JSON.pretty_generate(envelope)
+    else
+      print_invocation_envelope(envelope)
+    end
+    envelope.fetch("state") == "failed" ? 2 : 0
+  rescue RemoteWork::Error => error
+    request_id ||= "call-#{SecureRandom.hex(12)}"
+    envelope = RemoteWork::InvocationEnvelope.failure(
+      request_id: request_id,
+      capability_id: capability_id || "capability:unknown",
+      mini_status: "unknown",
+      reason: error.message
+    )
+    puts JSON.pretty_generate(envelope) if options && options[:json]
+    warn envelope.fetch("error") unless options && options[:json]
+    2
+  end
+
+  def parse_capability_input(value)
+    parsed = JSON.parse(value)
+    raise RemoteWork::Error, "能力输入必须是 JSON 对象" unless parsed.is_a?(Hash)
+    parsed
+  rescue JSON::ParserError
+    raise RemoteWork::Error, "能力输入不是有效 JSON"
+  end
+
+  def invoke_capability(capability_id, input:, timeout:, confirmed:, wait: nil)
+    request_id = "call-#{SecureRandom.hex(12)}"
+    directory, source, warning = load_capability_directory
+    if source == "cache"
+      return RemoteWork::InvocationEnvelope.failure(
+        request_id: request_id, capability_id: capability_id, mini_status: "unknown",
+        reason: "只有已验签缓存，无法确认 Mini 实时状态：#{warning}"
+      )
+    end
+    view = capability_view(directory, source: source, warning: warning)
+    capability = view.fetch("remote_capabilities").find { |item| item["id"] == capability_id }
+    unless capability && capability["exposure"] == "callable"
+      return RemoteWork::InvocationEnvelope.failure(
+        request_id: request_id, capability_id: capability_id, mini_status: view.dig("mini", "status") || "unknown",
+        reason: "远端能力未登记为 callable"
+      )
+    end
+    policy = capability.fetch("invocation_policy")
+    if policy == "confirm" && !confirmed
+      return RemoteWork::InvocationEnvelope.failure(
+        request_id: request_id, capability_id: capability_id, mini_status: view.dig("mini", "status") || "unknown",
+        reason: "该能力需要所有者明确确认；确认后使用 --confirm"
+      )
+    end
+    unless %w[auto queue confirm].include?(policy)
+      return RemoteWork::InvocationEnvelope.failure(
+        request_id: request_id, capability_id: capability_id, mini_status: view.dig("mini", "status") || "unknown",
+        reason: "该能力只能通过专用人工入口调用"
+      )
+    end
+    availability = capability.fetch("availability")
+    unless %w[ready queueable-offline queueable-incompatible].include?(availability)
+      return RemoteWork::InvocationEnvelope.failure(
+        request_id: request_id, capability_id: capability_id, mini_status: view.dig("mini", "status") || "unknown",
+        reason: "远端能力当前不可用：#{availability_label(availability)}"
+      )
+    end
+
+    payload = {
+      "schema_version" => 1,
+      "request_id" => request_id,
+      "source" => "owner-air",
+      "kind" => capability.fetch("executor_kind", capability["kind"] == "workflow" ? "workflow" : "tool"),
+      "capability_id" => capability_id,
+      "replay_class" => capability.fetch("replay_class", "safe-read"),
+      "requested_executor" => "mac-mini",
+      "owner_confirmed" => confirmed,
+      "input" => input
+    }
+    @active_request_id = request_id
+    job = http.post("calls", payload).fetch("job")
+    @active_request_id = nil
+    job_id = job.fetch("id")
+    mini_status = view.dig("mini", "status") || "unknown"
+    if availability != "ready"
+      return RemoteWork::InvocationEnvelope.queued(
+        request_id: request_id, capability_id: capability_id, job_id: job_id,
+        mini_status: mini_status, reason: "Mini 当前#{mini_status}，等待兼容 worker 上线"
+      )
+    end
+    should_wait = wait.nil? ? capability.fetch("executor_kind", "tool") == "tool" : wait
+    unless should_wait
+      return RemoteWork::InvocationEnvelope.queued(
+        request_id: request_id, capability_id: capability_id, job_id: job_id,
+        mini_status: mini_status, reason: "能力已按后台方式进入 Mini 队列"
+      )
+    end
+
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    loop do
+      job = http.get("jobs/#{job_id}").fetch("job")
+      state = job.fetch("state")
+      break if TERMINAL_STATES.include?(state) || state == "waiting_user"
+      if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        return RemoteWork::InvocationEnvelope.queued(
+          request_id: request_id, capability_id: capability_id, job_id: job_id,
+          mini_status: mini_status, reason: "等待超时，能力仍在后台运行"
+        )
+      end
+      sleep 1
+    end
+    unless job.fetch("state") == "succeeded"
+      reason = job.fetch("state") == "waiting_user" ? "Mini 正在等待所有者交互" : job.fetch("failure", job.fetch("state"))
+      envelope = RemoteWork::InvocationEnvelope.failure(
+        request_id: request_id, capability_id: capability_id, mini_status: mini_status, reason: reason
+      )
+      envelope["job_id"] = job_id
+      envelope["state"] = job.fetch("state") == "waiting_user" ? "waiting_user" : "failed"
+      return envelope
+    end
+
+    destination = fetch_result(job_id, job)
+    output_path = destination.join("output.json")
+    provenance_path = destination.join("provenance.json")
+    raise RemoteWork::Error, "远端能力没有返回结构化结果" unless output_path.file? && provenance_path.file?
+    output = JSON.parse(output_path.read(encoding: "UTF-8"))
+    provenance = JSON.parse(provenance_path.read(encoding: "UTF-8"))
+    valid = provenance["job_id"] == job_id && provenance["capability_id"] == capability_id &&
+            provenance["actual_executor"] == "mac-mini" && provenance["remote_call_succeeded"] == true
+    raise RemoteWork::Error, "远端能力来源证明无效" unless valid
+    RemoteWork::InvocationEnvelope.success(
+      request_id: request_id, capability_id: capability_id, job_id: job_id,
+      output: output, mini_status: "online", observed_at: provenance.fetch("completed_at")
+    )
+  ensure
+    @active_request_id = nil
+  end
+
+  def print_invocation_envelope(envelope)
+    puts "能力\t#{envelope.fetch('capability_id')}"
+    puts "状态\t#{envelope.fetch('state')}"
+    puts "执行位置\t#{envelope.fetch('actual_executor')}"
+    puts "Mini\t#{envelope.fetch('mini_status')}"
+    puts "任务\t#{envelope['job_id']}" if envelope["job_id"]
+    puts envelope["error"] if envelope["error"]
+    puts JSON.pretty_generate(envelope["output"]) if envelope.key?("output")
+  end
+
+  def modules
+    command = @arguments.shift || "list"
+    case command
+    when "list" then modules_list
+    when "status" then modules_status
+    when "pull" then modules_pull
+    when "update" then modules_update
+    when "versions" then modules_versions
+    when "rollback" then modules_rollback
+    else raise RemoteWork::Error, "未知 modules 命令：#{command}"
+    end
+  end
+
+  def models
+    command = @arguments.shift || "list"
+    raise RemoteWork::Error, "未知 models 命令：#{command}" unless command == "list"
+    ensure_no_arguments!
+    value = http.get("models")
+    models = value.fetch("models")
+    if models.empty?
+      puts "Mac mini 尚未同步模型目录"
+      return 0
+    end
+    models.each do |model|
+      marker = model["is_default"] ? "默认" : "-"
+      puts [model.fetch("id"), marker, model.fetch("default_effort", "-"), Array(model["efforts"]).join(","), model.fetch("display_name", model.fetch("id"))].join("\t")
+    end
+    0
+  end
+
+  def tools
+    command = @arguments.shift || "list"
+    case command
+    when "list" then tools_list
+    when "invoke" then tools_invoke
+    else raise RemoteWork::Error, "未知 tools 命令：#{command}"
+    end
+  end
+
+  def devices
+    command = @arguments.shift || "list"
+    raise RemoteWork::Error, "未知 devices 命令：#{command}" unless command == "list"
+    ensure_no_arguments!
+    http.get("devices").fetch("devices").each do |item|
+      status = item["online"] ? "online" : "offline"
+      puts [item.fetch("name"), item.fetch("role"), status, item.fetch("last_seen_at", "-"), Array(item["capabilities"]).join(",")].join("\t")
+    end
+    0
+  end
+
+  def artifacts
+    command = @arguments.shift || "list"
+    case command
+    when "upload" then artifacts_upload
+    when "list" then artifacts_list
+    when "fetch" then artifacts_fetch
+    when "remove" then artifacts_remove
+    when "recover" then artifacts_recover
+    else raise RemoteWork::Error, "未知 artifacts 命令：#{command}"
+    end
+  end
+
+  def artifacts_upload
+    source = @arguments.shift
+    options = { media_type: "application/octet-stream", request_id: nil }
+    parser = OptionParser.new do |item|
+      item.on("--media-type TYPE") { |value| options[:media_type] = value }
+      item.on("--request-id ID") { |value| options[:request_id] = value }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    raise RemoteWork::Error, "缺少附件路径" unless source
+    path = Pathname.new(source).expand_path.cleanpath
+    raise RemoteWork::Error, "附件不是普通文件" unless path.file? && !path.symlink?
+    raise RemoteWork::Error, "附件超过 50 MiB" if path.size > 50 * 1024 * 1024
+    request_id = options[:request_id] || "call-#{SecureRandom.hex(12)}"
+    raise RemoteWork::Error, "提交请求 ID 无效" unless REQUEST_ID.match?(request_id)
+    bytes = path.binread
+    @active_request_id = request_id
+    @active_request_kind = "artifact"
+    value = http.post("artifacts", {
+                        "request_id" => request_id,
+                        "filename" => path.basename.to_s,
+                        "media_type" => options.fetch(:media_type),
+                        "sha256" => Digest::SHA256.hexdigest(bytes),
+                        "content_base64" => Base64.strict_encode64(bytes)
+                      })
+    @active_request_id = nil
+    @active_request_kind = nil
+    puts JSON.pretty_generate(value)
+    0
+  end
+
+  def artifacts_list
+    ensure_no_arguments!
+    items = http.get("artifacts").fetch("artifacts")
+    if items.empty?
+      puts "没有暂存附件"
+      return 0
+    end
+    items.each do |item|
+      expiry = item["expires_at"] ? Time.at(item["expires_at"]).getlocal.strftime("%Y-%m-%d %H:%M") : "-"
+      puts [item.fetch("id"), item.fetch("state"), item.fetch("filename"), item.fetch("size"), expiry].join("\t")
+    end
+    0
+  end
+
+  def artifacts_fetch
+    artifact_id = validate_artifact_id!(@arguments.shift)
+    options = { output: nil }
+    parser = OptionParser.new { |item| item.on("--output PATH") { |value| options[:output] = value } }
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    item = http.get("artifacts/#{artifact_id}").fetch("artifact")
+    raise RemoteWork::Error, "附件当前不可下载：#{item.fetch('state')}" unless item.fetch("state") == "active"
+    bytes = http.get_bytes("artifacts/#{artifact_id}/content")
+    raise RemoteWork::Error, "附件哈希校验失败" unless secure_equal?(Digest::SHA256.hexdigest(bytes), item.fetch("sha256"))
+    destination = if options[:output]
+                    candidate = Pathname.new(options[:output]).expand_path.cleanpath
+                    candidate.directory? ? candidate.join(item.fetch("filename")) : candidate
+                  else
+                    @config.paths.fetch("artifacts").join(artifact_id, item.fetch("filename"))
+                  end
+    FileUtils.mkdir_p(destination.dirname.to_s, mode: 0o700)
+    if destination.exist?
+      same = destination.file? && Digest::SHA256.file(destination.to_s).hexdigest == item.fetch("sha256")
+      raise RemoteWork::Error, "目标已经存在且内容不同：#{destination}" unless same
+    else
+      RemoteWork::Atomic.write(destination, bytes, mode: 0o600)
+    end
+    puts destination
+    0
+  end
+
+  def artifacts_remove
+    artifact_id = validate_artifact_id!(@arguments.shift)
+    ensure_no_arguments!
+    puts JSON.pretty_generate(http.post("artifacts/#{artifact_id}/remove", {}))
+    0
+  end
+
+  def artifacts_recover
+    request_id = @arguments.shift
+    ensure_no_arguments!
+    raise RemoteWork::Error, "提交请求 ID 无效" unless request_id && REQUEST_ID.match?(request_id)
+    puts JSON.pretty_generate(http.get("artifacts/by-request/#{request_id}"))
+    0
+  end
+
+  def tools_list
+    ensure_no_arguments!
+    directory, source, warning = load_capability_directory
+    view = capability_view(directory, source: source, warning: warning)
+    view.fetch("remote_capabilities").select { |item| item["kind"] == "tool" && item["exposure"] == "callable" }.each do |item|
+      puts [item.fetch("id").split(":", 2).last, item.fetch("name", item.fetch("id")), item.fetch("side_effect"), item.fetch("location"), item.fetch("summary")].join("\t")
+    end
+    0
+  end
+
+  def tools_invoke
+    tool_id = @arguments.shift
+    raise RemoteWork::Error, "缺少工具 ID" unless tool_id&.match?(/\A[a-z][a-z0-9-]{0,63}\z/)
+    options = { timeout: tool_id == "codex-status" ? 300 : 120, json: false }
+    parser = OptionParser.new do |item|
+      item.on("--timeout SECONDS", Integer) { |value| options[:timeout] = value }
+      item.on("--json") { options[:json] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    raise RemoteWork::Error, "等待时间必须在 5 到 600 秒之间" unless options.fetch(:timeout).between?(5, 600)
+
+    envelope = invoke_capability(
+      "tool:#{tool_id}", input: {}, timeout: options.fetch(:timeout), confirmed: false, wait: true
+    )
+    unless envelope["state"] == "succeeded"
+      raise RemoteWork::Error, envelope.fetch("error", "本轮未能成功调用两头乌 Mini")
+    end
+    output = envelope.fetch("output")
+    job_id = envelope.fetch("job_id")
+    if tool_id == "codex-status"
+      raise RemoteWork::Error, "远程工具结果 schema 不受支持" unless output["schema"] == "two-head-wu.codex-status.v1"
+    end
+    if options.fetch(:json)
+      puts JSON.pretty_generate(output.merge("job_id" => job_id))
+    elsif tool_id == "codex-status"
+      print_codex_status(output)
+    else
+      puts JSON.pretty_generate(output)
+    end
+    0
+  end
+
+  def print_codex_status(output)
+    print RemoteWork::CodexStatusFormatter.new(output).render
+  end
+
+  def modules_list
+    ensure_no_arguments!
+    modules = remote_modules
+    reconcile_server_denials!(modules)
+    modules.each do |item|
+      version = item["version"] || "-"
+      puts [item.fetch("id"), item.fetch("classification"), item.fetch("status"), version, item.fetch("summary")].join("\t")
+    end
+    0
+  end
+
+  def modules_status
+    ensure_no_arguments!
+    modules = remote_modules
+    reconcile_server_denials!(modules)
+    state = @config.state
+    installed = state.fetch("installed_modules", {})
+    policies = state.fetch("module_policies", {})
+    modules.each do |item|
+      local = installed[item.fetch("id")] || {}
+      mode = policies[item.fetch("id")] || item.fetch("default_mode", "on-demand")
+      current = local["version"] || "-"
+      remote = item["version"] || "-"
+      state_text = if item["status"] != "active"
+                     "revoked"
+                   elsif %w[off metadata-only].include?(mode) && current != "-"
+                     "disabled"
+                   elsif current == "-"
+                     "not-installed"
+                   elsif current == remote
+                     "current"
+                   else
+                     "outdated"
+                   end
+      puts [item.fetch("id"), mode, current, remote, state_text].join("\t")
+    end
+    0
+  end
+
+  def modules_pull
+    module_id = validate_module_id!(@arguments.shift)
+    ensure_no_arguments!
+    pull_module(module_id)
+    0
+  end
+
+  def modules_update
+    module_id = @arguments.shift
+    ensure_no_arguments!
+    if module_id
+      pull_module(validate_module_id!(module_id))
+      return 0
+    end
+    modules = remote_modules
+    reconcile_server_denials!(modules)
+    state = @config.state
+    policies = state.fetch("module_policies", {})
+    selected = modules.select do |item|
+      mode = policies[item.fetch("id")] || item.fetch("default_mode", "on-demand")
+      mode == "auto-update" && item["classification"] == "portable" && item["status"] == "active"
+    end.map { |item| item.fetch("id") }
+    selected.each { |id| pull_module(id) }
+    puts "没有设置自动更新的模块" if selected.empty?
+    0
+  end
+
+  def modules_versions
+    module_id = validate_module_id!(@arguments.shift)
+    ensure_no_arguments!
+    item = remote_modules.find { |entry| entry.fetch("id") == module_id }
+    raise RemoteWork::Error, "模块不可见或不存在：#{module_id}" unless item
+    versions = Array(item["versions"])
+    versions = [item.slice("version", "sha256", "size")] if versions.empty? && item["version"]
+    current = @config.state.dig("installed_modules", module_id, "version")
+    versions.each do |entry|
+      marker = entry["version"] == current ? "current" : "available"
+      puts [entry.fetch("version"), marker, entry.fetch("size", "-"), entry.fetch("sha256", "-")].join("\t")
+    end
+    0
+  end
+
+  def modules_rollback
+    module_id = validate_module_id!(@arguments.shift)
+    version = @arguments.shift
+    ensure_no_arguments!
+    raise RemoteWork::Error, "模块版本无效" unless version&.match?(/\A[a-f0-9]{16}\z/)
+    pull_module(module_id, version: version)
+    state = @config.state
+    state.fetch("module_policies", {})[module_id] = "pinned"
+    @config.save_state(state)
+    puts "#{module_id}\tpinned\t#{version}"
+    0
+  end
+
+  def pull_module(module_id, version: nil)
+    item = remote_modules.find { |entry| entry.fetch("id") == module_id }
+    raise RemoteWork::Error, "模块不可见或不存在：#{module_id}" unless item
+    raise RemoteWork::Error, "模块只能在 Mac mini 远程使用：#{module_id}" if item.fetch("classification") == "remote-only"
+    raise RemoteWork::Error, "模块当前不可拉取：#{item.fetch('status')}" unless item.fetch("status") == "active"
+
+    release = if version
+                Array(item["versions"]).find { |entry| entry["version"] == version }
+              else
+                item
+              end
+    raise RemoteWork::Error, "模块版本不可用：#{version}" unless release
+    version = release.fetch("version")
+    expected = release.fetch("sha256")
+    suffix = version == item["version"] ? "" : "?version=#{version}"
+    bytes = http.get_bytes("modules/#{URI.encode_www_form_component(module_id)}/archive#{suffix}")
+    actual = Digest::SHA256.hexdigest(bytes)
+    raise RemoteWork::Error, "模块哈希校验失败" unless secure_equal?(actual, expected)
+
+    component_root = @config.paths.fetch("components").join(module_id.tr(":", "-"), version)
+    unless component_root.directory?
+      Dir.mktmpdir("module-", @config.paths.fetch("tmp").tap { |path| FileUtils.mkdir_p(path.to_s) }.to_s) do |temporary|
+        archive = Pathname.new(temporary).join("module.tar.gz")
+        File.open(archive.to_s, "wb", 0o600) { |file| file.write(bytes) }
+        extracted = Pathname.new(temporary).join("content")
+        RemoteWork::Archive.unpack(archive, extracted)
+        validate_module_content!(module_id, extracted)
+        FileUtils.mkdir_p(component_root.dirname.to_s, mode: 0o700)
+        FileUtils.mv(extracted.to_s, component_root.to_s)
+      end
+    end
+    activate_module!(module_id, component_root)
+    state = @config.state
+    state.fetch("installed_modules", {})[module_id] = {
+      "version" => version,
+      "sha256" => expected,
+      "installed_at" => Time.now.utc.iso8601,
+      "path" => component_root.to_s
+    }
+    @config.save_state(state)
+    puts "已安装 #{module_id} #{version}"
+  end
+
+  def reconcile_server_denials!(modules)
+    by_id = modules.each_with_object({}) { |item, index| index[item.fetch("id")] = item }
+    state = @config.state
+    changed = false
+    state.fetch("installed_modules", {}).each_key do |module_id|
+      item = by_id[module_id]
+      next unless item && item["status"] != "active"
+      deactivate_module!(module_id)
+      if state.fetch("module_policies", {})[module_id] != "off"
+        state.fetch("module_policies", {})[module_id] = "off"
+        changed = true
+      end
+      if state.fetch("installed_modules", {})[module_id]["server_status"] != item["status"]
+        state.fetch("installed_modules", {})[module_id]["server_status"] = item["status"]
+        changed = true
+      end
+    end
+    @config.save_state(state) if changed
+  end
+
+  def deactivate_module!(module_id)
+    type, name = module_id.split(":", 2)
+    return unless type == "skill"
+    skills_root = Pathname.new(ENV.fetch("WU_REMOTE_SKILLS_HOME", File.join(Dir.home, ".agents", "skills"))).expand_path
+    target = skills_root.join(name)
+    return unless target.symlink?
+    existing = target.realpath rescue nil
+    managed = @config.paths.fetch("components")
+    managed_prefix = (managed.directory? ? managed.realpath : managed.expand_path).to_s + File::SEPARATOR
+    raise RemoteWork::Error, "拒绝停用指向客户端管理范围之外的 Skill" unless existing && existing.to_s.start_with?(managed_prefix)
+    FileUtils.rm_f(target.to_s)
+  end
+
+  def activate_module!(module_id, component_root)
+    type, name = module_id.split(":", 2)
+    return unless type == "skill"
+
+    skills_root = Pathname.new(ENV.fetch("WU_REMOTE_SKILLS_HOME", File.join(Dir.home, ".agents", "skills"))).expand_path
+    FileUtils.mkdir_p(skills_root.to_s, mode: 0o755)
+    target = skills_root.join(name)
+    if target.exist? || target.symlink?
+      unless target.symlink?
+        raise RemoteWork::Error, "Skill 目标已经存在且不归远程客户端管理：#{target}"
+      end
+      existing = target.realpath rescue nil
+      components_root = @config.paths.fetch("components")
+      managed_root = (components_root.directory? ? components_root.realpath : components_root.expand_path).to_s + File::SEPARATOR
+      raise RemoteWork::Error, "Skill 链接指向客户端管理范围之外" unless existing && existing.to_s.start_with?(managed_root)
+      FileUtils.rm_f(target.to_s)
+    end
+    temporary = skills_root.join(".#{name}.#{Process.pid}.#{SecureRandom.hex(3)}")
+    File.symlink(component_root.to_s, temporary.to_s)
+    File.rename(temporary.to_s, target.to_s)
+  ensure
+    FileUtils.rm_f(temporary.to_s) if defined?(temporary) && temporary
+  end
+
+  def validate_module_content!(module_id, root)
+    type, = module_id.split(":", 2)
+    raise RemoteWork::Error, "Skill 模块缺少 SKILL.md" if type == "skill" && !root.join("SKILL.md").file?
+  end
+
+  def policy
+    command = @arguments.shift || "help"
+    raise RemoteWork::Error, "未知 policy 命令：#{command}" unless command == "set"
+    module_id = validate_module_id!(@arguments.shift)
+    mode = @arguments.shift
+    ensure_no_arguments!
+    raise RemoteWork::Error, "更新策略无效：#{mode}" unless POLICY_MODES.include?(mode)
+    item = remote_modules.find { |entry| entry.fetch("id") == module_id }
+    raise RemoteWork::Error, "模块不可见或不存在：#{module_id}" unless item
+    if item.fetch("classification") == "remote-only" && !%w[off metadata-only].include?(mode)
+      raise RemoteWork::Error, "remote-only 模块只能设为 off 或 metadata-only"
+    end
+    state = @config.state
+    state.fetch("module_policies", {})[module_id] = mode
+    @config.save_state(state)
+    deactivate_module!(module_id) if %w[off metadata-only].include?(mode)
+    puts "#{module_id}\t#{mode}"
+    0
+  end
+
+  def projects
+    command = @arguments.shift || "status"
+    case command
+    when "status" then projects_status
+    when "sync" then projects_sync
+    else raise RemoteWork::Error, "未知 projects 命令：#{command}"
+    end
+  end
+
+  def projects_status
+    job_id = @arguments.shift
+    ensure_no_arguments!
+    bindings = @config.state.fetch("active_projects", {})
+    value = job_id ? bindings.slice(validate_job_id!(job_id)) : bindings
+    puts JSON.pretty_generate({ "schema_version" => 1, "projects" => value })
+    0
+  end
+
+  def projects_sync
+    job_id = @arguments.shift
+    ensure_no_arguments!
+    bindings = @config.state.fetch("active_projects", {})
+    targets = job_id ? { validate_job_id!(job_id) => bindings[validate_job_id!(job_id)] } : bindings
+    raise RemoteWork::Error, "没有对应的 Air 项目绑定" if targets.empty? || targets.values.any?(&:nil?)
+    reports = targets.map { |id, binding| sync_project_binding(id, binding) }
+    puts JSON.pretty_generate({ "schema_version" => 1, "projects" => reports })
+    0
+  end
+
+  def save_active_project(job, project, manifest, mode)
+    lease_id = job["project_lease_id"]
+    return unless lease_id
+    state = @config.state
+    state["active_projects"] ||= {}
+    state["active_projects"][job.fetch("id")] = {
+      "root" => project.to_s,
+      "project_lease_id" => lease_id,
+      "mode" => mode,
+      "manifest" => manifest,
+      "registered_at" => Time.now.utc.iso8601,
+      "last_synced_at" => Time.now.utc.iso8601,
+      "state" => job.fetch("state")
+    }
+    @config.save_state(state)
+  end
+
+  def sync_project_binding(job_id, binding)
+    raise RemoteWork::Error, "Air 项目绑定无效" unless binding.is_a?(Hash)
+    root = Pathname.new(binding.fetch("root")).expand_path.cleanpath
+    raise RemoteWork::Error, "Air 项目目录已不可用：#{root}" unless root.directory?
+    job = http.get("jobs/#{job_id}").fetch("job")
+    if TERMINAL_STATES.include?(job.fetch("state"))
+      update_project_binding(job_id, binding.merge("state" => job.fetch("state")))
+      return { "job_id" => job_id, "state" => job.fetch("state"), "delta_entries" => 0, "result" => "terminal" }
+    end
+    entries, current = RemoteWork::ProjectSnapshot.delta(root, binding.fetch("manifest", {}))
+    if entries.empty?
+      update_project_binding(job_id, binding.merge("state" => job.fetch("state"), "last_checked_at" => Time.now.utc.iso8601))
+      return { "job_id" => job_id, "state" => job.fetch("state"), "delta_entries" => 0, "result" => "current" }
+    end
+    response = http.post("jobs/#{job_id}/project/deltas", {
+      "schema_version" => 1,
+      "project_lease_id" => binding.fetch("project_lease_id"),
+      "entries" => entries
+    })
+    updated = binding.merge(
+      "manifest" => current,
+      "state" => job.fetch("state"),
+      "last_synced_at" => Time.now.utc.iso8601,
+      "last_delta_sequence" => response.dig("delta", "sequence")
+    )
+    update_project_binding(job_id, updated)
+    {
+      "job_id" => job_id,
+      "state" => job.fetch("state"),
+      "delta_entries" => entries.length,
+      "delta_sequence" => response.dig("delta", "sequence"),
+      "result" => "uploaded"
+    }
+  end
+
+  def update_project_binding(job_id, binding)
+    state = @config.state
+    state["active_projects"] ||= {}
+    state["active_projects"][job_id] = binding
+    @config.save_state(state)
+  end
+
+  def jobs
+    command = @arguments.shift || "status"
+    case command
+    when "submit" then jobs_submit
+    when "status" then jobs_status
+    when "events" then jobs_events
+    when "interactions" then jobs_interactions
+    when "reply" then jobs_reply
+    when "follow" then jobs_follow
+    when "fetch" then jobs_fetch
+    when "cancel" then jobs_cancel
+    when "retry" then jobs_retry
+    when "recover" then jobs_recover
+    else raise RemoteWork::Error, "未知 jobs 命令：#{command}"
+    end
+  end
+
+  def jobs_submit
+    divider = @arguments.index("--")
+    raise RemoteWork::Error, "请在 -- 后提供任务说明" unless divider
+    option_arguments = @arguments.shift(divider)
+    @arguments.shift
+    instruction = @arguments.join(" ").strip
+    @arguments.clear
+    raise RemoteWork::Error, "任务说明不能为空" if instruction.empty?
+    options = { project: ".", project_mode: "workspace-write", model: nil, effort: nil, request_id: nil, artifact_ids: [] }
+    parser = OptionParser.new do |item|
+      item.on("--project PATH") { |value| options[:project] = value }
+      item.on("--project-mode MODE") { |value| options[:project_mode] = value }
+      item.on("--model MODEL") { |value| options[:model] = value }
+      item.on("--effort EFFORT") { |value| options[:effort] = value }
+      item.on("--request-id ID") { |value| options[:request_id] = value }
+      item.on("--artifact ID") { |value| options[:artifact_ids] << validate_artifact_id!(value) }
+    end
+    parser.parse!(option_arguments)
+    raise RemoteWork::Error, "未知任务参数" unless option_arguments.empty?
+
+    raise RemoteWork::Error, "项目权限档位无效" unless %w[review workspace-write full-project].include?(options.fetch(:project_mode))
+    project = Pathname.new(options.fetch(:project)).expand_path.cleanpath
+    raise RemoteWork::Error, "项目目录不存在" unless project.directory?
+    project = project.realpath
+    FileUtils.mkdir_p(@config.paths.fetch("tmp").to_s, mode: 0o700)
+    capsule = @config.paths.fetch("tmp").join("capsule-#{SecureRandom.hex(6)}.tar.gz")
+    metadata = RemoteWork::Archive.pack_directory(project, capsule)
+    request_id = options[:request_id] || "call-#{SecureRandom.hex(12)}"
+    raise RemoteWork::Error, "提交请求 ID 无效" unless REQUEST_ID.match?(request_id)
+    payload = {
+      "request_id" => request_id,
+      "instruction" => instruction,
+      "identity" => "owner-auto",
+      "project_name" => project.basename.to_s,
+      "model" => options[:model],
+      "effort" => options[:effort],
+      "capsule_sha256" => metadata.fetch("sha256"),
+      "capsule_size" => metadata.fetch("size"),
+      "capsule_base64" => Base64.strict_encode64(capsule.binread),
+      "artifact_ids" => options.fetch(:artifact_ids),
+      "project_mode" => options.fetch(:project_mode),
+      "project_manifest" => RemoteWork::ProjectSnapshot.manifest(project)
+    }
+    @active_request_id = request_id
+    @active_request_kind = "job"
+    result = http.post("jobs", payload)
+    @active_request_id = nil
+    @active_request_kind = nil
+    job = result.fetch("job")
+    save_active_project(job, project, payload.fetch("project_manifest"), options.fetch(:project_mode))
+    puts JSON.pretty_generate(result)
+    0
+  ensure
+    FileUtils.rm_f(capsule.to_s) if defined?(capsule) && capsule
+  end
+
+  def jobs_status
+    job_id = @arguments.shift
+    ensure_no_arguments!
+    value = job_id ? http.get("jobs/#{validate_job_id!(job_id)}") : http.get("jobs")
+    puts JSON.pretty_generate(value)
+    0
+  end
+
+  def jobs_events
+    job_id = validate_job_id!(@arguments.shift)
+    options = { after: 0 }
+    parser = OptionParser.new { |item| item.on("--after N", Integer) { |value| options[:after] = value } }
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    value = http.get("jobs/#{job_id}/events?after=#{options.fetch(:after)}")
+    puts JSON.pretty_generate(value)
+    0
+  end
+
+  def jobs_interactions
+    job_id = validate_job_id!(@arguments.shift)
+    ensure_no_arguments!
+    value = http.get("jobs/#{job_id}/interactions")
+    puts JSON.pretty_generate(value)
+    0
+  end
+
+  def jobs_reply
+    job_id = validate_job_id!(@arguments.shift)
+    interaction_id = validate_interaction_id!(@arguments.shift)
+    options = { answers: {} }
+    parser = OptionParser.new do |item|
+      item.on("--decision DECISION") { |value| options[:decision] = normalize_decision(value) }
+      item.on("--answer ID=TEXT") do |value|
+        key, answer = value.split("=", 2)
+        raise OptionParser::InvalidArgument, "--answer 必须是 ID=TEXT" unless key&.match?(/\A[A-Za-z0-9_.-]{1,128}\z/) && answer
+        options[:answers][key] ||= []
+        options[:answers][key] << answer
+      end
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    payload = {}
+    payload["decision"] = options[:decision] if options[:decision]
+    payload["answers"] = options[:answers] unless options[:answers].empty?
+    raise RemoteWork::Error, "请提供 --decision 或 --answer" if payload.empty?
+    puts JSON.pretty_generate(http.post("jobs/#{job_id}/interactions/#{interaction_id}/reply", payload))
+    0
+  end
+
+  def jobs_follow
+    job_id = validate_job_id!(@arguments.shift)
+    options = { timeout: 0, interval: 2 }
+    parser = OptionParser.new do |item|
+      item.on("--timeout SECONDS", Integer) { |value| options[:timeout] = value }
+      item.on("--interval SECONDS", Integer) { |value| options[:interval] = value }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    cursor = @config.state.fetch("event_cursors", {}).fetch(job_id, 0).to_i
+    loop do
+      events = http.get("jobs/#{job_id}/events?after=#{cursor}").fetch("events")
+      events.each do |event|
+        puts [event.fetch("sequence"), event.fetch("type"), event.fetch("message", "")].join("\t")
+        cursor = [cursor, event.fetch("sequence").to_i].max
+      end
+      save_event_cursor(job_id, cursor)
+      job = http.get("jobs/#{job_id}").fetch("job")
+      if TERMINAL_STATES.include?(job.fetch("state"))
+        puts "state\t#{job.fetch('state')}"
+        break
+      end
+      if job.fetch("state") == "waiting_user"
+        print_pending_interactions(job_id)
+        puts "state\twaiting_user"
+        break
+      end
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+      raise RemoteWork::Error, "等待任务超时；可稍后继续查看" if options.fetch(:timeout).positive? && elapsed >= options.fetch(:timeout)
+      sleep [options.fetch(:interval), 1].max
+    end
+    0
+  end
+
+  def jobs_fetch
+    job_id = validate_job_id!(@arguments.shift)
+    ensure_no_arguments!
+    job = http.get("jobs/#{job_id}").fetch("job")
+    raise RemoteWork::Error, "任务尚无可接收结果：#{job.fetch('state')}" unless job["result_sha256"]
+    destination = fetch_result(job_id, job)
+    puts destination
+    0
+  end
+
+  def fetch_result(job_id, job)
+    destination = @config.paths.fetch("results").join(job_id)
+    return destination if destination.exist?
+
+    bytes = http.get_bytes("jobs/#{job_id}/result")
+    actual = Digest::SHA256.hexdigest(bytes)
+    raise RemoteWork::Error, "结果包哈希校验失败" unless secure_equal?(actual, job.fetch("result_sha256"))
+    FileUtils.mkdir_p(@config.paths.fetch("tmp").to_s, mode: 0o700)
+    Dir.mktmpdir("result-", @config.paths.fetch("tmp").to_s) do |temporary|
+      archive = Pathname.new(temporary).join("result.tar.gz")
+      File.open(archive.to_s, "wb", 0o600) { |file| file.write(bytes) }
+      extracted = Pathname.new(temporary).join("content")
+      RemoteWork::Archive.unpack(archive, extracted)
+      FileUtils.mkdir_p(destination.dirname.to_s, mode: 0o700)
+      FileUtils.mv(extracted.to_s, destination.to_s)
+    end
+    destination
+  end
+
+  def jobs_cancel
+    job_id = validate_job_id!(@arguments.shift)
+    ensure_no_arguments!
+    puts JSON.pretty_generate(http.post("jobs/#{job_id}/cancel", {}))
+    0
+  end
+
+  def jobs_retry
+    job_id = validate_job_id!(@arguments.shift)
+    ensure_no_arguments!
+    puts JSON.pretty_generate(http.post("jobs/#{job_id}/retry", {}))
+    0
+  end
+
+  def jobs_recover
+    request_id = @arguments.shift
+    ensure_no_arguments!
+    raise RemoteWork::Error, "提交请求 ID 无效" unless request_id && REQUEST_ID.match?(request_id)
+    puts JSON.pretty_generate(http.get("jobs/by-request/#{request_id}"))
+    0
+  end
+
+  def print_pending_interactions(job_id)
+    pending = http.get("jobs/#{job_id}/interactions").fetch("interactions").select { |item| item["status"] == "pending" }
+    pending.each do |item|
+      puts "interaction\t#{item.fetch('id')}\t#{item.fetch('kind')}"
+      puts JSON.pretty_generate(item.fetch("prompt", {}))
+    end
+    puts "下一步\t使用 wu 回复任务 或 wu 回答任务；不会把沉默视为同意"
+  end
+
+  def bridge
+    command = @arguments.shift || "status"
+    case command
+    when "install" then bridge_install
+    when "status" then bridge_status
+    else raise RemoteWork::Error, "未知 bridge 命令：#{command}"
+    end
+  end
+
+  def bridge_install
+    ensure_no_arguments!
+    binary = bridge_binary
+    raise RemoteWork::Error, "两头乌 MCP 能力桥不存在：#{binary}" unless binary.executable?
+    changed = ensure_codex_bridge!(binary)
+    puts "Codex MCP\ttwo-head-wu\t#{changed ? 'installed' : 'current'}"
+    0
+  end
+
+  def ensure_codex_bridge!(binary)
+    stdout, _stderr, status = Open3.capture3("codex", "mcp", "get", "two-head-wu", "--json")
+    if status.success?
+      value = JSON.parse(stdout)
+      current = value.dig("transport", "command")
+      raise RemoteWork::Error, "Codex 中的 two-head-wu MCP 名称已被其他程序占用" unless current == binary.to_s
+      return false
+    end
+    _add_stdout, add_stderr, add_status = Open3.capture3("codex", "mcp", "add", "two-head-wu", "--", binary.to_s)
+    raise RemoteWork::Error, "无法注册 Codex MCP 能力桥：#{add_stderr.to_s.lines.first.to_s.strip}" unless add_status.success?
+    true
+  rescue JSON::ParserError
+    raise RemoteWork::Error, "Codex MCP 状态响应无效"
+  rescue Errno::ENOENT
+    raise RemoteWork::Error, "没有找到 Codex CLI，暂时不能注册 MCP 能力桥"
+  end
+
+  def bridge_status
+    ensure_no_arguments!
+    stdout, _stderr, status = Open3.capture3("codex", "mcp", "get", "two-head-wu", "--json")
+    raise RemoteWork::Error, "Codex 尚未登记 two-head-wu MCP；运行 wu remote bridge install" unless status.success?
+    value = JSON.parse(stdout)
+    value["expected_command"] = bridge_binary.to_s
+    value["healthy"] = value.dig("transport", "command") == bridge_binary.to_s && value["enabled"] == true
+    puts JSON.pretty_generate(value)
+    value["healthy"] ? 0 : 2
+  rescue JSON::ParserError
+    raise RemoteWork::Error, "Codex MCP 状态响应无效"
+  rescue Errno::ENOENT
+    raise RemoteWork::Error, "没有找到 Codex CLI"
+  end
+
+  def bridge_binary
+    managed = Pathname.new(File.join(Dir.home, ".local", "bin", "two-head-wu-mcp"))
+    return managed if managed.executable?
+    @root.join("capabilities/remote-work/installer/two-head-wu-mcp")
+  end
+
+  def companion
+    command = @arguments.shift || "status"
+    case command
+    when "install" then companion_install
+    when "status" then companion_status
+    when "once" then companion_once
+    when "run" then companion_run
+    when "prompt" then companion_prompt
+    else raise RemoteWork::Error, "未知 companion 命令：#{command}"
+    end
+  end
+
+  def companion_install
+    ensure_no_arguments!
+    wu = Pathname.new(File.join(Dir.home, ".local", "bin", "wu"))
+    raise RemoteWork::Error, "稳定 wu 入口不存在" unless wu.executable?
+    install_companion_launch_agent(wu)
+    puts "Air 交互伴侣\tinstalled"
+    0
+  end
+
+  def install_companion_launch_agent(wu)
+    plist = companion_plist_path
+    content = <<~PLIST
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+      <plist version="1.0"><dict>
+        <key>Label</key><string>com.twoheadwu.remote-companion</string>
+        <key>ProgramArguments</key><array>
+          <string>#{xml_escape(wu.to_s)}</string><string>remote</string><string>companion</string><string>run</string>
+        </array>
+        <key>RunAtLoad</key><true/>
+        <key>KeepAlive</key><true/>
+        <key>ThrottleInterval</key><integer>10</integer>
+        <key>StandardOutPath</key><string>#{xml_escape(@config.home.join('companion.log').to_s)}</string>
+        <key>StandardErrorPath</key><string>#{xml_escape(@config.home.join('companion-error.log').to_s)}</string>
+      </dict></plist>
+    PLIST
+    RemoteWork::Atomic.write(plist, content, mode: 0o600)
+    domain = "gui/#{Process.uid}"
+    system("launchctl", "bootout", domain, plist.to_s, out: File::NULL, err: File::NULL)
+    raise RemoteWork::Error, "无法启动 Air 交互伴侣" unless system("launchctl", "bootstrap", domain, plist.to_s, out: File::NULL, err: File::NULL)
+    true
+  rescue Errno::ENOENT
+    raise RemoteWork::Error, "当前系统没有 launchctl"
+  end
+
+  def companion_status
+    ensure_no_arguments!
+    state = @config.state
+    puts JSON.pretty_generate({
+      "schema_version" => 1,
+      "installed" => companion_plist_path.file?,
+      "notified_interactions" => state.fetch("companion_notified", {}).length,
+      "active_projects" => state.fetch("active_projects", {}).length,
+      "terminal_ui" => ENV["WU_REMOTE_COMPANION_NO_UI"] == "1" ? "disabled-for-test" : "enabled"
+    })
+    companion_plist_path.file? ? 0 : 2
+  end
+
+  def companion_run
+    options = { interval: 3 }
+    parser = OptionParser.new { |item| item.on("--interval SECONDS", Integer) { |value| options[:interval] = value } }
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    raise RemoteWork::Error, "伴侣轮询间隔必须在 2 到 60 秒之间" unless options.fetch(:interval).between?(2, 60)
+    loop do
+      begin
+        companion_tick
+      rescue RemoteWork::Error => error
+        warn "Air companion retry: #{error.message}"
+      end
+      sleep options.fetch(:interval)
+    end
+  end
+
+  def companion_once
+    ensure_no_arguments!
+    report = companion_tick
+    puts JSON.pretty_generate(report)
+    0
+  end
+
+  def companion_tick
+    air_sync_report = reconcile_pending_air_sync
+    project_reports = @config.state.fetch("active_projects", {}).map do |job_id, binding|
+      begin
+        sync_project_binding(job_id, binding)
+      rescue RemoteWork::Error => error
+        { "job_id" => job_id, "result" => "error", "error" => error.message }
+      end
+    end
+    notified = []
+    jobs = http.get("jobs").fetch("jobs")
+    jobs.select { |job| job["state"] == "waiting_user" }.each do |job|
+      interactions = http.get("jobs/#{job.fetch('id')}/interactions").fetch("interactions")
+      interactions.select { |item| item["status"] == "pending" }.each do |interaction|
+        next if interaction_notified?(interaction.fetch("id"))
+        open_interaction_terminal(job.fetch("id"), interaction.fetch("id"), interaction.fetch("prompt", {}))
+        mark_interaction_notified(interaction.fetch("id"), job.fetch("id"))
+        notified << interaction.fetch("id")
+      end
+    end
+    {
+      "schema_version" => 1,
+      "observed_at" => Time.now.utc.iso8601,
+      "air_sync" => air_sync_report,
+      "notified" => notified,
+      "projects" => project_reports
+    }
+  end
+
+  def reconcile_pending_air_sync
+    record = @config.state["air_sync"]
+    return { "status" => "idle" } unless record.is_a?(Hash) && record["status"] == "queued" && record["job_id"]
+
+    job_id = validate_job_id!(record.fetch("job_id"))
+    job = http.get("jobs/#{job_id}").fetch("job")
+    return { "status" => job.fetch("state"), "job_id" => job_id } unless TERMINAL_STATES.include?(job.fetch("state"))
+
+    unless job.fetch("state") == "succeeded"
+      reason = job.fetch("failure", job.fetch("state"))
+      save_air_sync_state(trigger: record.fetch("trigger", "queued-air-sync"), status: "failed", job_id: job_id, reason: reason)
+      return { "status" => "failed", "job_id" => job_id, "reason" => reason }
+    end
+
+    destination = fetch_result(job_id, job)
+    output_path = destination.join("output.json")
+    raise RemoteWork::Error, "排队的 Air 同步流水线没有结构化结果" unless output_path.file?
+    output = JSON.parse(output_path.read(encoding: "UTF-8"))
+    raise RemoteWork::Error, "排队的 Air 同步流水线结果不受支持" unless output["schema"] == "two-head-wu.air-sync.v1"
+
+    if output.fetch("status") == "completed"
+      modules_update
+      sync_capability_directory!(quiet: true)
+      save_air_sync_state(
+        trigger: record.fetch("trigger", "queued-air-sync"), status: "completed",
+        job_id: job_id, catalog_version: output["catalog_version"]
+      )
+      { "status" => "completed", "job_id" => job_id, "catalog_version" => output["catalog_version"] }
+    elsif output.fetch("status") == "review-required"
+      pending = Array(output["pending_review"])
+      save_air_sync_state(
+        trigger: record.fetch("trigger", "queued-air-sync"), status: "review-required",
+        job_id: job_id, pending_review: pending
+      )
+      { "status" => "review-required", "job_id" => job_id, "pending_review" => pending }
+    else
+      save_air_sync_state(
+        trigger: record.fetch("trigger", "queued-air-sync"), status: "failed",
+        job_id: job_id, reason: "unknown pipeline status"
+      )
+      { "status" => "failed", "job_id" => job_id, "reason" => "unknown pipeline status" }
+    end
+  rescue JSON::ParserError, KeyError => error
+    save_air_sync_state(
+      trigger: record&.fetch("trigger", "queued-air-sync"), status: "failed",
+      job_id: record && record["job_id"], reason: error.message
+    )
+    { "status" => "failed", "job_id" => record && record["job_id"], "reason" => error.message }
+  end
+
+  def interaction_notified?(interaction_id)
+    @config.state.fetch("companion_notified", {}).key?(interaction_id)
+  end
+
+  def mark_interaction_notified(interaction_id, job_id)
+    state = @config.state
+    state["companion_notified"] ||= {}
+    state["companion_notified"][interaction_id] = { "job_id" => job_id, "notified_at" => Time.now.utc.iso8601 }
+    state["companion_notified"] = state["companion_notified"].to_a.last(500).to_h
+    @config.save_state(state)
+  end
+
+  def open_interaction_terminal(job_id, interaction_id, prompt)
+    title = prompt.fetch("title", "Mini 需要你的确认").to_s[0, 120]
+    if ENV["WU_REMOTE_COMPANION_NO_UI"] == "1"
+      puts "pending\t#{job_id}\t#{interaction_id}\t#{title}"
+      return
+    end
+    wu = File.join(Dir.home, ".local", "bin", "wu")
+    command = [wu, "remote", "companion", "prompt", job_id, interaction_id].shelljoin
+    notification = %(display notification "#{apple_escape(title)}" with title "两头乌 Mini 等待确认")
+    terminal = %(tell application "Terminal" to do script "#{apple_escape(command)}")
+    system("osascript", "-e", notification, out: File::NULL, err: File::NULL)
+    raise RemoteWork::Error, "无法打开 Air 交互终端；请运行 wu 待处理 #{job_id}" unless system("osascript", "-e", terminal, "-e", %(tell application "Terminal" to activate), out: File::NULL, err: File::NULL)
+  rescue Errno::ENOENT
+    raise RemoteWork::Error, "系统没有 osascript；请运行 wu 待处理 #{job_id}"
+  end
+
+  def companion_prompt
+    job_id = validate_job_id!(@arguments.shift)
+    interaction_id = validate_interaction_id!(@arguments.shift)
+    ensure_no_arguments!
+    interaction = http.get("jobs/#{job_id}/interactions").fetch("interactions").find { |item| item["id"] == interaction_id }
+    raise RemoteWork::Error, "交互不存在或已不可见" unless interaction
+    raise RemoteWork::Error, "交互已经处理：#{interaction.fetch('status')}" unless interaction["status"] == "pending"
+    prompt = interaction.fetch("prompt", {})
+    puts "\n两头乌 Mini 需要你的处理"
+    puts "任务：#{job_id}"
+    puts "交互：#{interaction_id}"
+    puts JSON.pretty_generate(prompt)
+    payload = if interaction.fetch("kind") == "user-input"
+                answers = {}
+                Array(prompt["questions"]).each do |question|
+                  print "#{question.fetch('question', question.fetch('id'))}\n> "
+                  answer = STDIN.gets
+                  raise RemoteWork::Error, "没有收到回答；交互保持待处理" unless answer
+                  answers[question.fetch("id")] = [answer.chomp]
+                end
+                { "answers" => answers }
+              else
+                puts "选择：1 接受　2 本次会话　3 拒绝　4 取消"
+                print "> "
+                answer = STDIN.gets&.strip
+                decision = { "1" => "accept", "2" => "acceptForSession", "3" => "decline", "4" => "cancel" }[answer]
+                raise RemoteWork::Error, "没有有效选择；交互保持待处理" unless decision
+                { "decision" => decision }
+              end
+    puts JSON.pretty_generate(http.post("jobs/#{job_id}/interactions/#{interaction_id}/reply", payload))
+    0
+  end
+
+  def companion_plist_path
+    Pathname.new(File.join(Dir.home, "Library", "LaunchAgents", "com.twoheadwu.remote-companion.plist"))
+  end
+
+  def apple_escape(value)
+    value.to_s.gsub("\\", "\\\\").gsub('"', '\\"').gsub("\n", " ")
+  end
+
+  def command_available?(name)
+    ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).any? do |directory|
+      path = File.join(directory, name)
+      File.file?(path) && File.executable?(path)
+    end
+  end
+
+  def diagnose
+    ensure_no_arguments!
+    report = {
+      "version" => RemoteWork::VERSION,
+      "configured" => @config.configured?,
+      "config_permissions" => @config.path.file? ? format("%04o", @config.path.stat.mode & 0o777) : nil,
+      "secret" => "not-checked",
+      "control_plane" => "not-checked"
+    }
+    if @config.configured?
+      begin
+        secret = @config.secret
+        report["secret"] = secret.empty? ? "missing" : "ready"
+        response = http.get("me")
+        report["control_plane"] = "reachable"
+        report["device_id"] = response.fetch("device").fetch("id")
+        report["role"] = response.fetch("device").fetch("role")
+      rescue RemoteWork::Error => error
+        report["control_plane"] = "failed"
+        report["error"] = error.message
+      end
+    end
+    puts JSON.pretty_generate(report.compact)
+    report["configured"] && report["secret"] == "ready" && report["control_plane"] == "reachable" ? 0 : 2
+  end
+
+  def owner_policy
+    YAML.safe_load(@root.join("capabilities/remote-work/policies/owner-only.yaml").read(encoding: "UTF-8"), permitted_classes: [], aliases: false)
+  end
+
+  def remote_modules
+    value = http.get("modules")
+    RemoteWork::ModuleSignature.verify!(value, release_public_key.read)
+    Array(value.fetch("modules"))
+  end
+
+  def http
+    @http ||= RemoteWork::HTTPClient.new(@config)
+  end
+
+  def validate_module_id!(value)
+    raise RemoteWork::Error, "缺少模块 ID" unless value
+    raise RemoteWork::Error, "模块 ID 无效" unless MODULE_ID.match?(value)
+    value
+  end
+
+  def validate_job_id!(value)
+    raise RemoteWork::Error, "缺少任务 ID" unless value
+    raise RemoteWork::Error, "任务 ID 无效" unless JOB_ID.match?(value)
+    value
+  end
+
+  def validate_interaction_id!(value)
+    raise RemoteWork::Error, "缺少交互 ID" unless value
+    raise RemoteWork::Error, "交互 ID 无效" unless INTERACTION_ID.match?(value)
+    value
+  end
+
+  def validate_artifact_id!(value)
+    raise RemoteWork::Error, "缺少附件 ID" unless value
+    raise RemoteWork::Error, "附件 ID 无效" unless ARTIFACT_ID.match?(value)
+    value
+  end
+
+  def normalize_decision(value)
+    mapping = {
+      "接受" => "accept", "accept" => "accept",
+      "本次会话" => "acceptForSession", "acceptForSession" => "acceptForSession",
+      "拒绝" => "decline", "decline" => "decline",
+      "取消" => "cancel", "cancel" => "cancel"
+    }
+    mapping.fetch(value) { raise RemoteWork::Error, "选择必须是 接受、本次会话、拒绝 或 取消" }
+  end
+
+  def save_event_cursor(job_id, cursor)
+    state = @config.state
+    state.fetch("event_cursors", {})[job_id] = cursor
+    @config.save_state(state)
+  end
+
+  def secure_equal?(first, second)
+    return false unless first.bytesize == second.bytesize
+    difference = 0
+    first.bytes.zip(second.bytes) { |left, right| difference |= left ^ right }
+    difference.zero?
+  end
+
+  def ensure_no_arguments!
+    raise RemoteWork::Error, "未知参数：#{@arguments.join(' ')}" unless @arguments.empty?
+  end
+end
+
+exit RemoteWorkClient.new(ARGV).run

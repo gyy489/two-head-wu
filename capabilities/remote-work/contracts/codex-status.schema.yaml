@@ -1,0 +1,51 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Two-Headed-Wu redacted Codex quota status
+type: object
+required: [schema, source_device, observed_at, accounts]
+properties:
+  schema:
+    const: two-head-wu.codex-status.v1
+  source_device:
+    const: mac-mini-worker
+  observed_at:
+    type: string
+  accounts:
+    type: array
+    items:
+      type: object
+      required: [identity, status, account, primary, five_hour, weekly, rate_limits]
+      properties:
+        identity:
+          type: string
+        status:
+          enum: [ok, not-logged-in, error]
+        account:
+          type: [object, "null"]
+        primary:
+          $ref: "#/$defs/rate_window_or_null"
+          description: "Backward-compatible alias of the provider primary window. New consumers should use five_hour."
+        five_hour:
+          $ref: "#/$defs/rate_window_or_null"
+        weekly:
+          $ref: "#/$defs/rate_window_or_null"
+        rate_limits:
+          type: array
+        error:
+          type: [string, "null"]
+      additionalProperties: false
+additionalProperties: false
+$defs:
+  rate_window_or_null:
+    oneOf:
+      - type: "null"
+      - $ref: "#/$defs/rate_window"
+  rate_window:
+    type: object
+    required: [remaining_percent, used_percent, window_duration_mins, resets_at, resets_at_iso]
+    properties:
+      remaining_percent: { type: [number, "null"], minimum: 0, maximum: 100 }
+      used_percent: { type: [number, "null"], minimum: 0, maximum: 100 }
+      window_duration_mins: { type: [integer, "null"], minimum: 1 }
+      resets_at: { type: [integer, "null"], minimum: 1 }
+      resets_at_iso: { type: [string, "null"] }
+    additionalProperties: false

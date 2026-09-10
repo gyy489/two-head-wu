@@ -1,0 +1,6 @@
+interface:
+  display_name: "两头乌多端工作"
+  short_description: "用中文管理模块漫游以及 Mac mini 远程任务"
+  default_prompt: "使用 $remote-work 查看这台设备可用的两头乌模块。"
+policy:
+  allow_implicit_invocation: true

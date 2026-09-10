@@ -1,0 +1,73 @@
+schema_version: 1
+id: spec-kit-governance
+version: "0.2.1"
+status: active
+summary: "Project-local Spec Kit installation plus deterministic Change Capsule, scope, review, and staged-change governance."
+
+documentation:
+  overview: "capabilities/spec-kit-governance/README.md"
+  skill_docs: []
+  references:
+    - "capabilities/spec-kit-governance/contracts/change-capsule.schema.yaml"
+  generated: []
+
+installation:
+  source_owner: two-head-wu
+  runtime_mode: project-generated
+  managed_copy: true
+  large_artifacts: none
+
+interfaces:
+  - id: spec-kit-governance
+    type: adapter
+    entrypoint: "capabilities/spec-kit-governance/adapters/spec-kit-governance"
+  - id: spec-kit-health
+    type: workflow
+    entrypoint: "catalog/workflows_registry.yaml"
+  - id: change-governance
+    type: adapter
+    entrypoint: "capabilities/spec-kit-governance/adapters/change-governance"
+
+components:
+  skills: []
+  agents: []
+  adapters:
+    - "adapters/spec-kit-governance"
+    - "adapters/change-governance"
+  workflows:
+    - "spec-kit-health"
+
+compatibility:
+  codex: native
+  claude-code: compatible
+  openclaw: denied
+
+permissions:
+  risk_level: low
+  network: none
+  secrets: none
+  filesystem:
+    read:
+      - ".specify"
+      - ".agents/skills"
+      - ".claude/skills"
+      - "skills/.active"
+      - "specs"
+      - "catalog/documentation_registry.yaml"
+      - "catalog/packages_registry.yaml"
+      - "repository-local Git index and worktree path metadata"
+    write: []
+
+dependencies:
+  - id: specify-cli
+    version: "0.16.2"
+    purpose: "Project-local Spec Kit integration and templates."
+
+recovery:
+  source_of_truth: ".specify integration manifests, specs/*/change.yaml, Catalog navigation facts, and tracked governance package files"
+  rebuild_command: "capabilities/spec-kit-governance/adapters/spec-kit-governance doctor"
+  rollback: "Restore the previous tracked Spec Kit integration after reviewing regenerated files."
+
+tests:
+  - "capabilities/spec-kit-governance/tests/test_spec_kit_governance.sh"
+  - "ruby capabilities/spec-kit-governance/tests/test_change_governance.rb"

@@ -1,0 +1,101 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://two-head-wu.local/contracts/capability.schema.yaml"
+title: "Two-Headed-Wu Capability Package"
+type: object
+additionalProperties: false
+required:
+  - schema_version
+  - id
+  - version
+  - status
+  - summary
+  - documentation
+  - installation
+  - interfaces
+  - components
+  - compatibility
+  - permissions
+  - dependencies
+  - recovery
+  - tests
+properties:
+  schema_version:
+    const: 1
+  id:
+    type: string
+    pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+  version:
+    type: string
+  status:
+    enum: [candidate, experimental, active, disabled, deprecated]
+  summary:
+    type: string
+  documentation:
+    type: object
+    additionalProperties: false
+    required: [overview, skill_docs, references, generated]
+    properties:
+      overview: { type: string }
+      skill_docs: { type: array, items: { type: string } }
+      references: { type: array, items: { type: string } }
+      generated: { type: array, items: { type: string } }
+  installation:
+    type: object
+    additionalProperties: false
+    required: [source_owner, runtime_mode, managed_copy, large_artifacts]
+    properties:
+      source_owner:
+        enum: [system-package-manager, runtime-native, two-head-wu, external-service, vendored]
+      runtime_mode:
+        enum: [source, project-generated, source-and-generated, source-and-external-state, source-and-external-service, source-and-protected-service]
+      managed_copy: { type: boolean }
+      large_artifacts:
+        enum: [none, external-volume-required]
+  interfaces:
+    type: array
+    items:
+      type: object
+      required: [id, type, entrypoint]
+      properties:
+        id: { type: string }
+        type: { enum: [cli, skill, mcp, adapter, workflow, agent, service] }
+        entrypoint: { type: string }
+  components:
+    type: object
+    properties:
+      skills: { type: array, items: { type: string } }
+      agents: { type: array, items: { type: string } }
+      adapters: { type: array, items: { type: string } }
+      workflows: { type: array, items: { type: string } }
+  compatibility:
+    type: object
+    additionalProperties:
+      enum: [native, compatible, needs-review, denied]
+  permissions:
+    type: object
+    required: [risk_level, network, secrets, filesystem]
+    properties:
+      risk_level: { enum: [low, medium, high, critical] }
+      network: { type: string }
+      secrets: { type: string }
+      filesystem: { type: object }
+  dependencies:
+    type: array
+    items:
+      type: object
+      required: [id, version]
+      properties:
+        id: { type: string }
+        version: { type: string }
+        purpose: { type: string }
+  recovery:
+    type: object
+    required: [source_of_truth, rollback]
+    properties:
+      source_of_truth: { type: string }
+      private_material: { type: string }
+      rebuild_command: { type: string }
+      rollback: { type: string }
+  tests:
+    type: array
+    items: { type: string }

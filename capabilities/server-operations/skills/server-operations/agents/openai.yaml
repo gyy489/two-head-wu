@@ -1,0 +1,4 @@
+interface:
+  display_name: "受保护静态发布"
+  short_description: "通过独立受保护执行器安全发布两个已登记的私人静态站点内容"
+  default_prompt: "Use $server-operations to publish this project’s checked static output to public-site through the protected executor."

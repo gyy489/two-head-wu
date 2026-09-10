@@ -1,0 +1,94 @@
+version: 1
+updated_at: "2026-09-10"
+
+packages:
+  - id: two-head-wu-core
+    version: "0.5.0"
+    status: active
+    path: capabilities/two-head-wu-core
+    manifest: capabilities/two-head-wu-core/capability.yaml
+    summary: "两头乌的确定性解析、调用、诊断和治理入口。"
+    exports:
+      interfaces: [wu, git-change-gates, capability-release-routing]
+      skills: [two-head-wu]
+  - id: capability-release-management
+    version: "0.1.1"
+    status: active
+    path: capabilities/capability-release-management
+    manifest: capabilities/capability-release-management/capability.yaml
+    summary: "能力包版本解析、校验安装、原子激活、稳定调用与回滚。"
+    exports:
+      interfaces: [capability-release-manager, capability-stable-invoke]
+      skills: []
+  - id: spec-kit-governance
+    version: "0.2.1"
+    status: active
+    path: capabilities/spec-kit-governance
+    manifest: capabilities/spec-kit-governance/capability.yaml
+    summary: "项目规格、变更范围、审查和提交治理。"
+    exports:
+      interfaces: [spec-kit-governance, spec-kit-health, change-governance]
+      skills: []
+  - id: agent-identity
+    version: "0.11.0"
+    status: active
+    path: capabilities/agent-identity
+    manifest: capabilities/agent-identity/capability.yaml
+    summary: "Codex 身份、会话路由、项目终端恢复和生命周期管理。"
+    exports:
+      interfaces: [agent-identity-adapter, agent-identity-thread-lifecycle, agent-identity-project-terminals]
+      skills: [agent-identity]
+  - id: agent-observability
+    version: "0.3.11"
+    status: experimental
+    path: capabilities/agent-observability
+    manifest: capabilities/agent-observability/capability.yaml
+    summary: "本地 Codex 身份与项目的调用追踪和可观测性。"
+    exports:
+      interfaces: [agent-observability-adapter, agent-observability.status.v1, agent-observability.query.v1]
+      skills: []
+  - id: skills-dashboard
+    version: "0.1.0"
+    status: active
+    path: capabilities/skills-dashboard
+    manifest: capabilities/skills-dashboard/capability.yaml
+    summary: "按需启动的本地只读 Skill 与 Capability 关系面板。"
+    exports:
+      interfaces: [skills-dashboard-adapter]
+      skills: [skills-dashboard]
+  - id: server-operations
+    version: "0.3.0"
+    status: active
+    path: capabilities/server-operations
+    manifest: capabilities/server-operations/capability.yaml
+    summary: "面向固定示例站点的受保护静态发布与脱敏审计。"
+    exports:
+      interfaces: [server-operations-adapter, private-site-publisher, server-operations-health]
+      skills: [server-operations]
+  - id: remote-work-bootstrap
+    version: "0.1.0"
+    status: active
+    path: capabilities/remote-work-bootstrap
+    manifest: capabilities/remote-work-bootstrap/capability.yaml
+    summary: "固定远程运行环境的受控初始化与验证。"
+    exports:
+      interfaces: [remote-work-bootstrap-adapter, remote-work-bootstrap-target-provider, remote-work-bootstrap-health]
+      skills: [remote-work-bootstrap]
+  - id: remote-work
+    version: "0.12.0"
+    status: experimental
+    path: capabilities/remote-work
+    manifest: capabilities/remote-work/capability.yaml
+    summary: "macOS/Windows 多设备能力桥、隔离 Worker 和可恢复任务。"
+    exports:
+      interfaces: [remote-work-client, remote-work-control-plane, remote-work-worker, remote-work-air-mcp]
+      skills: [remote-work]
+  - id: personal-memory
+    version: "0.2.0"
+    status: experimental
+    path: capabilities/personal-memory
+    manifest: capabilities/personal-memory/capability.yaml
+    summary: "基于 OpenClaw 会话和可移植 Markdown 的所有者长期记忆。"
+    exports:
+      interfaces: [personal-memory.status.v1, personal-memory.recall.v1, personal-memory.remember.v1]
+      skills: []

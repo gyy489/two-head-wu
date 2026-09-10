@@ -1,0 +1,67 @@
+schema_version: 1
+id: skills-dashboard
+version: "0.1.0"
+status: active
+summary: "On-request (not standing) read-only local web dashboard visualizing Skill/Capability relationships (skill_set membership, capability ownership/dependency, runtime availability, and heuristically inferred SKILL.md cross-references) built live from this project's own registries; self-terminates and clears its own state after a period of inactivity."
+
+documentation:
+  overview: "capabilities/skills-dashboard/README.md"
+  skill_docs:
+    - "capabilities/skills-dashboard/skills/skills-dashboard/SKILL.md"
+  references:
+    - "capabilities/skills-dashboard/references/maintenance-reference.md"
+  generated: []
+
+installation:
+  source_owner: two-head-wu
+  runtime_mode: source
+  managed_copy: false
+  large_artifacts: none
+
+interfaces:
+  - id: skills-dashboard
+    type: skill
+    entrypoint: "capabilities/skills-dashboard/skills/skills-dashboard/SKILL.md"
+  - id: skills-dashboard-adapter
+    type: adapter
+    entrypoint: "capabilities/skills-dashboard/adapters/skills-dashboard"
+
+components:
+  skills:
+    - "skills/skills-dashboard"
+  agents: []
+  adapters:
+    - "adapters/skills-dashboard"
+  workflows: []
+
+compatibility:
+  codex: native
+  claude-code: compatible
+  openclaw: denied
+
+permissions:
+  risk_level: low
+  network: "binds 127.0.0.1 only by default (overridable with --bind, not recommended); makes no outbound requests; sends no CORS headers"
+  secrets: "none read, served, or stored; only architecture metadata already present in this project's own registries (skill names, paths, purposes, risk/network/filesystem-access labels)"
+  filesystem:
+    read:
+      - "skills/registries/skills_registry.yaml"
+      - "registries/capabilities_registry.yaml"
+      - "capabilities/*/capability.yaml"
+      - "each active Skill's SKILL.md body text, for heuristic name-mention scanning only"
+    write:
+      - "var/skills-dashboard/ (pid/port state and server log only)"
+
+dependencies:
+  - id: two-head-wu-core
+    version: ">=0.1.0"
+    purpose: "Project capability resolution and registered Skill exposure."
+
+recovery:
+  source_of_truth: "tracked capability package; runtime state under var/skills-dashboard/ is fully rebuildable and disposable"
+  private_material: "none"
+  rebuild_command: "capabilities/skills-dashboard/tests/test_skills_dashboard.sh"
+  rollback: "Run adapters/skills-dashboard stop and/or delete var/skills-dashboard/; nothing else in the project references it."
+
+tests:
+  - "capabilities/skills-dashboard/tests/test_skills_dashboard.sh"

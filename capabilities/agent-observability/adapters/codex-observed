@@ -1,0 +1,78 @@
+#!/usr/bin/ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "pathname"
+
+state_root = Pathname.new(Dir.home).join(".local/state/two-head-wu/agent-observability")
+package_root = Pathname.new(__dir__).join("..").realpath
+
+override = ENV["TWO_HEAD_WU_OBSERVABILITY_VENDOR_CODEX"].to_s
+if override.empty?
+  candidates = Dir.glob(Pathname.new(Dir.home).join(".vscode/extensions/openai.chatgpt-*-darwin-arm64/bin/macos-aarch64/codex").to_s)
+                  .select { |path| File.executable?(path) }
+  abort "Codex VS Code extension binary was not found" if candidates.empty?
+  target = candidates.max_by { |path| File.mtime(path) }
+else
+  abort "CODEX_BIN is set but not executable: #{override}" unless File.executable?(override)
+  target = override
+end
+abort "recursive Codex wrapper target refused" if Pathname.new(target).realpath == Pathname.new(__FILE__).realpath
+metadata_only = [%w[--version], %w[-V], %w[--help], %w[-h], %w[help]]
+if metadata_only.include?(ARGV)
+  exec(
+    { "CODEX_BIN" => nil, "TWO_HEAD_WU_OBSERVABILITY_VENDOR_CODEX" => nil },
+    target, *ARGV
+  )
+end
+
+prelaunch = package_root.join("integrations/codex-prelaunch")
+log = state_root.join("provider-trigger.log")
+socket_path = state_root.join("provider-trigger.sock")
+provider_pid = nil
+provider_reaped = true
+begin
+  FileUtils.mkdir_p(state_root, mode: 0o700)
+  File.open(log, File::WRONLY | File::APPEND | File::CREAT, 0o600) do |log_io|
+    FileUtils.chmod(0o600, log)
+    provider_pid = Process.spawn(prelaunch.to_s, out: log_io, err: log_io)
+  end
+  provider_reaped = false
+  100.times do
+    break if socket_path.socket?
+    if Process.waitpid(provider_pid, Process::WNOHANG)
+      provider_reaped = true
+      break
+    end
+    sleep 0.02
+  end
+rescue SystemCallError, IOError => error
+  warn "agent-observability prelaunch unavailable: #{error.class}"
+end
+
+vendor_status = nil
+begin
+  vendor_pid = Process.spawn(
+    { "CODEX_BIN" => nil, "TWO_HEAD_WU_OBSERVABILITY_VENDOR_CODEX" => nil },
+    target, *ARGV
+  )
+  _, vendor_status = Process.wait2(vendor_pid)
+ensure
+  unless provider_reaped || provider_pid.nil?
+    50.times do
+      if Process.waitpid(provider_pid, Process::WNOHANG)
+        provider_reaped = true
+        break
+      end
+      break unless socket_path.socket?
+
+      sleep 0.02
+    end
+    unless provider_reaped
+      Process.kill("TERM", provider_pid) rescue nil if socket_path.socket?
+      Process.wait(provider_pid) rescue nil
+    end
+  end
+end
+
+exit(vendor_status.exitstatus || (128 + vendor_status.termsig))

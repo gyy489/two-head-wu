@@ -1,0 +1,1213 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "date"
+require "json"
+require "open3"
+require "optparse"
+require "pathname"
+require "time"
+require "yaml"
+
+require_relative "../lib/function_catalog"
+require_relative "../lib/skill_policy"
+require_relative "../../capabilities/capability-release-management/lib/capability_release_manager"
+
+class WuError < StandardError; end
+
+class Wu
+  EXPOSED_COMPATIBILITY = %w[native compatible].freeze
+
+  def initialize(arguments)
+    @arguments = arguments.dup
+    @root = Pathname.new(__dir__).join("../..").expand_path.cleanpath
+    @invocation_cwd = Pathname.pwd.expand_path.cleanpath
+  end
+
+  def run
+    command = @arguments.shift || "help"
+    exit_status = case command
+                  when "help", "帮助", "--help", "-h" then show_help
+                  when "status" then status
+                  when "doctor" then doctor
+                  when "resolve" then resolve
+                  when "search" then search
+                  when "resources" then resources
+                  when "run" then run_workflow
+                  when "translate", "翻译" then delegate("capabilities/local-translation/adapters/local-translation", ["translate", *@arguments])
+                  when "research-library", "资料库" then research_library(@arguments)
+                  when "skills" then route_skills(@arguments)
+                  when "capabilities" then delegate("scripts/capabilities-manager", @arguments)
+                  when "packages", "能力版本" then delegate("capabilities/capability-release-management/adapters/capability-release-manager", @arguments)
+                  when "invoke", "调用接口" then delegate("capabilities/capability-release-management/adapters/capability-release-manager", ["invoke", *@arguments])
+                  when "update-docs", "更新说明" then delegate("core/bin/wu-docs", ["update", *@arguments])
+                  when "verify-change", "验收修改" then delegate("core/bin/wu-docs", ["verify", *@arguments])
+                  when "change", "变更检查" then delegate("capabilities/spec-kit-governance/adapters/change-governance", @arguments)
+                  when "git-hooks", "Git门禁" then delegate("core/bin/wu-git-hooks", @arguments)
+                  when "安装门禁" then delegate("core/bin/wu-git-hooks", ["install", *@arguments])
+                  when "门禁状态" then delegate("core/bin/wu-git-hooks", ["status", *@arguments])
+                  when "卸载门禁" then delegate("core/bin/wu-git-hooks", ["uninstall", *@arguments])
+                  when "remote", "多端" then delegate_remote(@arguments)
+                  when "能做什么", "查看能力"
+                    remote_configured? ? delegate_remote(["abilities", "list", *@arguments]) : function_catalog
+                  when "功能清单", "查看清单" then function_catalog
+                  when "本地能力" then delegate_remote(["abilities", "local", *@arguments])
+                  when "远端能力" then delegate_remote(["abilities", "remote", *@arguments])
+                  when "同步能力" then delegate_remote(["abilities", "sync", *@arguments])
+                  when "调用能力" then delegate_remote(["invoke", *@arguments])
+                  when "同步项目" then delegate_remote(["projects", "sync", *@arguments])
+                  when "查看项目桥" then delegate_remote(["projects", "status", *@arguments])
+                  when "安装能力桥" then delegate_remote(["bridge", "install", *@arguments])
+                  when "查看能力桥" then delegate_remote(["bridge", "status", *@arguments])
+                  when "查看交互伴侣" then delegate_remote(["companion", "status", *@arguments])
+                  when "查看模块" then delegate_remote(["modules", "list", *@arguments])
+                  when "查看本机" then delegate_remote(["modules", "status", *@arguments])
+                  when "查看模型" then delegate_remote(["models", "list", *@arguments])
+                  when "查看工具" then delegate_remote(["tools", "list", *@arguments])
+                  when "查看设备" then delegate_remote(["devices", "list", *@arguments])
+                  when "查看附件" then delegate_remote(["artifacts", "list", *@arguments])
+                  when "上传附件" then delegate_remote(["artifacts", "upload", *@arguments])
+                  when "下载附件" then delegate_remote(["artifacts", "fetch", *@arguments])
+                  when "删除附件" then delegate_remote(["artifacts", "remove", *@arguments])
+                  when "恢复附件" then delegate_remote(["artifacts", "recover", *@arguments])
+                  when "查看额度", "codex-status" then delegate_remote(["tools", "invoke", "codex-status", *@arguments])
+                  when "查看账号" then delegate_remote(["tools", "invoke", "identity-catalog", *@arguments])
+                  when "查看资源" then invoke_remote_resource(@arguments)
+                  when "查OpenAI文档" then search_remote_openai_docs(@arguments)
+                  when "运行工作流" then invoke_remote_workflow(@arguments)
+                  when "拉取模块" then delegate_remote(["modules", "pull", *@arguments])
+                  when "自动更新" then delegate_remote(["policy", "set", *@arguments, "auto-update"])
+                  when "按需模块" then delegate_remote(["policy", "set", *@arguments, "on-demand"])
+                  when "固定模块" then delegate_remote(["policy", "set", *@arguments, "pinned"])
+                  when "停用模块" then delegate_remote(["policy", "set", *@arguments, "off"])
+                  when "更新模块" then delegate_remote(["modules", "update", *@arguments])
+                  when "查看版本" then delegate_remote(["modules", "versions", *@arguments])
+                  when "回滚模块" then delegate_remote(["modules", "rollback", *@arguments])
+                  when "远程任务" then delegate_remote(["jobs", "submit", "--project", @invocation_cwd.to_s, "--", *@arguments])
+                  when "附件任务" then submit_remote_artifact_job(@arguments)
+                  when "查看任务" then delegate_remote(["jobs", "status", *@arguments])
+                  when "待处理" then delegate_remote(["jobs", "interactions", *@arguments])
+                  when "回复任务" then reply_remote_interaction(@arguments)
+                  when "回答任务" then answer_remote_interaction(@arguments)
+                  when "接收结果" then delegate_remote(["jobs", "fetch", *@arguments])
+                  when "取消任务" then delegate_remote(["jobs", "cancel", *@arguments])
+                  when "重试任务" then delegate_remote(["jobs", "retry", *@arguments])
+                  when "恢复提交" then delegate_remote(["jobs", "recover", *@arguments])
+                  when "诊断" then delegate_remote(["diagnose", *@arguments])
+                  else
+                    raise WuError, "unknown command: #{command}"
+                  end
+    record(command, exit_status || 0)
+    exit_status || 0
+  rescue Errno::EPIPE
+    0
+  rescue WuError, TwoHeadWu::FunctionCatalog::Error, KeyError, Psych::Exception => error
+    warn "Error: #{error.message}"
+    record(command || "unknown", 2)
+    2
+  end
+
+  private
+
+  def show_help
+    puts <<~HELP
+      Usage: wu COMMAND [OPTIONS]
+
+      Commands:
+        status                         Show runtime and Skill surface status
+        resolve [options]              Resolve allowed capabilities deterministically
+        search QUERY [--json]          Search registered Skills, packages, projects, and MCP servers
+        resources [options]            List redacted resources bound to one project
+        run WORKFLOW [--approve]       Run one pre-registered deterministic workflow
+        translate [options]            Translate bounded text through the approved local model
+        research-library COMMAND       Use the bound private literature provider and ingestion queue
+        doctor [--strict]              Validate managers, registries, surfaces, and packages
+        skills COMMAND [...]           Manage Releases, profiles, cold Catalog, audit, and activation
+        capabilities COMMAND [...]     Manage cross-runtime capability surfaces
+        packages COMMAND [...]         Resolve, update, and roll back project Capability releases
+        invoke CAPABILITY [...]        Invoke an active project-bound Capability interface
+        update-docs                    Refresh managed documentation and topology
+        verify-change                  Verify documentation, topology, packages, tests, and storage placement
+        change COMMAND [...]           Validate Change Capsules and staged/worktree scope
+        git-hooks COMMAND [...]         Install, inspect, or remove repository Git change gates
+        remote COMMAND [...]           Manage owner-only multi-device modules and jobs
+
+      Chinese shortcuts:
+        翻译 | 资料库 | 能力版本 | 调用接口 | 更新说明 | 验收修改 | 变更检查 | 安装门禁 | 门禁状态 | 卸载门禁
+        能做什么 | 功能清单 | 本地能力 | 远端能力 | 同步能力 | 调用能力 | 同步项目 | 查看项目桥 | 安装能力桥 | 查看能力桥 | 查看交互伴侣
+        查看模块 | 查看本机 | 查看模型 | 查看工具 | 查看设备 | 查看额度 | 查看账号 | 查看资源 | 查OpenAI文档 | 运行工作流
+        查看附件 | 上传附件 | 下载附件 | 删除附件 | 恢复附件
+        拉取模块 | 自动更新 | 按需模块 | 固定模块 | 停用模块 | 更新模块 | 查看版本 | 回滚模块 | 远程任务 | 附件任务
+        查看任务 | 待处理 | 回复任务 | 回答任务 | 接收结果 | 取消任务 | 重试任务 | 恢复提交 | 诊断
+    HELP
+    0
+  end
+
+  def status
+    ensure_no_arguments!
+    puts "two-head-wu: #{@root}"
+    puts "core:        core/bin/wu"
+    puts "catalog:     catalog/index.yaml"
+    puts "packages:    capabilities/"
+    puts "runtime var: var/"
+    puts
+    first = delegate("scripts/skills-manager", ["status"])
+    puts
+    second = delegate("scripts/capabilities-manager", ["status"])
+    [first, second].max
+  end
+
+  def doctor
+    strict = !!@arguments.delete("--strict")
+    ensure_no_arguments!
+    codes = []
+    codes << delegate("scripts/skills-manager", ["doctor"])
+    capability_args = ["doctor"]
+    capability_args << "--strict" if strict
+    codes << delegate("scripts/capabilities-manager", capability_args)
+    codes << validate_packages
+    puts "wu doctor ok" if codes.all?(&:zero?)
+    codes.max
+  end
+
+  def resolve
+    options = { "agent" => "two-head-wu", "format" => "text" }
+    parser = OptionParser.new do |item|
+      item.on("--agent ID") { |value| options["agent"] = value }
+      item.on("--runtime ID") { |value| options["runtime"] = value }
+      item.on("--project ID") { |value| options["project"] = value }
+      item.on("--intent TEXT") { |value| options["intent"] = value }
+      item.on("--json") { options["format"] = "json" }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+
+    agents = index_by(load_yaml("registries/agents_registry.yaml").fetch("agents"), "id")
+    agent = agents[options.fetch("agent")]
+    raise WuError, "unknown agent: #{options.fetch('agent')}" unless agent
+
+    manifest = load_yaml(agent.fetch("manifest"))
+    runtime_id = options["runtime"] || manifest.dig("runtime", "primary_brain")
+    raise WuError, "runtime is required" unless runtime_id
+
+    runtimes = index_by(load_yaml("registries/runtimes_registry.yaml").fetch("runtimes"), "id")
+    runtime = runtimes[runtime_id]
+    raise WuError, "unknown runtime: #{runtime_id}" unless runtime
+
+    capability_registry = load_yaml("registries/capabilities_registry.yaml")
+    skill_sets = capability_registry.fetch("skill_sets")
+    requested_sets = Array(manifest.dig("capabilities", "skill_sets"))
+    requested_sets.concat(Array(manifest.dig("capabilities", "runtime_skill_sets", runtime_id)))
+
+    skills = index_by(load_yaml("skills/registries/skills_registry.yaml").fetch("skills"), "name")
+    package_registry = load_yaml("catalog/packages_registry.yaml")
+    all_packages = Array(package_registry["packages"])
+    packages_by_id = index_by(all_packages, "id")
+    global_packages = Array(capability_registry["global_packages"])
+    global_packages.each do |package_id|
+      raise WuError, "global policy references unknown package: #{package_id}" unless packages_by_id[package_id]
+    end
+    package_compatibility = all_packages.each_with_object({}) do |entry, index|
+      manifest_data = load_yaml(entry.fetch("manifest"))
+      index[entry.fetch("id")] = manifest_data.fetch("compatibility", {}).fetch(runtime_id, "needs-review")
+    end
+
+    project = resolve_project(options["project"])
+    project_packages = global_packages.dup
+    if project
+      allowed_runtimes = Array(project["allowed_runtimes"] || project.dig("runtimes", "allowed"))
+      unless allowed_runtimes.empty? || allowed_runtimes.include?(runtime_id)
+        raise WuError, "project #{project.fetch('id')} does not allow runtime #{runtime_id}"
+      end
+
+      project_policy = project["capabilities"]
+      raise WuError, "project #{project.fetch('id')} has no capability policy" unless project_policy.is_a?(Hash)
+      project_packages.concat(Array(project_policy["packages"])).uniq!
+      project_packages.each do |package_id|
+        package = packages_by_id[package_id]
+        raise WuError, "project references unknown package: #{package_id}" unless package
+      end
+    end
+
+    skill_policy = TwoHeadWu::SkillPolicy.new(@root)
+    if project
+      profile_id = skill_policy.project_profile_id(project.fetch("id"), options.fetch("agent"), runtime_id)
+      raise WuError, "project #{project.fetch('id')} has no Skill Profile binding for #{options.fetch('agent')}/#{runtime_id}" unless profile_id
+      skill_names = skill_policy.resolved_hot_skills(project.fetch("id"), options.fetch("agent"), runtime_id)
+      catalog_skill_names = skill_policy.eligible_catalog_skills(project.fetch("id"), options.fetch("agent"), runtime_id)
+      profile_stacks = skill_policy.profile_stack_ids(profile_id)
+    else
+      profile_id = skill_policy.global_profile_id(runtime_id)
+      skill_names = skill_policy.global_hot_skills(runtime_id)
+      catalog_skill_names = skill_policy.eligible_catalog_skills(nil, options.fetch("agent"), runtime_id)
+      profile_stacks = skill_policy.profile_stack_ids(profile_id)
+    end
+
+    packages = all_packages.select do |package|
+      compatible = EXPOSED_COMPATIBILITY.include?(package_compatibility.fetch(package.fetch("id")))
+      next false unless compatible
+
+      if project
+        project_packages.include?(package.fetch("id"))
+      else
+        exports = Array(package.dig("exports", "skills"))
+        global_packages.include?(package.fetch("id")) || !(exports & skill_names).empty?
+      end
+    end
+
+    mcp_ids = Array(manifest.dig("capabilities", "mcp_allowlist"))
+    mcp_ids &= Array(project.dig("capabilities", "mcp")) if project
+    mcp_servers = index_by(load_yaml("catalog/mcp_registry.yaml").fetch("servers"), "id")
+    mcp_ids.select! do |mcp_id|
+      server = mcp_servers[mcp_id]
+      raise WuError, "unknown MCP: #{mcp_id}" unless server
+      state = server.fetch("clients", {}).fetch(runtime_id, "not_configured")
+      allowed_agents = Array(server["allowed_agents"])
+      state.to_s.start_with?("configured") && allowed_agents.include?(options.fetch("agent"))
+    end
+
+    server_operations_available = packages.any? { |item| item.fetch("id") == "server-operations" } &&
+                                  (skill_names + catalog_skill_names).include?("server-operations")
+    available_package_ids = packages.map { |item| item.fetch("id") }
+    resources = project ? project_resources(project, capability_ids: available_package_ids) : []
+    protected_assets = if project && server_operations_available
+                         project_protected_assets(project)
+                       else
+                         []
+                       end
+    intent_matches = []
+    capability_intent_matches = []
+    resource_intent_matches = []
+    protected_asset_intent_matches = []
+    providers = packages.flat_map { |item| capability_providers(item) }
+    provider_intent_matches = []
+    if options["intent"]
+      query = options["intent"].downcase
+      intent_matches = skill_names.select do |name|
+        item = skills[name] || {}
+        [name, item["category"], item["purpose"]].compact.join(" ").downcase.include?(query)
+      end
+      capability_intent_matches = packages.select do |item|
+        [item["id"], item["summary"], *Array(item.dig("exports", "interfaces"))].compact.join(" ").downcase.include?(query)
+      end.map { |item| item.fetch("id") }
+      resource_intent_matches = resources.select do |item|
+        [item["id"], item["kind"], item["summary"], *Array(item["roles"])].compact.join(" ").downcase.include?(query)
+      end.map { |item| item.fetch("id") }
+      protected_asset_intent_matches = protected_assets.select do |item|
+        [item["id"], item["kind"], item["summary"], item["classification"], item["status"], item["access"]].compact.join(" ").downcase.include?(query)
+      end.map { |item| item.fetch("id") }
+      provider_intent_matches = providers.select do |item|
+        [item["id"], item["kind"], item["capability"], *Array(item["interfaces"])].compact.join(" ").downcase.include?(query)
+      end.map { |item| item.fetch("id") }
+    end
+
+    result = {
+      "agent" => options.fetch("agent"),
+      "runtime" => runtime_id,
+      "project" => project && project["id"],
+      "workspace" => project && (project["workspace"] || project["path"]),
+      "skill_sets" => requested_sets,
+      "skill_profile" => profile_id,
+      "skill_stacks" => profile_stacks,
+      "skills" => skill_names,
+      "catalog_skills" => catalog_skill_names,
+      "capability_packages" => packages.map { |item| item.fetch("id") }.sort,
+      "providers" => providers,
+      "resources" => resources.map { |item| safe_resource_view(item) },
+      "protected_assets" => protected_assets.map { |item| safe_protected_asset_view(item) },
+      "mcp" => mcp_ids,
+      "delegation" => Array(manifest.dig("capabilities", "delegation_allowlist")),
+      "approval_profile" => project&.dig("permissions", "approval_profile") || manifest.dig("permissions", "default_profile"),
+      "intent" => options["intent"],
+      "intent_matches" => intent_matches,
+      "capability_intent_matches" => capability_intent_matches,
+      "resource_intent_matches" => resource_intent_matches,
+      "protected_asset_intent_matches" => protected_asset_intent_matches,
+      "provider_intent_matches" => provider_intent_matches
+    }
+
+    if options["format"] == "json"
+      puts JSON.pretty_generate(result)
+    else
+      print_resolution(result)
+    end
+    0
+  end
+
+  def search
+    json = !!@arguments.delete("--json")
+    query = @arguments.join(" ").strip
+    raise WuError, "search requires a query" if query.empty?
+
+    needle = query.downcase
+    records = []
+    Array(load_yaml("skills/registries/skills_registry.yaml")["skills"]).each do |item|
+      add_search_record(records, "skill", item["name"], item, needle, %w[name category purpose path])
+    end
+    Array(load_yaml("catalog/packages_registry.yaml")["packages"]).each do |item|
+      add_search_record(records, "package", item["id"], item, needle, %w[id summary path status])
+    end
+    Array(load_yaml("registries/projects_registry.yaml")["projects"]).each do |item|
+      add_search_record(records, "project", item["id"], item, needle, %w[id name path purpose])
+    end
+    Array(load_yaml("catalog/mcp_registry.yaml")["servers"]).each do |item|
+      add_search_record(records, "mcp", item["id"], item, needle, %w[id name status risk_level])
+    end
+    protected_asset_records.each do |item|
+      add_search_record(records, "protected-asset", item["id"], item, needle, %w[id kind summary classification status access])
+    end
+    if json
+      puts JSON.pretty_generate({ "query" => query, "results" => records })
+    elsif records.empty?
+      puts "No registered result for: #{query}"
+    else
+      records.each { |item| puts "#{item.fetch('type')}\t#{item.fetch('id')}\t#{item.fetch('summary')}" }
+    end
+    0
+  end
+
+  def resources
+    options = { "format" => "text" }
+    parser = OptionParser.new do |item|
+      item.on("--agent ID") { |value| options["agent"] = value }
+      item.on("--runtime ID") { |value| options["runtime"] = value }
+      item.on("--project ID") { |value| options["project"] = value }
+      item.on("--id ID") { |value| options["id"] = value }
+      item.on("--query TEXT") { |value| options["query"] = value }
+      item.on("--json") { options["format"] = "json" }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    %w[agent runtime project].each { |key| raise WuError, "resources requires --#{key}" unless options[key] }
+
+    project = authorize_resources!(options.fetch("agent"), options.fetch("runtime"), options.fetch("project"))
+    capability_ids = authorized_resource_capabilities(
+      options.fetch("agent"), options.fetch("runtime"), project
+    )
+    records = project_resources(project, capability_ids: capability_ids)
+    if options["id"]
+      record = records.find { |item| item.fetch("id") == options.fetch("id") }
+      raise WuError, "resource is not bound to project #{project.fetch('id')}: #{options.fetch('id')}" unless record
+
+      records = [record]
+    end
+    if options["query"]
+      needle = options.fetch("query").downcase
+      records = records.select do |item|
+        safe = safe_resource_view(item)
+        [safe["id"], safe["kind"], safe["summary"], *Array(safe["roles"]), safe["access"], safe["content_mode"], safe["lifecycle"]].compact.join(" ").downcase.include?(needle)
+      end
+    end
+    safe_records = records.map { |item| safe_resource_view(item) }
+    if options["format"] == "json"
+      puts JSON.pretty_generate({ "project" => project.fetch("id"), "resources" => safe_records })
+    else
+      safe_records.each do |item|
+        puts "#{item.fetch('id')}\t#{item.fetch('kind')}\t#{item.fetch('summary')}"
+      end
+    end
+    0
+  end
+
+  def run_workflow
+    approved = !!@arguments.delete("--approve")
+    workflow_id = @arguments.shift
+    raise WuError, "run requires a workflow ID" unless workflow_id
+    ensure_no_arguments!
+
+    workflows = index_by(load_yaml("catalog/workflows_registry.yaml").fetch("workflows"), "id")
+    workflow = workflows[workflow_id]
+    raise WuError, "unknown workflow: #{workflow_id}" unless workflow
+    if workflow.fetch("approval", "none") == "explicit" && !approved
+      raise WuError, "workflow #{workflow_id} requires --approve"
+    end
+
+    command = Array(workflow.fetch("command"))
+    raise WuError, "workflow command is empty: #{workflow_id}" if command.empty?
+    executable = Pathname.new(command.first)
+    if executable.relative? && command.first.include?(File::SEPARATOR)
+      executable = @root.join(executable).cleanpath
+      root_prefix = "#{@root}#{File::SEPARATOR}"
+      raise WuError, "workflow executable escapes project root" unless executable.to_s.start_with?(root_prefix)
+      command[0] = executable.to_s
+    end
+    puts "workflow: #{workflow_id}"
+    run_command(command)
+  end
+
+  def research_library(arguments)
+    command = arguments.shift || "help"
+    return research_library_help if %w[help 帮助 --help -h].include?(command)
+
+    library_commands = {
+      "status" => "status", "状态" => "status", "health" => "health", "健康" => "health",
+      "browse" => "browse", "浏览" => "browse",
+      "search" => "search", "搜索" => "search", "get" => "get", "取件" => "get",
+      "get-artifact" => "get-artifact", "精确取件" => "get-artifact",
+      "citation" => "citation", "引用" => "citation", "collect" => "collect", "收集" => "collect",
+      "ingest-file" => "ingest-file", "录入文件" => "ingest-file", "backfill" => "backfill", "回填" => "backfill",
+      "archive-translation" => "archive-translation", "归档译文" => "archive-translation",
+      "backup" => "backup", "备份" => "backup", "restore" => "restore", "恢复备份" => "restore",
+      "migrate" => "migrate", "迁移数据库" => "migrate", "rebuild-index" => "rebuild-index", "重建索引" => "rebuild-index",
+      "register-entity" => "register-entity", "登记实体" => "register-entity",
+      "relate-entity" => "relate-entity", "关联实体" => "relate-entity"
+    }
+    ingestion_commands = {
+      "inventory" => "inventory", "盘点" => "inventory", "start" => "start", "开始" => "start",
+      "ingest-url" => "ingest-url", "抓取网页" => "ingest-url", "job-status" => "status", "任务" => "status",
+      "pause" => "pause", "暂停" => "pause", "resume" => "resume", "恢复" => "resume",
+      "cancel" => "cancel", "取消" => "cancel", "review-path" => "review-path", "审核目录" => "review-path",
+      "review-finalize" => "review-finalize", "确认入库" => "review-finalize",
+      "review-update-metadata" => "review-update-metadata", "修正审核元数据" => "review-update-metadata",
+      "review-reclassify" => "review-reclassify", "重分类审核副本" => "review-reclassify",
+      "review-resolve-verification" => "review-resolve-verification", "决议预核验队列" => "review-resolve-verification",
+      "reprocess-prepare" => "reprocess-prepare", "准备清洗阅读副本" => "reprocess-prepare",
+      "reprocess-status" => "reprocess-status", "清洗阅读副本状态" => "reprocess-status",
+      "reprocess-apply" => "reprocess-apply", "应用清洗阅读副本" => "reprocess-apply"
+    }
+    browser_commands = {
+      "browser" => "start", "页面" => "start",
+      "browser-status" => "status", "页面状态" => "status",
+      "browser-stop" => "stop", "关闭页面" => "stop"
+    }
+    if %w[initialize 初始化].include?(command)
+      return initialize_research_library(arguments)
+    end
+
+    research_library_root
+    if browser_commands.key?(command)
+      return invoke_research_release(
+        "research-library", "research-library-web", [browser_commands.fetch(command), *arguments]
+      )
+    end
+    if library_commands.key?(command)
+      return invoke_research_release(
+        "research-library", "research-library-adapter", [library_commands.fetch(command), *arguments]
+      )
+    end
+    if ingestion_commands.key?(command)
+      return invoke_research_release(
+        "research-ingestion", "research-ingestion-adapter", [ingestion_commands.fetch(command), *arguments]
+      )
+    end
+    raise WuError, "unknown research-library command: #{command}"
+  end
+
+  def research_library_help
+    puts <<~HELP
+      Usage: wu 资料库 COMMAND [OPTIONS]
+
+      Library:
+        初始化 --data-root PATH [--dry-run]  Preview or explicitly create and bind one data root
+        状态 | 健康 [--deep] | 浏览 | 搜索 | 取件 | 引用 | 收集 | 回填
+        页面 [--open] [--port N]          启动本机只读 Web 浏览器
+        页面状态 | 关闭页面
+        归档译文 --work-id ID --version-id ID --source-artifact-id ID
+                   --expected-source-sha256 HASH --translation FILE --manifest FILE [--confirm]
+        备份 [--include-artifacts] | 恢复备份 --backup-id ID [--confirm]
+        迁移数据库 [--confirm] | 重建索引
+      Ingestion:
+        盘点 --manifest FILE
+        开始 --manifest FILE                 Explicitly launch a resumable background job
+        任务|暂停|恢复|取消 --job ID
+        审核目录 --job ID
+        修正审核元数据 --job ID --candidate ID --metadata FILE
+        重分类审核副本 --job ID --candidate ID --selection FILE
+        决议预核验队列 --job ID --resolutions FILE
+        确认入库 --job ID [--confirm]         Preview by default; publish only with --confirm
+        抓取网页 --url URL --metadata FILE --confirmed-relevant
+        准备清洗阅读副本 [--limit N]         转换全部原件并建立可恢复检查点，不改数据库
+        清洗阅读副本状态
+        应用清洗阅读副本 --backup-id ID [--confirm]
+                                             必须绑定完整备份；默认只预览
+
+      English command aliases are available through `wu research-library`.
+    HELP
+    0
+  end
+
+  def initialize_research_library(arguments)
+    options = { "dry_run" => false, "json" => false }
+    parser = OptionParser.new do |item|
+      item.on("--data-root PATH") { |value| options["data_root"] = value }
+      item.on("--dry-run") { options["dry_run"] = true }
+      item.on("--json") { options["json"] = true }
+    end
+    parser.parse!(arguments)
+    raise WuError, "unknown arguments: #{arguments.join(' ')}" unless arguments.empty?
+    raise WuError, "资料库 初始化 requires --data-root" if options["data_root"].to_s.empty?
+    root = Pathname.new(options.fetch("data_root")).expand_path.cleanpath
+    raise WuError, "research-library data root must be absolute" unless root.absolute?
+    adapter_arguments = ["--data-root", root.to_s, "initialize"]
+    adapter_arguments << "--dry-run" if options.fetch("dry_run")
+    adapter_arguments << "--json" if options.fetch("json")
+    activate_research_runtime unless options.fetch("dry_run")
+    status = delegate("capabilities/research-library/adapters/research-library", adapter_arguments)
+    write_research_library_binding(root) if status.zero? && !options.fetch("dry_run")
+    status
+  end
+
+  def activate_research_runtime
+    manager = @root.join("capabilities/capability-release-management/adapters/capability-release-manager")
+    %w[research-library research-ingestion].each do |capability|
+      command = [
+        manager.to_s, "update", "--project", "two-head-wu", "--capability", capability,
+        "--apply", "--json"
+      ]
+      _stdout, stderr, status = Open3.capture3(*command, chdir: @root.to_s)
+      next if status.success?
+
+      detail = stderr.to_s.lines.first.to_s.strip
+      raise WuError, "failed to activate managed research runtime: #{capability}#{detail.empty? ? '' : ": #{detail}"}"
+    end
+  end
+
+  def invoke_research_release(capability, interface, arguments)
+    runtime = ENV.fetch("TWO_HEAD_WU_RUNTIME_ID", "codex")
+    unless %w[codex claude-code openclaw].include?(runtime)
+      raise WuError, "unsupported research runtime: #{runtime}"
+    end
+    delegate(
+      "capabilities/capability-release-management/adapters/capability-release-manager",
+      [
+        "invoke", capability, "--project", "two-head-wu", "--runtime", runtime,
+        "--interface", interface, "--", *arguments
+      ]
+    )
+  end
+
+  def research_library_root
+    explicit = ENV["TWO_HEAD_WU_RESEARCH_LIBRARY_ROOT"].to_s
+    return Pathname.new(explicit).expand_path.cleanpath.to_s unless explicit.empty?
+
+    binding_path = research_library_binding_path
+    raise WuError, "research-library data root is not bound; run `wu 资料库 初始化 --data-root PATH`" unless binding_path.file?
+    binding = JSON.parse(binding_path.read(encoding: "UTF-8"))
+    unless binding.is_a?(Hash) && binding["schema_version"] == 1 &&
+           binding["resource_id"] == "private-data-service"
+      raise WuError, "research-library machine binding is invalid"
+    end
+    root = Pathname.new(binding.fetch("data_root")).expand_path.cleanpath
+    raise WuError, "research-library machine binding is not absolute" unless root.absolute?
+    root.to_s
+  rescue JSON::ParserError, KeyError => error
+    raise WuError, "research-library machine binding is invalid: #{error.message}"
+  end
+
+  def research_library_binding_path
+    configured = ENV["WU_RESEARCH_LIBRARY_BINDING_FILE"].to_s
+    return Pathname.new(configured).expand_path.cleanpath unless configured.empty?
+
+    @root.join("var/resource-bindings/private-data-service.json")
+  end
+
+  def write_research_library_binding(root)
+    path = research_library_binding_path
+    path.dirname.mkpath
+    temporary = path.dirname.join(".#{path.basename}.#{Process.pid}.tmp")
+    payload = {
+      "schema_version" => 1, "resource_id" => "private-data-service",
+      "data_root" => root.to_s, "bound_at" => Time.now.utc.iso8601
+    }
+    File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+      file.write(JSON.pretty_generate(payload) + "\n")
+      file.flush
+      file.fsync
+    end
+    File.rename(temporary, path)
+  ensure
+    File.delete(temporary) if temporary && temporary.exist?
+  end
+
+  def route_skills(arguments)
+    command = arguments.first
+    catalog_commands = {
+      "search" => "catalog-search",
+      "load" => "catalog-load",
+      "read" => "catalog-read",
+      "index" => "catalog-index",
+      "budget" => "visibility-budget",
+      "sync-profiles" => "sync-skills"
+    }
+    routed = catalog_commands[command]
+    return delegate("scripts/skills-manager", arguments) unless routed
+
+    delegate("scripts/capabilities-manager", [routed, *arguments.drop(1)])
+  end
+
+  def resolve_project(project_id)
+    return nil unless project_id
+
+    projects = Array(load_yaml("registries/projects_registry.yaml")["projects"])
+    project = projects.find { |item| item["id"] == project_id }
+    raise WuError, "unknown project: #{project_id}" unless project
+    workspace = project["workspace"] || project["path"]
+    raise WuError, "project #{project_id} has no workspace path" unless workspace
+    raw_path = Pathname.new(workspace)
+    path = raw_path.absolute? ? raw_path.expand_path : @root.join(raw_path).expand_path.cleanpath
+    raise WuError, "project workspace does not exist: #{workspace}" unless path.directory?
+    project
+  end
+
+  def resource_records
+    sources = load_yaml("catalog/index.yaml").fetch("sources")
+    infrastructure = load_yaml(sources.fetch("infrastructure_resources"))
+    deployments = load_yaml(sources.fetch("static_site_deployments"))
+    machines = Array(infrastructure.fetch("resources")).map do |item|
+      item.merge("_record_type" => "machine")
+    end
+    sites = Array(deployments.fetch("sites")).map do |item|
+      item.merge("_record_type" => "site", "kind" => "static-site")
+    end
+    records = machines + sites
+    ids = records.map { |item| item.fetch("id") }
+    raise WuError, "duplicate resource ID in Catalog" unless ids.uniq.length == ids.length
+
+    records
+  end
+
+  def project_resources(project, capability_ids: nil)
+    allowed_ids = Array(project.dig("resources", "allowed"))
+    records = resource_records
+    unknown = allowed_ids - records.map { |item| item.fetch("id") }
+    raise WuError, "project #{project.fetch('id')} references unknown resources: #{unknown.join(', ')}" unless unknown.empty?
+
+    selected = records.select { |item| allowed_ids.include?(item.fetch("id")) }
+    return selected unless capability_ids
+
+    selected.select { |item| capability_ids.include?(item.fetch("capability")) }
+  end
+
+  def capability_providers(package)
+    manifest = load_yaml(package.fetch("manifest"))
+    interfaces = Array(manifest["interfaces"])
+    canonical = interfaces.select { |item| item["provider_kind"] }
+    canonical.map do |provider|
+      prefix = provider.fetch("id").split(".", 2).first
+      {
+        "id" => provider.fetch("id"),
+        "kind" => provider.fetch("provider_kind"),
+        "capability" => package.fetch("id"),
+        "version" => manifest.fetch("version"),
+        "interfaces" => interfaces.map { |item| item["id"] }.compact.select { |id| id.start_with?("#{prefix}.") },
+        "binding_status" => package.fetch("id") == "research-library" ? research_library_binding_status : "not-required"
+      }
+    end
+  end
+
+  def research_library_binding_status
+    research_library_root
+    "configured"
+  rescue WuError
+    "unconfigured"
+  end
+
+  def protected_asset_records
+    sources = load_yaml("catalog/index.yaml").fetch("sources")
+    catalog = load_yaml(sources.fetch("protected_assets"))
+    records = Array(catalog.fetch("assets"))
+    ids = records.map { |item| item.fetch("id") }
+    raise WuError, "duplicate protected asset ID in Catalog" unless ids.uniq.length == ids.length
+
+    records
+  end
+
+  def project_protected_assets(project)
+    allowed_ids = Array(project.dig("protected_assets", "allowed"))
+    records = protected_asset_records
+    unknown = allowed_ids - records.map { |item| item.fetch("id") }
+    unless unknown.empty?
+      raise WuError, "project #{project.fetch('id')} references unknown protected assets: #{unknown.join(', ')}"
+    end
+
+    records.select { |item| allowed_ids.include?(item.fetch("id")) }
+  end
+
+  def authorize_resources!(agent_id, runtime_id, project_id)
+    agents = index_by(load_yaml("registries/agents_registry.yaml").fetch("agents"), "id")
+    agent = agents[agent_id]
+    raise WuError, "unknown agent: #{agent_id}" unless agent
+
+    manifest = load_yaml(agent.fetch("manifest"))
+    runtimes = index_by(load_yaml("registries/runtimes_registry.yaml").fetch("runtimes"), "id")
+    runtime = runtimes[runtime_id]
+    raise WuError, "unknown runtime: #{runtime_id}" unless runtime
+    project = resolve_project(project_id)
+    allowed_runtimes = Array(project["allowed_runtimes"] || project.dig("runtimes", "allowed"))
+    unless allowed_runtimes.empty? || allowed_runtimes.include?(runtime_id)
+      raise WuError, "project #{project.fetch('id')} does not allow runtime #{runtime_id}"
+    end
+
+    project
+  end
+
+  def authorized_resource_capabilities(agent_id, runtime_id, project)
+    agents = index_by(load_yaml("registries/agents_registry.yaml").fetch("agents"), "id")
+    manifest = load_yaml(agents.fetch(agent_id).fetch("manifest"))
+    runtimes = index_by(load_yaml("registries/runtimes_registry.yaml").fetch("runtimes"), "id")
+    runtime = runtimes.fetch(runtime_id)
+    requested_sets = Array(manifest.dig("capabilities", "skill_sets"))
+    requested_sets.concat(Array(manifest.dig("capabilities", "runtime_skill_sets", runtime_id)))
+    exposed_sets = Array(runtime.dig("skill_surface", "skill_sets"))
+    project_packages = Array(project.dig("capabilities", "packages"))
+    packages = index_by(load_yaml("catalog/packages_registry.yaml").fetch("packages"), "id")
+
+    project_packages.select do |capability_id|
+      next false unless requested_sets.include?(capability_id) && exposed_sets.include?(capability_id)
+
+      package = packages[capability_id]
+      next false unless package
+
+      package_manifest = load_yaml(package.fetch("manifest"))
+      EXPOSED_COMPATIBILITY.include?(package_manifest.fetch("compatibility", {}).fetch(runtime_id, "needs-review"))
+    end
+  end
+
+  def safe_resource_view(item)
+    if item.fetch("_record_type") == "site"
+      {
+        "id" => item.fetch("id"),
+        "kind" => "static-site",
+        "capability" => item.fetch("capability"),
+        "summary" => item.fetch("summary"),
+        "public_url" => item.fetch("public_url"),
+        "access" => item.fetch("access"),
+        "content_mode" => item.fetch("content_mode"),
+        "lifecycle" => item.fetch("lifecycle"),
+        "expiry" => item["expiry"],
+        "target_resource" => item.fetch("target_resource"),
+        "publication_status" => item.dig("publication_policy", "execution_status")
+      }.compact
+    else
+      operations = item.fetch("operations")
+      {
+        "id" => item.fetch("id"),
+        "kind" => item.fetch("kind"),
+        "capability" => item.fetch("capability"),
+        "summary" => item.fetch("summary"),
+        "classification" => item.fetch("classification"),
+        "roles" => item.fetch("roles"),
+        "allowed_actions" => Array(operations["allowed_actions"]),
+        "change_control" => operations["change_control"],
+        "automatic_wake" => operations["automatic_wake"],
+        "execution_status" => operations["execution_status"]
+      }.compact
+    end
+  end
+
+  def safe_protected_asset_view(item)
+    {
+      "id" => item.fetch("id"),
+      "kind" => item.fetch("kind"),
+      "summary" => item.fetch("summary"),
+      "classification" => item.fetch("classification"),
+      "status" => item.fetch("status"),
+      "access" => item.fetch("access")
+    }
+  end
+
+  def validate_resource_catalog(errors, package_ids)
+    records = resource_records
+    forbidden_keys = %w[address ip port hostname host username ssh_alias ssh_profile credential password token private_key key_path remote_path config configuration]
+    machine_ids = records.select { |item| item.fetch("_record_type") == "machine" }.map { |item| item.fetch("id") }
+    records.each do |item|
+      if item.fetch("_record_type") == "site"
+        %w[id capability summary public_url access content_mode lifecycle target_resource publication_policy private_ref].each do |key|
+          errors << "site #{item.fetch('id', 'unknown')} missing #{key}" unless item.key?(key)
+        end
+        errors << "site #{item.fetch('id')} is not static-only" unless item["content_mode"] == "static_only"
+        errors << "site #{item.fetch('id')} is not persistent mutable" unless item["lifecycle"] == "persistent_mutable"
+        errors << "site #{item.fetch('id')} target is not a registered machine" unless machine_ids.include?(item["target_resource"])
+        if item.fetch("id") == "public-site"
+          errors << "public-site must be public" unless item["access"] == "public"
+          errors << "public-site must have no expiry" unless item["expiry"] == "none"
+        end
+      else
+        %w[id kind capability summary classification roles operations policy_ref private_ref secret_ref_count].each do |key|
+          errors << "resource #{item.fetch('id', 'unknown')} missing #{key}" unless item.key?(key)
+        end
+      end
+      scan_resource_keys(item, forbidden_keys, errors, item.fetch("id", "unknown"))
+      capability = item["capability"]
+      errors << "resource #{item.fetch('id', 'unknown')} references unknown capability: #{capability}" unless package_ids.include?(capability)
+    end
+    records.map { |item| item.fetch("id") }
+  rescue WuError, KeyError, Psych::Exception => error
+    errors << "resource Catalog invalid: #{error.message}"
+    []
+  end
+
+  def scan_resource_keys(value, forbidden_keys, errors, resource_id)
+    case value
+    when Hash
+      value.each do |key, child|
+        errors << "resource #{resource_id} has forbidden field: #{key}" if forbidden_keys.include?(key.to_s)
+        scan_resource_keys(child, forbidden_keys, errors, resource_id)
+      end
+    when Array
+      value.each { |child| scan_resource_keys(child, forbidden_keys, errors, resource_id) }
+    end
+  end
+
+  def validate_protected_asset_catalog(errors)
+    records = protected_asset_records
+    required = %w[id kind summary classification status access private_ref]
+    forbidden_keys = %w[
+      address config configuration credential host hostname ip key key_path location password path port
+      private_key raw_path remote_path ssh_alias ssh_profile token username value
+    ]
+    allowed_kinds = %w[recovery-record secret-store protected-binding]
+    allowed_classifications = %w[private-operational secret-critical]
+    allowed_statuses = %w[owner-confirmed-present migration-pending protected]
+    allowed_access = %w[human-recovery-only protected-executor-only references-only]
+
+    records.each do |item|
+      required.each do |key|
+        errors << "protected asset #{item.fetch('id', 'unknown')} missing #{key}" unless item.key?(key)
+      end
+      next unless required.all? { |key| item.key?(key) }
+
+      id = item.fetch("id")
+      errors << "protected asset #{id} has invalid kind" unless allowed_kinds.include?(item.fetch("kind"))
+      unless allowed_classifications.include?(item.fetch("classification"))
+        errors << "protected asset #{id} has invalid classification"
+      end
+      errors << "protected asset #{id} has invalid status" unless allowed_statuses.include?(item.fetch("status"))
+      errors << "protected asset #{id} has invalid access" unless allowed_access.include?(item.fetch("access"))
+      unless item.fetch("private_ref").match?(%r{\Aprivate://two-head-wu/[a-z0-9/-]+\z})
+        errors << "protected asset #{id} has invalid private reference"
+      end
+      scan_resource_keys(item, forbidden_keys, errors, id)
+      scan_protected_asset_values(item, errors, id)
+    end
+    records.map { |item| item.fetch("id") }
+  rescue WuError, KeyError, Psych::Exception => error
+    errors << "protected asset Catalog invalid: #{error.message}"
+    []
+  end
+
+  def scan_protected_asset_values(value, errors, asset_id)
+    case value
+    when Hash
+      value.each_value { |child| scan_protected_asset_values(child, errors, asset_id) }
+    when Array
+      value.each { |child| scan_protected_asset_values(child, errors, asset_id) }
+    when String
+      errors << "protected asset #{asset_id} contains an absolute local path" if value.match?(%r{(?:\A|\s)/(?:Users|Volumes|private|etc)/})
+      errors << "protected asset #{asset_id} contains a raw network address" if value.match?(/(?:\d{1,3}\.){3}\d{1,3}/)
+      errors << "protected asset #{asset_id} contains private key material" if value.include?("-----BEGIN")
+    end
+  end
+
+  def skills_for_sets(names, sets, runtime_id)
+    names.flat_map do |name|
+      item = sets[name]
+      raise WuError, "unknown project Skill set: #{name}" unless item
+      state = item.fetch("compatibility", {}).fetch(runtime_id, "needs-review")
+      EXPOSED_COMPATIBILITY.include?(state) ? Array(item["skills"]) : []
+    end.uniq
+  end
+
+  def print_resolution(result)
+    puts "agent:    #{result.fetch('agent')}"
+    puts "runtime:  #{result.fetch('runtime')}"
+    puts "project:  #{result['project'] || '(global)'}"
+    puts "approval: #{result['approval_profile'] || 'unspecified'}"
+    puts "Skill profile: #{result.fetch('skill_profile')}"
+    puts "Skill stacks: #{result.fetch('skill_stacks').join(', ')}"
+    puts "Skills (#{result.fetch('skills').length}): #{result.fetch('skills').join(', ')}"
+    puts "Cold Catalog (#{result.fetch('catalog_skills').length} eligible): #{result.fetch('catalog_skills').join(', ')}"
+    puts "Capability packages: #{result.fetch('capability_packages').join(', ')}"
+    puts "Providers: #{result.fetch('providers').map { |item| item.fetch('id') }.join(', ')}"
+    puts "Resources (#{result.fetch('resources').length}): #{result.fetch('resources').map { |item| item.fetch('id') }.join(', ')}"
+    puts "Protected assets (#{result.fetch('protected_assets').length}): #{result.fetch('protected_assets').map { |item| item.fetch('id') }.join(', ')}"
+    puts "MCP: #{result.fetch('mcp').join(', ')}"
+    puts "Delegation: #{result.fetch('delegation').join(', ')}"
+    if result["intent"]
+      matches = result.fetch("intent_matches")
+      puts "Intent matches: #{matches.empty? ? '(none; no permission was inferred)' : matches.join(', ')}"
+      capability_matches = result.fetch("capability_intent_matches")
+      puts "Capability intent matches: #{capability_matches.empty? ? '(none)' : capability_matches.join(', ')}"
+      resource_matches = result.fetch("resource_intent_matches")
+      puts "Resource intent matches: #{resource_matches.empty? ? '(none)' : resource_matches.join(', ')}"
+      protected_asset_matches = result.fetch("protected_asset_intent_matches")
+      puts "Protected asset intent matches: #{protected_asset_matches.empty? ? '(none)' : protected_asset_matches.join(', ')}"
+      provider_matches = result.fetch("provider_intent_matches")
+      puts "Provider intent matches: #{provider_matches.empty? ? '(none)' : provider_matches.join(', ')}"
+    end
+  end
+
+  def validate_packages
+    errors = []
+    registry = load_yaml("catalog/packages_registry.yaml")
+    package_ids = []
+    Array(registry["packages"]).each do |entry|
+      package_ids << entry.fetch("id")
+      path = @root.join(entry.fetch("path")).cleanpath
+      manifest_path = @root.join(entry.fetch("manifest")).cleanpath
+      errors << "package path missing: #{entry.fetch('id')}" unless path.directory?
+      unless manifest_path.file?
+        errors << "package manifest missing: #{entry.fetch('id')}"
+        next
+      end
+      manifest = YAML.safe_load(manifest_path.read(encoding: "UTF-8"), permitted_classes: [], aliases: false) || {}
+      %w[schema_version id version status summary documentation installation interfaces components compatibility permissions dependencies recovery tests].each do |key|
+        errors << "#{entry.fetch('id')} manifest missing #{key}" unless manifest.key?(key)
+      end
+      errors << "package ID mismatch: #{entry.fetch('id')}" unless manifest["id"] == entry["id"]
+    end
+
+    catalog_index = load_yaml("catalog/index.yaml")
+    catalog_index.fetch("sources").each_value do |source|
+      errors << "Catalog source missing: #{source}" unless @root.join(source).file?
+    end
+    resource_ids = validate_resource_catalog(errors, package_ids)
+    protected_asset_ids = validate_protected_asset_catalog(errors)
+
+    runtime_ids = index_by(load_yaml("registries/runtimes_registry.yaml").fetch("runtimes"), "id").keys
+    skill_sets = load_yaml("registries/capabilities_registry.yaml").fetch("skill_sets").keys
+    skill_ids = index_by(load_yaml("skills/registries/skills_registry.yaml").fetch("skills"), "name").keys
+    mcp_registry = load_yaml("catalog/mcp_registry.yaml")
+    errors << "MCP registry version must be 2" unless mcp_registry["version"] == 2
+    mcp_servers = index_by(mcp_registry.fetch("servers"), "id")
+    mcp_servers.each do |mcp_id, server|
+      provider = server["provider"]
+      unless provider.is_a?(Hash) && provider["kind"] && provider["id"]
+        errors << "#{mcp_id} has no complete MCP provider ownership"
+        next
+      end
+      provider_kind = provider.fetch("kind")
+      errors << "#{mcp_id} has invalid MCP provider kind: #{provider_kind}" unless %w[capability runtime-native plugin external-service].include?(provider_kind)
+      if provider_kind == "capability" && !package_ids.include?(provider.fetch("id"))
+        errors << "#{mcp_id} references unknown provider capability: #{provider.fetch('id')}"
+      end
+    end
+    mcp_ids = mcp_servers.keys
+    Array(load_yaml("registries/projects_registry.yaml")["projects"]).each do |project|
+      project_id = project.fetch("id")
+      workspace = project["workspace"] || project["path"]
+      if workspace.nil? || !Pathname.new(workspace).absolute? || !Pathname.new(workspace).directory?
+        errors << "project workspace invalid: #{project_id}"
+      end
+      policy = project["capabilities"]
+      unless policy.is_a?(Hash)
+        errors << "project capability policy missing: #{project_id}"
+        next
+      end
+      Array(project["allowed_runtimes"]).each do |id|
+        errors << "#{project_id} references unknown runtime: #{id}" unless runtime_ids.include?(id)
+      end
+      Array(policy["packages"]).each do |id|
+        errors << "#{project_id} references unknown package: #{id}" unless package_ids.include?(id)
+      end
+      Array(policy["skill_sets"]).each do |id|
+        errors << "#{project_id} references unknown Skill set: #{id}" unless skill_sets.include?(id)
+      end
+      Array(policy["skills"]).each do |id|
+        errors << "#{project_id} references unknown Skill: #{id}" unless skill_ids.include?(id)
+      end
+      Array(policy["mcp"]).each do |id|
+        errors << "#{project_id} references unknown MCP: #{id}" unless mcp_ids.include?(id)
+      end
+      Array(project.dig("resources", "allowed")).each do |id|
+        errors << "#{project_id} references unknown resource: #{id}" unless resource_ids.include?(id)
+      end
+      Array(project.dig("protected_assets", "allowed")).each do |id|
+        errors << "#{project_id} references unknown protected asset: #{id}" unless protected_asset_ids.include?(id)
+      end
+    end
+
+    workflow_ids = []
+    Array(load_yaml("catalog/workflows_registry.yaml")["workflows"]).each do |workflow|
+      workflow_id = workflow.fetch("id")
+      errors << "duplicate workflow ID: #{workflow_id}" if workflow_ids.include?(workflow_id)
+      workflow_ids << workflow_id
+      errors << "#{workflow_id} references unknown package" unless package_ids.include?(workflow["capability"])
+      errors << "#{workflow_id} has invalid approval" unless %w[none explicit].include?(workflow["approval"])
+      command = Array(workflow["command"])
+      if command.empty?
+        errors << "#{workflow_id} has no command"
+      elsif command.first.include?(File::SEPARATOR)
+        executable = @root.join(command.first).cleanpath
+        errors << "#{workflow_id} executable missing" unless executable.file? && executable.executable?
+      end
+    end
+    begin
+      release_manager = TwoHeadWu::CapabilityReleaseManager.new(
+        root: @root,
+        state_root: @root.join("var/capability-releases")
+      )
+      binding_projects = Array(
+        load_yaml("catalog/project_capability_bindings.yaml")["bindings"]
+      ).map { |binding| binding.fetch("project") }.uniq
+      binding_projects.each { |project_id| release_manager.resolve(project_id: project_id) }
+    rescue TwoHeadWu::CapabilityReleaseManager::Error, KeyError => error
+      errors << "Capability release binding cannot resolve: #{error.message}"
+    end
+    errors.each { |message| warn "ERROR: #{message}" }
+    puts "catalog and capability packages: #{errors.empty? ? 'ok' : "#{errors.length} error(s)"}"
+    errors.empty? ? 0 : 2
+  end
+
+  def function_catalog
+    json = !!@arguments.delete("--json")
+    ensure_no_arguments!
+    catalog = TwoHeadWu::FunctionCatalog.new(@root)
+    data = catalog.manifest.merge(
+      "directory_source" => "local-managed-catalog",
+      "mini" => { "status" => "local", "online" => true }
+    )
+    if json
+      puts JSON.pretty_generate(data)
+    else
+      print_local_function_catalog(data)
+    end
+    0
+  end
+
+  def print_local_function_catalog(data)
+    puts "两头乌统一功能清单（Mini 本地登记）"
+    puts "目录版本：#{data.fetch('catalog_version')}　登记日期：#{data.fetch('updated_at')}"
+    puts "\n精确工具与执行入口（#{data.dig('counts', 'execution_entries')} 项）"
+    data.fetch("execution_entries").each do |entry|
+      command = entry["command"] ? "；入口：#{entry['command']}" : ""
+      puts "- #{entry.fetch('name')}（#{entry.fetch('id')}）：#{entry.fetch('summary')}#{command}"
+    end
+    puts "\n完整组件功能表（#{data.dig('counts', 'inventory_entries')} 项）"
+    data.fetch("inventory_entries").group_by { |entry| entry.fetch("kind") }.sort.each do |kind, entries|
+      puts "#{function_kind_label(kind)}（#{entries.length}）"
+      entries.each do |entry|
+        puts "- [#{air_mode_label(entry.fetch('air_mode'))}] #{entry.fetch('name')}（#{entry.fetch('id')}）：#{entry.fetch('summary')}"
+      end
+    end
+    puts "\n说明：#{data.fetch('policy_note')}"
+    puts "详细链接：inventories/function_catalog.md"
+  end
+
+  def function_kind_label(value)
+    {
+      "skill" => "Skills", "capability-package" => "能力包", "agent" => "Agents",
+      "mcp-server" => "MCP / 集成", "runtime" => "运行时", "workflow" => "工作流", "resource" => "资源"
+    }.fetch(value, value)
+  end
+
+  def air_mode_label(value)
+    {
+      "local" => "Air 本地", "portable" => "可安装到 Air", "remote-auto" => "远端自动调用",
+      "remote-queue" => "远端任务调用", "confirm" => "远端调用前确认", "metadata-only" => "仅发现",
+      "unavailable" => "当前不可用"
+    }.fetch(value, value)
+  end
+
+  def remote_configured?
+    configured_home = ENV["WU_REMOTE_HOME"].to_s
+    home = if configured_home.empty?
+             Pathname.new(Dir.home).join(".config/two-head-wu/remote-work")
+           else
+             Pathname.new(configured_home).expand_path.cleanpath
+           end
+    home.join("config.json").file?
+  end
+
+  def add_search_record(records, type, id, item, needle, fields)
+    haystack = fields.map { |field| item[field] }.compact.join(" ").downcase
+    return unless haystack.include?(needle)
+
+    summary = item["purpose"] || item["summary"] || item["name"] || item["status"] || ""
+    records << { "type" => type, "id" => id, "summary" => summary }
+  end
+
+  def delegate(path, arguments)
+    run_command([@root.join(path).to_s, *arguments])
+  end
+
+  def delegate_with_env(path, arguments, environment)
+    run_command([@root.join(path).to_s, *arguments], environment)
+  end
+
+  def reply_remote_interaction(arguments)
+    job_id, interaction_id, decision, *extra = arguments
+    raise WuError, "用法：wu 回复任务 JOB_ID INTERACTION_ID 接受|本次会话|拒绝|取消" unless job_id && interaction_id && decision && extra.empty?
+    delegate_remote(["jobs", "reply", job_id, interaction_id, "--decision", decision])
+  end
+
+  def answer_remote_interaction(arguments)
+    job_id, interaction_id, *answers = arguments
+    if !job_id || !interaction_id || answers.empty? || answers.any? { |value| !value.include?("=") }
+      raise WuError, "用法：wu 回答任务 JOB_ID INTERACTION_ID 问题ID=回答 [问题ID=回答...]"
+    end
+    structured = answers.flat_map { |value| ["--answer", value] }
+    delegate_remote(["jobs", "reply", job_id, interaction_id, *structured])
+  end
+
+  def submit_remote_artifact_job(arguments)
+    artifact_id, *instruction = arguments
+    raise WuError, "用法：wu 附件任务 ARTIFACT_ID 任务说明" unless artifact_id && !instruction.empty?
+    delegate_remote(["jobs", "submit", "--project", @invocation_cwd.to_s, "--artifact", artifact_id, "--", *instruction])
+  end
+
+  def invoke_remote_resource(arguments)
+    resource_id, *extra = arguments
+    raise WuError, "用法：wu 查看资源 [RESOURCE_ID]" unless extra.empty?
+    input = resource_id ? { "id" => resource_id } : {}
+    delegate_remote(["invoke", "tool:resource-catalog", "--input-json", JSON.generate(input), "--wait"])
+  end
+
+  def search_remote_openai_docs(arguments)
+    query = arguments.join(" ").strip
+    raise WuError, "用法：wu 查OpenAI文档 查询内容" if query.empty?
+    input = { "action" => "search", "query" => query, "limit" => 5 }
+    delegate_remote(["invoke", "mcp-tool:openai-docs", "--input-json", JSON.generate(input), "--wait"])
+  end
+
+  def invoke_remote_workflow(arguments)
+    workflow_id, *options = arguments
+    unless workflow_id&.match?(/\A[a-z][a-z0-9-]{0,62}\z/)
+      raise WuError, "用法：wu 运行工作流 WORKFLOW_ID [--confirm]"
+    end
+    delegate_remote(["invoke", "workflow:#{workflow_id}", *options])
+  end
+
+  def delegate_remote(arguments)
+    command = [@root.join("capabilities/remote-work/adapters/remote-work").to_s, *arguments]
+    system(*command, chdir: @invocation_cwd.to_s)
+    $?.exitstatus
+  end
+
+  def run_command(command, environment = {})
+    system(environment, *command, chdir: @root.to_s)
+    $?.exitstatus
+  end
+
+  def load_yaml(relative_path)
+    path = @root.join(relative_path)
+    raise WuError, "missing catalog source: #{relative_path}" unless path.file?
+
+    data = YAML.safe_load(path.read(encoding: "UTF-8"), permitted_classes: [Date, Time], aliases: false)
+    raise WuError, "YAML root is not a mapping: #{relative_path}" unless data.is_a?(Hash)
+    data
+  end
+
+  def index_by(items, key)
+    Array(items).each_with_object({}) do |item, index|
+      value = item.fetch(key)
+      raise WuError, "duplicate #{key}: #{value}" if index.key?(value)
+      index[value] = item
+    end
+  end
+
+  def ensure_no_arguments!
+    raise WuError, "unknown arguments: #{@arguments.join(' ')}" unless @arguments.empty?
+  end
+
+  def record(command, status)
+    path = @root.join("var/logs/core/commands.jsonl")
+    path.dirname.mkpath
+    event = { "time" => Time.now.utc.iso8601, "command" => command, "status" => status }
+    File.open(path, "a", encoding: "UTF-8") { |file| file.puts(JSON.generate(event)) }
+  rescue StandardError
+    nil
+  end
+end
+
+exit Wu.new(ARGV).run

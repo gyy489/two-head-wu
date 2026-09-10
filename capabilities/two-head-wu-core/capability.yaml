@@ -1,0 +1,83 @@
+schema_version: 1
+id: two-head-wu-core
+version: "0.5.0"
+status: active
+summary: "Deterministic Two-Headed-Wu query, stable Capability release routing, generated project navigation, workflow, documentation, Change Capsule Git gate, and health-check interface."
+
+documentation:
+  overview: "docs/architecture.md"
+  skill_docs:
+    - "capabilities/two-head-wu-core/skills/two-head-wu/SKILL.md"
+  references:
+    - "AGENTS.md"
+    - "docs/architecture.md"
+    - "core/contracts/documentation-registry.schema.yaml"
+    - "core/contracts/capability-release-registry.schema.yaml"
+    - "core/contracts/project-capability-bindings.schema.yaml"
+  generated: []
+
+installation:
+  source_owner: two-head-wu
+  runtime_mode: source-and-generated
+  managed_copy: true
+  large_artifacts: external-volume-required
+
+interfaces:
+  - id: wu
+    type: cli
+    entrypoint: "core/bin/wu"
+  - id: two-head-wu
+    type: skill
+    entrypoint: "capabilities/two-head-wu-core/skills/two-head-wu/SKILL.md"
+  - id: git-change-gates
+    type: cli
+    entrypoint: "core/bin/wu-git-hooks"
+  - id: capability-release-routing
+    type: cli
+    entrypoint: "core/bin/wu"
+
+components:
+  skills:
+    - "skills/two-head-wu"
+  agents: []
+  adapters: []
+  workflows:
+    - "catalog/workflows_registry.yaml"
+
+compatibility:
+  codex: native
+  claude-code: compatible
+  openclaw: compatible
+
+permissions:
+  risk_level: low
+  network: none
+  secrets: references-only
+  filesystem:
+    read:
+      - catalog
+      - registries
+      - skills/registries
+      - mcp
+      - capabilities/remote-work/policies
+    write:
+      - var/logs/core
+      - registered-managed-workflows
+      - "repository-local .git/config only when the owner runs wu 安装门禁 or wu 卸载门禁"
+
+dependencies:
+  - id: spec-kit-governance
+    version: "0.2.0"
+    purpose: "Provide deterministic Change Capsule validation for wu and repository Git gates."
+
+recovery:
+  source_of_truth: "tracked Core, Catalog, registries, and capability manifests"
+  rebuild_command: "core/tests/test_wu.sh"
+  rollback: "Run wu 卸载门禁 to remove only the local core.hooksPath setting, or revert the tracked Core/Catalog change; runtime logs are rebuildable."
+
+tests:
+  - "core/tests/test_wu.sh"
+  - "ruby scripts/tests/test_capabilities_manager.rb"
+  - "ruby scripts/tests/test_skill_policy.rb"
+  - "ruby scripts/tests/test_system_cartographer_derived_surface.rb"
+  - "python3 -m unittest scripts/tests/test_skills_manager.py"

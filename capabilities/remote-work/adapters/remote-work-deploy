@@ -1,0 +1,1758 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "date"
+require "digest"
+require "fileutils"
+require "find"
+require "json"
+require "net/http"
+require "open3"
+require "optparse"
+require "pathname"
+require "securerandom"
+require "shellwords"
+require "time"
+require "tmpdir"
+require "uri"
+require "yaml"
+
+require_relative "../lib/remote_work"
+require_relative "../../remote-work-bootstrap/lib/protected_ssh_target"
+
+class RemoteWorkDeploy
+  RESOURCE_ID = "edge-server"
+  PROJECT_ID = "two-head-wu"
+  PACKAGE_ID = "remote-work"
+  SITE_IDS = %w[private-site public-site].freeze
+  REQUIRED_ACTION = "host-owner-remote-work-control-plane"
+  SSH_TARGET_ENV = "TWO_HEAD_WU_ALIYUN_SSH_TARGET"
+  TARGET_PATTERN = /\A(?:[a-z_][a-z0-9_-]*@)?[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\z/i.freeze
+  SSH_OPTIONS = [
+    "-oBatchMode=yes", "-oPasswordAuthentication=no", "-oKbdInteractiveAuthentication=no",
+    "-oChallengeResponseAuthentication=no", "-oStrictHostKeyChecking=yes", "-oConnectTimeout=8",
+    "-oConnectionAttempts=1", "-oServerAliveInterval=10", "-oServerAliveCountMax=3", "-oLogLevel=ERROR"
+  ].freeze
+  UPLOAD_TIMEOUT_SECONDS = 120
+  ENDPOINT = "https://relay.example/two-head-wu/v1"
+  AIR_ENDPOINT = "https://relay.example/two-head-wu/v2"
+  REMOTE_ROOT = "/srv/two-head-wu"
+  AIR_PAIRING_TTL = 3600
+  AIR_GRANT_PROFILES = {
+    "member" => {
+      "skill:remote-work" => [],
+      "skill:paper-writing" => [],
+      "skill:paper-navigator" => [],
+      "codex:project-task" => %w[project-read review-result],
+      "capability:result-review" => %w[download receipt],
+      "research-library:search" => %w[metadata snippets],
+      "research-library:get" => %w[metadata],
+      "tool:codex-status" => %w[self]
+    }.freeze,
+    "owner" => {
+      "skill:remote-work" => [],
+      "skill:paper-writing" => [],
+      "skill:paper-navigator" => [],
+      "skill:two-head-wu" => [],
+      "skill:server-operations" => [],
+      "codex:project-task" => %w[project-read review-result],
+      "capability:result-review" => %w[download receipt],
+      "research-library:search" => %w[metadata snippets],
+      "research-library:get" => %w[metadata],
+      "tool:codex-status" => %w[self],
+      "memory:notebook" => %w[recall remember correct forget]
+    }.freeze
+  }.freeze
+
+  INSPECT_SCRIPT = <<~'SH'.freeze
+    set -eu
+    as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -n "$@"; fi; }
+    [ ! -L /srv/two-head-wu ] && [ -d /srv/two-head-wu ] && [ -f /srv/two-head-wu/state/bootstrap-v1 ] || { printf 'runtime_root=not-ready\n'; exit 71; }
+    id twoheadwu >/dev/null 2>&1 || { printf 'system_identity=not-ready\n'; exit 72; }
+    if [ "$(id -u)" -ne 0 ]; then command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1 || { printf 'privilege=unavailable\n'; exit 73; }; fi
+    for command_name in python3 systemctl nginx curl tar sha256sum; do command -v "$command_name" >/dev/null 2>&1 || { printf 'missing=%s\n' "$command_name"; exit 74; }; done
+    python_version=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+    python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' || { printf 'python=unsupported\n'; exit 75; }
+    as_root nginx -t >/dev/null 2>&1 || { printf 'nginx=invalid\n'; exit 76; }
+    nginx_dump=$(as_root nginx -T 2>&1)
+    temp_blocks=$(printf '%s\n' "$nginx_dump" | grep -Ec 'server_name[^;]*public\.example' || true)
+    owner_route_count=$(printf '%s\n' "$nginx_dump" | grep -Ec 'two-head-wu/v1' || true)
+    member_route_count=$(printf '%s\n' "$nginx_dump" | grep -Ec 'two-head-wu/v2' || true)
+    if as_root systemctl is-active --quiet two-head-wu-control-plane.service; then service_state=active; else service_state=inactive; fi
+    printf 'runtime_root=ready\n'
+    printf 'system_identity=ready\n'
+    printf 'privilege=ready\n'
+    printf 'python=%s\n' "$python_version"
+    printf 'nginx=ready\n'
+    printf 'temp_site_matches=%s\n' "$temp_blocks"
+    printf 'api_route_matches=%s\n' "$owner_route_count"
+    printf 'member_api_route_matches=%s\n' "$member_route_count"
+    printf 'service=%s\n' "$service_state"
+  SH
+
+  DEPLOY_SCRIPT = <<~'SH'.freeze
+    set -eu
+    build_id=$1
+    expected_sha=$2
+    upload=$3
+    root=/srv/two-head-wu
+    runtime_user=twoheadwu
+    stage=
+    backup=
+    marker=
+    unit=
+    cleanup_unit=
+    cleanup_timer=
+    link_tmp=
+    release=
+    mutated=0
+    committed=0
+    release_created=0
+    previous_current=
+    as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -n "$@"; fi; }
+    cleanup_deployment_files() {
+      [ -z "$stage" ] || as_root rm -rf "$stage"
+      [ -z "$upload" ] || as_root rm -f "$upload"
+      [ -z "$marker" ] || rm -f "$marker"
+      [ -z "$unit" ] || rm -f "$unit"
+      [ -z "$cleanup_unit" ] || rm -f "$cleanup_unit"
+      [ -z "$cleanup_timer" ] || rm -f "$cleanup_timer"
+      [ -z "$link_tmp" ] || as_root rm -f "$link_tmp"
+    }
+    backup_item() {
+      source=$1
+      name=$2
+      if as_root test -e "$source" || as_root test -L "$source"; then
+        as_root touch "$backup/$name.exists"
+        as_root cp -a "$source" "$backup/$name"
+      fi
+    }
+    restore_item() {
+      destination=$1
+      name=$2
+      as_root rm -rf "$destination" || return 1
+      if as_root test -f "$backup/$name.exists"; then
+        as_root cp -a "$backup/$name" "$destination" || return 1
+      fi
+      return 0
+    }
+    rollback_service_deployment() {
+      set +e
+      rollback_ok=1
+      as_root rm -f "$root/app/current" || rollback_ok=0
+      if [ -n "$previous_current" ]; then as_root ln -s "$previous_current" "$root/app/current" || rollback_ok=0; fi
+      restore_item "$root/capabilities/published" capabilities-published || rollback_ok=0
+      restore_item "$root/components/published" components-published || rollback_ok=0
+      restore_item "$root/releases/current.json" releases-current-json || rollback_ok=0
+      restore_item "$root/releases/current.tar.gz" releases-current-archive || rollback_ok=0
+      restore_item "$root/releases/manifests" releases-manifests || rollback_ok=0
+      restore_item /etc/systemd/system/two-head-wu-control-plane.service control-plane-unit || rollback_ok=0
+      restore_item /etc/systemd/system/two-head-wu-member-cleanup.service cleanup-unit || rollback_ok=0
+      restore_item /etc/systemd/system/two-head-wu-member-cleanup.timer cleanup-timer || rollback_ok=0
+      if [ "$release_created" = 1 ]; then as_root rm -rf "$release" || rollback_ok=0; fi
+      as_root systemctl daemon-reload || rollback_ok=0
+      if [ "$service_enabled_before" = 1 ]; then as_root systemctl enable two-head-wu-control-plane.service >/dev/null 2>&1 || rollback_ok=0; else as_root systemctl disable two-head-wu-control-plane.service >/dev/null 2>&1 || rollback_ok=0; fi
+      if [ "$timer_enabled_before" = 1 ]; then as_root systemctl enable two-head-wu-member-cleanup.timer >/dev/null 2>&1 || rollback_ok=0; else as_root systemctl disable two-head-wu-member-cleanup.timer >/dev/null 2>&1 || rollback_ok=0; fi
+      if [ "$service_active_before" = 1 ]; then as_root systemctl restart two-head-wu-control-plane.service || rollback_ok=0; else as_root systemctl stop two-head-wu-control-plane.service >/dev/null 2>&1 || rollback_ok=0; fi
+      if [ "$timer_active_before" = 1 ]; then as_root systemctl start two-head-wu-member-cleanup.timer || rollback_ok=0; else as_root systemctl stop two-head-wu-member-cleanup.timer >/dev/null 2>&1 || rollback_ok=0; fi
+      if [ -n "$previous_current" ]; then
+        [ "$(as_root readlink "$root/app/current" 2>/dev/null)" = "$previous_current" ] || rollback_ok=0
+      elif as_root test -e "$root/app/current" || as_root test -L "$root/app/current"; then
+        rollback_ok=0
+      fi
+      if [ "$service_active_before" = 1 ]; then as_root systemctl is-active --quiet two-head-wu-control-plane.service || rollback_ok=0; fi
+      if [ "$rollback_ok" = 1 ]; then printf 'rollback=completed\n'; else printf 'rollback=incomplete\n'; fi
+    }
+    finish_deployment() {
+      status=$?
+      trap - EXIT HUP INT TERM
+      set +e
+      if [ "$mutated" = 1 ] && [ "$committed" != 1 ]; then rollback_service_deployment; fi
+      if [ "$mutated" != 1 ] && [ "$committed" != 1 ] && [ "$release_created" = 1 ] && [ -n "$release" ]; then as_root rm -rf "$release"; fi
+      cleanup_deployment_files
+      exit "$status"
+    }
+    trap finish_deployment EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    [ ! -L "$root" ] && [ -d "$root" ] && [ -f "$root/state/bootstrap-v1" ] || { printf 'result=runtime-not-ready\n'; exit 71; }
+    [ -f "$upload" ] && [ ! -L "$upload" ] || { printf 'result=upload-invalid\n'; exit 72; }
+    printf '%s\n' "$build_id" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]{12}$' || { printf 'result=build-id-invalid\n'; exit 72; }
+    printf '%s\n' "$expected_sha" | grep -Eq '^[a-f0-9]{64}$' || { printf 'result=expected-hash-invalid\n'; exit 72; }
+    printf '%s\n' "$upload" | grep -Eq '^/srv/two-head-wu/tmp/upload\.[A-Za-z0-9]{8}\.tar\.gz$' || { printf 'result=upload-path-invalid\n'; exit 72; }
+    actual_sha=$(sha256sum "$upload" | awk '{print $1}')
+    [ "$actual_sha" = "$expected_sha" ] || { printf 'result=upload-hash-mismatch\n'; exit 73; }
+    stage=$(as_root mktemp -d "$root/tmp/deploy.XXXXXX")
+    tar -tzf "$upload" | awk '
+      /^\// || /(^|\/)\.\.($|\/)/ { exit 1 }
+      !/^(app|capabilities|components|releases)(\/|$)/ { exit 1 }
+    ' || { printf 'result=bundle-layout-invalid\n'; exit 74; }
+    as_root tar -xzf "$upload" --no-same-owner -C "$stage"
+    [ -f "$stage/app/control_plane.py" ] && [ -f "$stage/app/multi_user_contracts.py" ] && [ -f "$stage/app/member_auth.py" ] && [ -f "$stage/capabilities/manifest.json" ] && [ -f "$stage/capabilities/inventory.json" ] && [ -f "$stage/components/manifest.json" ] && [ -f "$stage/releases/current.json" ] && [ -f "$stage/releases/current.tar.gz" ] || { printf 'result=bundle-incomplete\n'; exit 75; }
+    for manifest in "$stage"/releases/manifests/*.json; do
+      [ -f "$manifest" ] || continue
+      name=$(basename "$manifest")
+      case "$name" in stable.json|dev.json) ;; *) printf 'result=release-manifest-invalid\n'; exit 77 ;; esac
+    done
+    for manifest in "$stage"/releases/manifests/releases/*.json; do
+      [ -f "$manifest" ] || continue
+      name=$(basename "$manifest")
+      printf '%s\n' "$name" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]{12}\.json$' || { printf 'result=release-id-invalid\n'; exit 78; }
+    done
+    for archive in "$stage"/releases/archives/*.tar.gz; do
+      [ -f "$archive" ] || continue
+      name=$(basename "$archive")
+      printf '%s\n' "$name" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]{12}\.tar\.gz$' || { printf 'result=release-archive-invalid\n'; exit 79; }
+    done
+    release="$root/app/releases/$build_id"
+    if as_root test -e "$release" || as_root test -L "$release"; then
+      [ ! -L "$release" ] && [ -d "$release" ] && [ "$(as_root cat "$release/bundle.sha256" 2>/dev/null || true)" = "$expected_sha" ] || { printf 'result=release-conflict\n'; exit 76; }
+    else
+      as_root install -d -o root -g "$runtime_user" -m 0750 "$root/app" "$root/app/releases" "$release"
+      release_created=1
+      as_root install -o root -g "$runtime_user" -m 0550 "$stage/app/control_plane.py" "$release/control_plane.py"
+      as_root install -o root -g "$runtime_user" -m 0440 "$stage/app/multi_user_contracts.py" "$release/multi_user_contracts.py"
+      as_root install -o root -g "$runtime_user" -m 0440 "$stage/app/member_auth.py" "$release/member_auth.py"
+      marker=$(mktemp)
+      printf '%s\n' "$expected_sha" >"$marker"
+      as_root install -o root -g "$runtime_user" -m 0440 "$marker" "$release/bundle.sha256"
+      rm -f "$marker"
+      marker=
+    fi
+    if as_root test -L "$root/app/current"; then
+      previous_current=$(as_root readlink "$root/app/current")
+      printf '%s\n' "$previous_current" | grep -Eq '^releases/v[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]{12}$' || { printf 'result=current-release-link-invalid\n'; exit 76; }
+    elif as_root test -e "$root/app/current"; then
+      printf 'result=current-release-not-symlink\n'
+      exit 76
+    fi
+    backup=$(as_root mktemp -d "$root/backups/service-deploy.$build_id.XXXXXX")
+    as_root chown root:root "$backup"
+    as_root chmod 0700 "$backup"
+    backup_item "$root/capabilities/published" capabilities-published
+    backup_item "$root/components/published" components-published
+    backup_item "$root/releases/current.json" releases-current-json
+    backup_item "$root/releases/current.tar.gz" releases-current-archive
+    backup_item "$root/releases/manifests" releases-manifests
+    backup_item /etc/systemd/system/two-head-wu-control-plane.service control-plane-unit
+    backup_item /etc/systemd/system/two-head-wu-member-cleanup.service cleanup-unit
+    backup_item /etc/systemd/system/two-head-wu-member-cleanup.timer cleanup-timer
+    if as_root systemctl is-enabled --quiet two-head-wu-control-plane.service; then service_enabled_before=1; else service_enabled_before=0; fi
+    if as_root systemctl is-active --quiet two-head-wu-control-plane.service; then service_active_before=1; else service_active_before=0; fi
+    if as_root systemctl is-enabled --quiet two-head-wu-member-cleanup.timer; then timer_enabled_before=1; else timer_enabled_before=0; fi
+    if as_root systemctl is-active --quiet two-head-wu-member-cleanup.timer; then timer_active_before=1; else timer_active_before=0; fi
+    link_tmp="$root/app/.current.$build_id"
+    as_root rm -f "$link_tmp"
+    as_root ln -s "releases/$build_id" "$link_tmp"
+    mutated=1
+    as_root mv -Tf "$link_tmp" "$root/app/current"
+    link_tmp=
+    as_root install -d -o "$runtime_user" -g "$runtime_user" -m 0750 "$root/capabilities/published" "$root/components/published" "$root/releases" "$root/releases/archives" "$root/releases/manifests" "$root/releases/manifests/releases"
+    for catalog in "$stage"/capabilities/*.json; do [ -f "$catalog" ] || continue; as_root install -o "$runtime_user" -g "$runtime_user" -m 0640 "$catalog" "$root/capabilities/published/$(basename "$catalog")"; done
+    for artifact in "$stage"/components/*; do [ -f "$artifact" ] || continue; as_root install -o "$runtime_user" -g "$runtime_user" -m 0640 "$artifact" "$root/components/published/$(basename "$artifact")"; done
+    as_root install -o "$runtime_user" -g "$runtime_user" -m 0640 "$stage/releases/current.json" "$root/releases/current.json"
+    as_root install -o "$runtime_user" -g "$runtime_user" -m 0640 "$stage/releases/current.tar.gz" "$root/releases/current.tar.gz"
+    for manifest in "$stage"/releases/manifests/*.json; do
+      [ -f "$manifest" ] || continue
+      name=$(basename "$manifest")
+      as_root install -o "$runtime_user" -g "$runtime_user" -m 0640 "$manifest" "$root/releases/manifests/$name"
+    done
+    for manifest in "$stage"/releases/manifests/releases/*.json; do
+      [ -f "$manifest" ] || continue
+      name=$(basename "$manifest")
+      as_root install -o "$runtime_user" -g "$runtime_user" -m 0640 "$manifest" "$root/releases/manifests/releases/$name"
+    done
+    for archive in "$stage"/releases/archives/*.tar.gz; do
+      [ -f "$archive" ] || continue
+      name=$(basename "$archive")
+      as_root install -o "$runtime_user" -g "$runtime_user" -m 0640 "$archive" "$root/releases/archives/$name"
+    done
+    python_path=$(command -v python3)
+    unit=$(mktemp)
+    cat >"$unit" <<EOF
+[Unit]
+Description=Two-Headed-Wu owner-only control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=twoheadwu
+Group=twoheadwu
+WorkingDirectory=/srv/two-head-wu
+ExecStart=$python_path /srv/two-head-wu/app/current/control_plane.py --root /srv/two-head-wu serve --bind 127.0.0.1 --port 18765
+Restart=on-failure
+RestartSec=3
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/srv/two-head-wu
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    as_root install -o root -g root -m 0644 "$unit" /etc/systemd/system/two-head-wu-control-plane.service
+    rm -f "$unit"
+    unit=
+    cleanup_unit=$(mktemp)
+    cat >"$cleanup_unit" <<EOF
+[Unit]
+Description=Two-Headed-Wu member content TTL cleanup
+After=two-head-wu-control-plane.service
+
+[Service]
+Type=oneshot
+User=twoheadwu
+Group=twoheadwu
+WorkingDirectory=/srv/two-head-wu
+ExecStart=$python_path /srv/two-head-wu/app/current/control_plane.py --root /srv/two-head-wu cleanup-member-content
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/srv/two-head-wu
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=two-head-wu-member-cleanup
+EOF
+    as_root install -o root -g root -m 0644 "$cleanup_unit" /etc/systemd/system/two-head-wu-member-cleanup.service
+    rm -f "$cleanup_unit"
+    cleanup_unit=
+    cleanup_timer=$(mktemp)
+    cat >"$cleanup_timer" <<'EOF'
+[Unit]
+Description=Schedule Two-Headed-Wu member content TTL cleanup
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+Unit=two-head-wu-member-cleanup.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    as_root install -o root -g root -m 0644 "$cleanup_timer" /etc/systemd/system/two-head-wu-member-cleanup.timer
+    rm -f "$cleanup_timer"
+    cleanup_timer=
+    as_root systemctl daemon-reload
+    as_root systemctl enable two-head-wu-control-plane.service >/dev/null
+    as_root systemctl enable --now two-head-wu-member-cleanup.timer >/dev/null
+    as_root systemctl restart two-head-wu-control-plane.service
+    attempt=0
+    expected_version=${build_id%%-*}
+    expected_version=${expected_version#v}
+    until health=$(curl --fail --silent --show-error http://127.0.0.1:18765/two-head-wu/v1/health) &&
+      reported_version=$(printf '%s' "$health" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version", ""))') &&
+      [ "$reported_version" = "$expected_version" ] &&
+      member_health=$(curl --fail --silent --show-error http://127.0.0.1:18765/two-head-wu/v2/health) &&
+      member_version=$(printf '%s' "$member_health" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version", ""))') &&
+      [ "$member_version" = "$expected_version" ]; do
+      attempt=$((attempt+1)); [ "$attempt" -lt 20 ] || { printf 'result=service-version-health-failed\n'; exit 77; }; sleep 1
+    done
+    as_root systemctl is-enabled --quiet two-head-wu-member-cleanup.timer &&
+      as_root systemctl is-active --quiet two-head-wu-member-cleanup.timer || {
+        printf 'result=cleanup-timer-not-active\n'; exit 80;
+      }
+    committed=1
+    printf 'result=ok\nservice=active\nbuild=%s\n' "$build_id"
+  SH
+
+  NGINX_SCRIPT = <<~'SH'.freeze
+    set -eu
+    root=/srv/two-head-wu
+    as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -n "$@"; fi; }
+    [ -f "$root/state/bootstrap-v1" ] || { printf 'result=runtime-not-ready\n'; exit 71; }
+    curl --fail --silent http://127.0.0.1:18765/two-head-wu/v1/health >/dev/null || { printf 'result=service-not-ready\n'; exit 72; }
+    as_root nginx -t >/dev/null 2>&1 || { printf 'result=nginx-invalid-before\n'; exit 73; }
+    english_before=$(curl --silent --output /dev/null --write-out '%{http_code}' https://private.example/)
+    temp_before=$(curl --silent --output /dev/null --write-out '%{http_code}' https://public.example/site/)
+    matches=$(as_root sh -c "grep -RlE 'server_name[^;]*temp\\.example-owner\\.com' /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null || true")
+    resolved=$(printf '%s\n' "$matches" | while IFS= read -r path; do [ -n "$path" ] && readlink -f "$path"; done | sort -u)
+    count=$(printf '%s\n' "$resolved" | sed '/^$/d' | wc -l | tr -d ' ')
+    [ "$count" = 1 ] || { printf 'result=temp-site-config-ambiguous\n'; exit 74; }
+    config=$(printf '%s\n' "$resolved" | sed -n '1p')
+    case "$config" in /etc/nginx/sites-available/*|/etc/nginx/conf.d/*) ;; *) printf 'result=temp-site-config-unsafe\n'; exit 75;; esac
+    timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+    backup="$root/backups/nginx-temp-site.$timestamp.conf"
+    include_backup="$root/backups/nginx-remote-work-location.$timestamp.conf"
+    as_root install -o root -g root -m 0600 "$config" "$backup"
+    as_root install -d -o root -g root -m 0755 /etc/nginx/two-head-wu
+    had_include=0
+    if [ -f /etc/nginx/two-head-wu/remote-work-location.conf ]; then as_root install -o root -g root -m 0600 /etc/nginx/two-head-wu/remote-work-location.conf "$include_backup"; had_include=1; fi
+    rollback() {
+      as_root install -o root -g root -m 0644 "$backup" "$config"
+      if [ "$had_include" = 1 ]; then as_root install -o root -g root -m 0644 "$include_backup" /etc/nginx/two-head-wu/remote-work-location.conf; else as_root rm -f /etc/nginx/two-head-wu/remote-work-location.conf; fi
+      as_root nginx -t >/dev/null 2>&1 && as_root systemctl reload nginx || true
+    }
+    location_tmp=$(mktemp)
+    cat >"$location_tmp" <<'EOF'
+location = /two-head-wu/v1 {
+    return 308 /two-head-wu/v1/;
+}
+location /two-head-wu/v1/ {
+    client_max_body_size 70m;
+    proxy_http_version 1.1;
+    proxy_connect_timeout 10s;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+    proxy_pass http://127.0.0.1:18765;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+location = /two-head-wu/v2 {
+    return 308 /two-head-wu/v2/;
+}
+location /two-head-wu/v2/ {
+    client_max_body_size 70m;
+    proxy_http_version 1.1;
+    proxy_connect_timeout 10s;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+    proxy_pass http://127.0.0.1:18765;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+EOF
+    as_root install -o root -g root -m 0644 "$location_tmp" /etc/nginx/two-head-wu/remote-work-location.conf
+    rm -f "$location_tmp"
+    patch_tmp=$(mktemp)
+    if ! python3 - "$config" >"$patch_tmp" <<'PY'
+import re, sys
+path=sys.argv[1]
+text=open(path, encoding="utf-8").read()
+lines=text.splitlines(True)
+blocks=[]
+depth=0
+server_start=None
+for index,line in enumerate(lines):
+    clean=re.sub(r'#.*','',line)
+    if server_start is None and re.search(r'\bserver\s*\{',clean):
+        server_start=index
+        depth=clean.count('{')-clean.count('}')
+        if depth == 0:
+            blocks.append((server_start, index))
+            server_start=None
+    elif server_start is not None:
+        depth += clean.count('{')-clean.count('}')
+        if depth == 0:
+            blocks.append((server_start, index))
+            server_start=None
+if server_start is not None:
+    raise SystemExit(2)
+
+target_blocks=[]
+for start,end in blocks:
+    block=''.join(re.sub(r'#.*','',line) for line in lines[start:end+1])
+    has_name=re.search(r'\bserver_name\b[^;]*\bpublic\.example\b',block)
+    has_tls=re.search(r'(?m)^\s*listen\s+[^;]*(?:\b443\b|\bssl\b)[^;]*;',block)
+    if has_name and has_tls:
+        target_blocks.append((start,end,block))
+if len(target_blocks) != 1:
+    raise SystemExit(3)
+
+start,end,block=target_blocks[0]
+include='include /etc/nginx/two-head-wu/remote-work-location.conf;'
+if include not in block:
+    indent=re.match(r'\s*',lines[end]).group(0)+"    "
+    lines.insert(end, indent+include+"\n")
+sys.stdout.write(''.join(lines))
+PY
+    then
+      rm -f "$patch_tmp"
+      rollback
+      printf 'result=temp-site-tls-block-ambiguous-rolled-back\n'
+      exit 75
+    fi
+    as_root install -o root -g root -m 0644 "$patch_tmp" "$config"
+    rm -f "$patch_tmp"
+    as_root nginx -t >/dev/null 2>&1 || { rollback; printf 'result=nginx-test-failed-rolled-back\n'; exit 76; }
+    as_root systemctl reload nginx
+    english_after=$(curl --silent --output /dev/null --write-out '%{http_code}' https://private.example/)
+    temp_after=$(curl --silent --output /dev/null --write-out '%{http_code}' https://public.example/site/)
+    if [ "$english_before" != "$english_after" ] || [ "$temp_before" != "$temp_after" ]; then rollback; printf 'result=site-guard-changed-rolled-back\n'; exit 77; fi
+    attempt=0
+    until curl --fail --silent --show-error https://relay.example/two-head-wu/v1/health >/dev/null &&
+      curl --fail --silent --show-error https://relay.example/two-head-wu/v2/health >/dev/null; do attempt=$((attempt+1)); [ "$attempt" -lt 15 ] || { rollback; printf 'result=https-health-failed-rolled-back\n'; exit 78; }; sleep 1; done
+    printf 'result=ok\nroute=active\n'
+  SH
+
+  def initialize(arguments)
+    @arguments = arguments.dup
+    @root = Pathname.new(__dir__).join("../../..").expand_path.cleanpath
+  end
+
+  def run
+    command = @arguments.shift || "help"
+    case command
+    when "help", "--help", "-h" then help
+    when "health" then health
+    when "inspect" then inspect_remote
+    when "deploy-service" then deploy_service
+    when "install-https-route" then install_https_route
+    when "issue-air-installer" then issue_air_installer
+    when "issue-air-worker-enrollment", "issue-member-worker-enrollment" then issue_air_worker_enrollment
+    when "issue-air-pairing-kit" then issue_air_pairing_kit
+    when "install-worker" then install_worker
+    when "production-smoke" then production_smoke
+    when "production-job-smoke" then production_job_smoke
+    when "production-tool-smoke" then production_tool_smoke
+    when "production-air-sync-smoke" then production_air_sync_smoke
+    when "production-artifact-smoke" then production_artifact_smoke
+    else raise RemoteWork::Error, "unknown deploy command: #{command}"
+    end
+  rescue OptionParser::ParseError => error
+    warn "Error: #{error.message}"
+    2
+  rescue RemoteWork::Error, KeyError, JSON::ParserError, Psych::Exception, SystemCallError => error
+    warn "Error: #{error.message}"
+    2
+  end
+
+  private
+
+  def help
+    puts <<~HELP
+      Usage: remote-work-deploy COMMAND [OPTIONS]
+
+        health
+        inspect             --project two-head-wu
+        deploy-service      --project two-head-wu --approve
+        install-https-route --project two-head-wu --approve
+        issue-air-installer --project two-head-wu --approve --device NAME
+        issue-air-worker-enrollment --project two-head-wu --approve --device NAME
+        issue-air-pairing-kit --project two-head-wu --approve --identity ALIAS --role owner|member --platform macos|windows
+        install-worker      --project two-head-wu --approve --device NAME
+        production-smoke    --project two-head-wu
+        production-job-smoke --project two-head-wu --approve
+        production-tool-smoke --project two-head-wu --approve
+        production-air-sync-smoke --project two-head-wu --approve
+        production-artifact-smoke --project two-head-wu --approve
+
+      Fixed resource: edge-server
+      Fixed root: /srv/two-head-wu
+      Fixed endpoint: https://relay.example/two-head-wu/v1
+      Air v2 endpoint: https://relay.example/two-head-wu/v2
+      No host, user, remote path, port, nginx file, or remote command argument is accepted.
+    HELP
+    0
+  end
+
+  def health
+    ensure_no_arguments!
+    catalogs = load_catalogs
+    validate_catalogs!(catalogs)
+    puts "remote-work-deploy health ok"
+    puts "resource: edge-server"
+    puts "endpoint: registered HTTPS path"
+    puts "websites protected: private-site, public-site"
+    puts "Air v2: default-deny until explicit user, device, and grant pairing"
+    0
+  end
+
+  def inspect_remote
+    options = parse_project_options!
+    catalogs = authorized_catalogs!(options.fetch(:project))
+    ssh_target
+    sites = check_sites!(catalogs)
+    stdout, stderr, status = run_ssh("sh -s", stdin_data: INSPECT_SCRIPT)
+    raise RemoteWork::Error, "remote inspect failed: #{classify_ssh_error(stderr)}" unless status.success?
+    fields = parse_fields(stdout, %w[runtime_root system_identity privilege python nginx temp_site_matches api_route_matches member_api_route_matches service])
+    fields.each { |key, value| puts "#{key}: #{value}" }
+    print_sites(sites)
+    0
+  end
+
+  def deploy_service
+    options = parse_project_options!(approve: true)
+    require_approval!(options)
+    catalogs = authorized_catalogs!(options.fetch(:project))
+    synchronize_source_mirror!
+    before = check_sites!(catalogs)
+    inspect_or_raise!
+    archive, build_id, digest = build_bundle
+    remote_path = allocate_remote_upload
+    upload_bundle(archive, remote_path)
+    stdout, stderr, status = run_ssh("sh -s -- #{build_id} #{digest} #{remote_path}", stdin_data: DEPLOY_SCRIPT)
+    raise RemoteWork::Error, "remote service deployment stopped: #{safe_result(stdout) || classify_ssh_error(stderr)}" unless status.success?
+    fields = parse_fields(stdout, %w[result service build])
+    raise RemoteWork::Error, "remote service returned invalid result" unless fields["result"] == "ok" && fields["service"] == "active"
+    after = check_sites!(catalogs)
+    require_same_sites!(before, after)
+    puts "remote service deployment: ok"
+    puts "build: #{fields.fetch('build')}"
+    print_sites(after)
+    0
+  end
+
+  def install_https_route
+    options = parse_project_options!(approve: true)
+    require_approval!(options)
+    catalogs = authorized_catalogs!(options.fetch(:project))
+    before = check_sites!(catalogs)
+    stdout, stderr, status = run_ssh("sh -s", stdin_data: NGINX_SCRIPT)
+    raise RemoteWork::Error, "HTTPS route deployment stopped: #{safe_result(stdout) || classify_ssh_error(stderr)}" unless status.success?
+    fields = parse_fields(stdout, %w[result route])
+    raise RemoteWork::Error, "HTTPS route returned invalid result" unless fields["result"] == "ok" && fields["route"] == "active"
+    after = check_sites!(catalogs)
+    require_same_sites!(before, after)
+    public_health!
+    puts "HTTPS route: active"
+    print_sites(after)
+    0
+  end
+
+  def issue_air_installer
+    options = parse_project_options!(approve: true, device: true)
+    require_approval!(options)
+    authorized_catalogs!(options.fetch(:project))
+    public_health!
+    token = issue_remote_token(options.fetch(:device), "owner-air")
+    admin = @root.join("capabilities/remote-work/adapters/remote-work-admin")
+    _build_out, build_err, build_status = Open3.capture3(admin.to_s, "build", chdir: @root.to_s)
+    raise RemoteWork::Error, "Air release build failed" unless build_status.success?
+    stdout, _stderr, status = Open3.capture3({ "TWO_HEAD_WU_ENROLLMENT_TOKEN" => token }, admin.to_s, "render-installer", chdir: @root.to_s)
+    raise RemoteWork::Error, "Air installer rendering failed" unless status.success?
+    path = Pathname.new(stdout.strip)
+    raise RemoteWork::Error, "Air installer path escaped the managed output" unless path.to_s.start_with?(@root.join("var/remote-work/installer").to_s + File::SEPARATOR)
+    puts path
+    0
+  end
+
+  def issue_air_worker_enrollment
+    options = parse_project_options!(approve: true, device: true)
+    require_approval!(options)
+    authorized_catalogs!(options.fetch(:project))
+    public_health!
+    device = options.fetch(:device)
+    output = @root.join("var/remote-work/air-worker-enrollment")
+    FileUtils.mkdir_p(output.to_s, mode: 0o700)
+    File.chmod(0o700, output.to_s)
+    path = output.join("#{device}.token")
+    if path.exist? || path.symlink?
+      raise RemoteWork::Error, "Air worker enrollment file already exists; remove it only after confirming it is expired or consumed"
+    end
+    token = issue_remote_token(device, "mac-mini-air-worker", ttl: 600)
+    RemoteWork::Atomic.write(path, token + "\n", mode: 0o600)
+    puts path
+    0
+  end
+
+  def issue_air_pairing_kit
+    options = parse_air_pairing_kit_options!
+    require_approval!(options)
+    authorized_catalogs!(options.fetch(:project))
+    public_air_health!
+    identity = options.fetch(:identity)
+    role = options.fetch(:role)
+    platform = options.fetch(:platform)
+    provisioned = remote_control_plane_json(
+      "ensure-air-user", "--identity-alias", identity, "--role", role
+    )
+    user = provisioned.fetch("user")
+    user_id = user.fetch("id")
+    unless user_id.match?(/\Ausr-[a-z0-9][a-z0-9-]{7,63}\z/) &&
+           user.fetch("role") == role && provisioned.dig("codex_binding", "identity_alias") == identity
+      raise RemoteWork::Error, "remote Air user provisioning returned invalid data"
+    end
+    AIR_GRANT_PROFILES.fetch(role).sort.each do |capability_id, scopes|
+      remote_control_plane_json(
+        "ensure-air-grant", "--user", user_id, "--capability", capability_id,
+        *scopes.flat_map { |scope| ["--scope", scope] }
+      )
+    end
+    token = remote_air_pairing_token(user_id, platform)
+    output = air_pairing_kit_root.join(identity)
+    FileUtils.mkdir_p(output.to_s, mode: 0o700)
+    File.chmod(0o700, output.to_s)
+    issued_at = Time.now.utc
+    kit = output.join("#{issued_at.strftime('%Y%m%dT%H%M%SZ')}-#{platform}-#{SecureRandom.hex(3)}")
+    FileUtils.mkdir_p(kit.to_s, mode: 0o700)
+    RemoteWork::Atomic.write(kit.join("pairing.token"), token + "\n", mode: 0o600)
+    RemoteWork::Atomic.json(
+      kit.join("kit.json"),
+      {
+        "schema_version" => 1,
+        "identity_alias" => identity,
+        "user_id" => user_id,
+        "role" => role,
+        "platform" => platform,
+        "endpoint" => AIR_ENDPOINT,
+        "issued_at" => issued_at.iso8601,
+        "expires_at" => (issued_at + AIR_PAIRING_TTL).iso8601,
+        "installer" => "separate-common-signed-package",
+        "one_active_device" => true
+      },
+      mode: 0o600
+    )
+    RemoteWork::Atomic.write(kit.join("安装说明.txt"), air_pairing_instructions(platform), mode: 0o600)
+    puts kit
+    0
+  ensure
+    token&.replace("x" * token.bytesize)
+  end
+
+  def install_worker
+    options = parse_project_options!(approve: true, device: true)
+    require_approval!(options)
+    authorized_catalogs!(options.fetch(:project))
+    public_health!
+    worker_home = Pathname.new(ENV.fetch("WU_REMOTE_WORKER_HOME", File.join(Dir.home, ".config", "two-head-wu", "remote-worker"))).expand_path
+    enrollment = ensure_worker_enrollment(worker_home, options.fetch(:device))
+    source_root = synchronize_source_mirror!
+    worker = install_worker_runtime
+    install_worker_launch_agent(worker_home, worker, source_root)
+    puts "Mac mini worker: installed and started"
+    puts "identity: owner-auto (owner-primary, owner-secondary)"
+    puts "enrollment: #{enrollment}"
+    0
+  end
+
+  def production_smoke
+    options = parse_project_options!
+    catalogs = authorized_catalogs!(options.fetch(:project))
+    sites = check_sites!(catalogs)
+    public_health!
+    stdout, stderr, status = run_ssh("sudo -n -u twoheadwu /usr/bin/python3 /srv/two-head-wu/app/current/control_plane.py --root /srv/two-head-wu doctor")
+    raise RemoteWork::Error, "remote doctor failed: #{classify_ssh_error(stderr)}" unless status.success?
+    result = JSON.parse(stdout)
+    raise RemoteWork::Error, "remote doctor returned invalid result" unless result["result"] == "ok"
+    raise RemoteWork::Error, "Mac mini model catalog has not been synchronized" unless result.fetch("models", 0).positive?
+    puts "production smoke: ok"
+    puts "modules: #{result['modules']}"
+    puts "capabilities: #{result['capabilities']}"
+    puts "inventory_entries: #{result['inventory_entries']}"
+    puts "models: #{result['models']}"
+    puts "jobs: #{result['jobs']}"
+    print_sites(sites)
+    0
+  end
+
+  def production_job_smoke
+    options = parse_project_options!(approve: true)
+    require_approval!(options)
+    catalogs = authorized_catalogs!(options.fetch(:project))
+    sites = check_sites!(catalogs)
+    public_health!
+    device_name = "production-smoke-#{Time.now.utc.strftime('%Y%m%d%H%M%S')}-#{SecureRandom.hex(2)}"
+    token = issue_remote_token(device_name, "owner-air")
+
+    Dir.mktmpdir("two-head-wu-production-smoke-") do |temporary|
+      temporary_root = Pathname.new(temporary)
+      client_home = temporary_root.join("client")
+      project = temporary_root.join("project")
+      FileUtils.mkdir_p(project.to_s, mode: 0o700)
+      project.join("README.md").write("Two-Headed-Wu production relay smoke test.\n", encoding: "UTF-8")
+      config = RemoteWork::Config.new(client_home)
+      RemoteWork::HTTPClient.enroll(
+        endpoint: ENDPOINT,
+        token: token,
+        device_name: device_name,
+        secret_store: "file",
+        config: config
+      )
+      client = @root.join("capabilities/remote-work/adapters/remote-work")
+      stdout, _stderr, status = Open3.capture3(
+        { "WU_REMOTE_HOME" => client_home.to_s },
+        client.to_s, "jobs", "submit", "--project", project.to_s, "--",
+        "不要调用任何工具，不要修改文件，只需回复：两头乌生产任务链路正常。"
+      )
+      raise RemoteWork::Error, "production job submission failed" unless status.success?
+      job_id = JSON.parse(stdout).fetch("job").fetch("id")
+      raise RemoteWork::Error, "production job returned an invalid ID" unless job_id.match?(/\Ajob-[a-z0-9-]+\z/)
+      http = RemoteWork::HTTPClient.new(config)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 300
+      job = nil
+      loop do
+        job = http.get("jobs/#{job_id}").fetch("job")
+        break if %w[succeeded failed cancelled expired].include?(job.fetch("state"))
+        if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+          http.post("jobs/#{job_id}/cancel", {})
+          raise RemoteWork::Error, "production job smoke timed out and was cancelled"
+        end
+        sleep 2
+      end
+      raise RemoteWork::Error, "production job smoke did not succeed: #{job.fetch('state')}" unless job.fetch("state") == "succeeded"
+
+      result = http.get_bytes("jobs/#{job_id}/result")
+      raise RemoteWork::Error, "production job result hash mismatch" unless Digest::SHA256.hexdigest(result) == job.fetch("result_sha256")
+      archive = temporary_root.join("result.tar.gz")
+      File.open(archive.to_s, "wb", 0o600) { |file| file.write(result) }
+      extracted = temporary_root.join("result")
+      RemoteWork::Archive.unpack(archive, extracted)
+      final = extracted.join("final.md")
+      provenance = JSON.parse(extracted.join("provenance.json").read(encoding: "UTF-8"))
+      raise RemoteWork::Error, "production job returned no final response" unless final.file? && !final.read(encoding: "UTF-8").strip.empty?
+      unless %w[owner-primary owner-secondary].include?(provenance["identity"])
+        raise RemoteWork::Error, "production job escaped the owner automatic identity pool"
+      end
+      raise RemoteWork::Error, "production job did not use the app-server executor" unless provenance["executor"] == "app-server"
+      puts "production job smoke: ok"
+      puts "job: #{job_id}"
+      puts "identity: #{provenance.fetch('identity')} (owner-auto)"
+      puts "executor: app-server"
+    end
+    print_sites(sites)
+    0
+  rescue JSON::ParserError, KeyError
+    raise RemoteWork::Error, "production job smoke returned invalid data"
+  end
+
+  def production_tool_smoke
+    options = parse_project_options!(approve: true)
+    require_approval!(options)
+    catalogs = authorized_catalogs!(options.fetch(:project))
+    sites = check_sites!(catalogs)
+    public_health!
+    device_name = "production-tool-#{Time.now.utc.strftime('%Y%m%d%H%M%S')}-#{SecureRandom.hex(2)}"
+    token = issue_remote_token(device_name, "owner-air")
+
+    Dir.mktmpdir("two-head-wu-production-tool-") do |temporary|
+      client_home = Pathname.new(temporary).join("client")
+      config = RemoteWork::Config.new(client_home)
+      RemoteWork::HTTPClient.enroll(
+        endpoint: ENDPOINT,
+        token: token,
+        device_name: device_name,
+        secret_store: "file",
+        config: config
+      )
+      client = @root.join("capabilities/remote-work/adapters/remote-work")
+      modules_out, _modules_err, modules_status = Open3.capture3(
+        { "WU_REMOTE_HOME" => client_home.to_s }, client.to_s, "modules", "list"
+      )
+      unless modules_status.success? && modules_out.lines.any? { |line| line.start_with?("skill:remote-work\tportable\tactive\t") }
+        raise RemoteWork::Error, "production signed module manifest verification failed"
+      end
+      abilities_out, _abilities_err, abilities_status = Open3.capture3(
+        { "WU_REMOTE_HOME" => client_home.to_s }, client.to_s, "abilities", "list", "--json"
+      )
+      raise RemoteWork::Error, "production signed capability discovery failed" unless abilities_status.success?
+      abilities = JSON.parse(abilities_out)
+      local_entries = Array(abilities["local_capabilities"])
+      remote_entries = Array(abilities["remote_capabilities"])
+      valid_capabilities = abilities["catalog_signature"] == "verified" &&
+                           abilities["directory_source"] == "live" &&
+                           abilities.dig("mini", "online") == true &&
+                           local_entries.length.positive? &&
+                           local_entries.all? { |item| !item["name"].to_s.empty? && !item["summary"].to_s.empty? } &&
+                           remote_entries.length == 25 &&
+                           remote_entries.all? { |item| !item["name"].to_s.empty? && !item["summary"].to_s.empty? } &&
+                           remote_entries.any? do |item|
+                             item["id"] == "tool:codex-status" && item["invocation_policy"] == "auto" && item["availability"] == "ready"
+                           end &&
+                           remote_entries.any? do |item|
+                             item["id"] == "workflow:sync-air" && item["invocation_policy"] == "confirm"
+                           end
+      raise RemoteWork::Error, "production capability directory returned invalid state" unless valid_capabilities
+      memory = Array(abilities["remote_capabilities"]).find { |item| item["id"] == "mcp:private-memory" }
+      unless memory && memory["invocation_policy"] == "unavailable" && memory["availability"] == "metadata-only"
+        raise RemoteWork::Error, "production capability directory falsely exposed private memory"
+      end
+      inventory = abilities.fetch("mini_inventory")
+      entries = Array(inventory["entries"])
+      forbidden_inventory_fields = %w[path command endpoint private_ref secret_ref executable workspace device_secret access_token]
+      valid_inventory = inventory["signature"] == "verified" && inventory["total"] == entries.length &&
+                        entries.length.positive? && inventory.dig("counts_by_kind", "skill").to_i.positive? &&
+                        entries.all? { |item| !item["name"].to_s.empty? && !item["summary"].to_s.empty? } &&
+                        entries.none? { |item| (item.keys & forbidden_inventory_fields).any? }
+      raise RemoteWork::Error, "production Mini inventory is invalid or unsafe" unless valid_inventory
+      if abilities_out.match?(/"(?:device_secret|access_token|private_ref|secret_ref)"\s*:/i)
+        raise RemoteWork::Error, "production capability response leaked protected fields"
+      end
+      stdout, _stderr, status = Open3.capture3(
+        { "WU_REMOTE_HOME" => client_home.to_s },
+        client.to_s, "tools", "invoke", "codex-status", "--json", "--timeout", "300"
+      )
+      raise RemoteWork::Error, "production codex-status invocation failed" unless status.success?
+      result = JSON.parse(stdout)
+      accounts = Array(result["accounts"])
+      raise RemoteWork::Error, "production codex-status schema drift" unless result["schema"] == "two-head-wu.codex-status.v1"
+      raise RemoteWork::Error, "production codex-status returned no identities" if accounts.empty?
+      serialized = JSON.generate(result)
+      if serialized.match?(/CODEX_HOME|codex_home|auth\.json|Keychain|device_secret|access_token/i)
+        raise RemoteWork::Error, "production codex-status leaked protected fields"
+      end
+      unless accounts.all? do |item|
+               five_hour = item["five_hour"]
+               weekly = item["weekly"]
+               (five_hour.nil? || five_hour["window_duration_mins"] == 300) &&
+                 (weekly.nil? || weekly["window_duration_mins"] == 10_080)
+             end
+        raise RemoteWork::Error, "production codex-status quota window mapping drift"
+      end
+      reset_order = accounts.map { |item| item.dig("five_hour", "resets_at") || item.dig("primary", "resets_at") || Float::INFINITY }
+      raise RemoteWork::Error, "production codex-status is not sorted by reset time" unless reset_order == reset_order.sort
+
+      runtime_out, _runtime_err, runtime_status = Open3.capture3(
+        { "WU_REMOTE_HOME" => client_home.to_s },
+        client.to_s, "invoke", "tool:runtime-status", "--json", "--timeout", "300"
+      )
+      raise RemoteWork::Error, "production generic runtime invocation failed" unless runtime_status.success?
+      runtime = JSON.parse(runtime_out)
+      codex_runtime = Array(runtime.dig("output", "catalog", "runtimes")).find do |item|
+        item["runtime_kind"] == "codex-app-server"
+      end
+      unless runtime["remote_call_succeeded"] == true && runtime["actual_executor"] == "mac-mini" &&
+             runtime.dig("output", "schema") == "two-head-wu.runtime-status.v1" &&
+             runtime.dig("output", "catalog", "protocol_min") == RemoteWork::PROTOCOL_VERSION &&
+             runtime.dig("output", "catalog", "protocol_max") == RemoteWork::PROTOCOL_VERSION &&
+             codex_runtime && codex_runtime["health"] == "compatible"
+        safe_runtime = {
+          remote_call_succeeded: runtime["remote_call_succeeded"],
+          actual_executor: runtime["actual_executor"],
+          schema: runtime.dig("output", "schema"),
+          protocol_min: runtime.dig("output", "catalog", "protocol_min"),
+          protocol_max: runtime.dig("output", "catalog", "protocol_max"),
+          health: codex_runtime && codex_runtime["health"],
+          runtime_version: codex_runtime && codex_runtime["runtime_version"]
+        }
+        raise RemoteWork::Error, "production worker runtime compatibility proof is invalid: #{JSON.generate(safe_runtime)}"
+      end
+
+      adapters_out, _adapters_err, adapters_status = Open3.capture3(
+        { "WU_REMOTE_HOME" => client_home.to_s },
+        client.to_s, "invoke", "tool:module-catalog", "--json", "--timeout", "300"
+      )
+      raise RemoteWork::Error, "production Mini adapter discovery failed" unless adapters_status.success?
+      adapters = JSON.parse(adapters_out)
+      adapter_ids = Array(adapters.dig("output", "adapters")).map { |item| item["capability_id"] }
+      required_adapters = Array(
+        YAML.safe_load(
+          @root.join("capabilities/remote-work/worker/capability-adapters.yaml").read(encoding: "UTF-8"),
+          permitted_classes: [], aliases: false
+        ).fetch("adapters")
+      ).map { |item| item.fetch("capability_id") }
+      missing_adapters = required_adapters - adapter_ids
+      extra_adapters = adapter_ids - required_adapters
+      unless adapters["remote_call_succeeded"] == true && missing_adapters.empty?
+        proof = {
+          remote_call_succeeded: adapters["remote_call_succeeded"],
+          state: adapters["state"],
+          reason: adapters["fallback_reason"] || adapters["error"],
+          adapter_count: adapter_ids.length,
+          missing: missing_adapters,
+          extra: extra_adapters
+        }
+        raise RemoteWork::Error, "production Mini adapter registry is incomplete: #{JSON.generate(proof)}"
+      end
+
+      identity_out, _identity_err, identity_status = Open3.capture3(
+        { "WU_REMOTE_HOME" => client_home.to_s },
+        client.to_s, "invoke", "tool:identity-catalog", "--json", "--timeout", "300"
+      )
+      raise RemoteWork::Error, "production identity catalog invocation failed" unless identity_status.success?
+      identity = JSON.parse(identity_out)
+      identity_serialized = JSON.generate(identity)
+      unless identity["remote_call_succeeded"] == true && identity.dig("output", "schema") == "two-head-wu.identity-catalog.v1" &&
+             Array(identity.dig("output", "identities")).any? { |item| item["id"] == "owner-primary" } &&
+             !identity_serialized.match?(/codex_home|CODEX_HOME|auth\.json|access_token/i)
+        raise RemoteWork::Error, "production identity catalog proof is invalid"
+      end
+
+      resource_out, _resource_err, resource_status = Open3.capture3(
+        { "WU_REMOTE_HOME" => client_home.to_s },
+        client.to_s, "invoke", "tool:resource-catalog", "--input-json", '{"id":"edge-server"}',
+        "--json", "--timeout", "300"
+      )
+      raise RemoteWork::Error, "production resource catalog invocation failed" unless resource_status.success?
+      resource = JSON.parse(resource_out)
+      resource_serialized = JSON.generate(resource)
+      unless resource["remote_call_succeeded"] == true && resource.dig("output", "schema") == "two-head-wu.resource-catalog.v1" &&
+             resource.dig("output", "entries", 0, "id") == "edge-server" &&
+             !resource_serialized.match?(/private_ref|secret_ref|ssh|password|token/i)
+        raise RemoteWork::Error, "production resource catalog proof is invalid"
+      end
+
+      docs_input = JSON.generate({ "action" => "search", "query" => "Codex resume", "limit" => 1 })
+      docs_out, _docs_err, docs_status = Open3.capture3(
+        { "WU_REMOTE_HOME" => client_home.to_s },
+        client.to_s, "invoke", "mcp-tool:openai-docs", "--input-json", docs_input,
+        "--json", "--timeout", "300"
+      )
+      raise RemoteWork::Error, "production OpenAI Docs MCP invocation failed" unless docs_status.success?
+      docs_result = JSON.parse(docs_out)
+      unless docs_result["remote_call_succeeded"] == true &&
+             docs_result.dig("output", "schema") == "two-head-wu.openai-docs.v1" &&
+             docs_result.dig("output", "tool") == "search_openai_docs"
+        raise RemoteWork::Error, "production OpenAI Docs MCP proof is invalid"
+      end
+
+      workflow_out, _workflow_err, workflow_status = Open3.capture3(
+        { "WU_REMOTE_HOME" => client_home.to_s },
+        client.to_s, "invoke", "workflow:remote-work-health", "--wait", "--json", "--timeout", "300"
+      )
+      unless workflow_status.success?
+        proof = begin
+          parsed = JSON.parse(workflow_out)
+          { state: parsed["state"], reason: parsed["fallback_reason"] || parsed["error"] }
+        rescue JSON::ParserError
+          { state: "invalid-response" }
+        end
+        raise RemoteWork::Error, "production Mini workflow invocation failed: #{JSON.generate(proof)}"
+      end
+      workflow = JSON.parse(workflow_out)
+      unless workflow["remote_call_succeeded"] == true &&
+             workflow.dig("output", "schema") == "two-head-wu.workflow-result.v1" &&
+             workflow.dig("output", "workflow") == "remote-work-health"
+        raise RemoteWork::Error, "production Mini workflow proof is invalid"
+      end
+      puts "production tool smoke: ok"
+      puts "tool: codex-status"
+      puts "module_manifest: signature-verified"
+      puts "capability_catalog: signature-verified"
+      puts "named_execution_entries: #{remote_entries.length}"
+      puts "capability_catalog_version: #{abilities.fetch('catalog_version')}"
+      puts "mini_inventory: signature-verified"
+      puts "mini_inventory_entries: #{inventory.fetch('total')}"
+      puts "mini_presence: online"
+      puts "accounts: #{accounts.length}"
+      puts "sorting: reset-time"
+      puts "runtime_gate: compatible"
+      puts "protocol_version: #{RemoteWork::PROTOCOL_VERSION}"
+      puts "registered_adapters: #{adapter_ids.length}"
+      puts "identity_catalog: redacted"
+      puts "resource_catalog: redacted"
+      puts "openai_docs_mcp: reachable"
+      puts "project_workflow: remote-work-health"
+    end
+    print_sites(sites)
+    0
+  rescue JSON::ParserError, KeyError
+    raise RemoteWork::Error, "production tool smoke returned invalid data"
+  end
+
+  def production_air_sync_smoke
+    options = parse_project_options!(approve: true)
+    require_approval!(options)
+    catalogs = authorized_catalogs!(options.fetch(:project))
+    check_sites!(catalogs)
+    public_health!
+    device_name = "production-air-sync-#{Time.now.utc.strftime('%Y%m%d%H%M%S')}-#{SecureRandom.hex(2)}"
+    token = issue_remote_token(device_name, "owner-air")
+
+    Dir.mktmpdir("two-head-wu-production-air-sync-") do |temporary|
+      test_home = Pathname.new(temporary).join("air-home")
+      client_home = test_home.join(".config/two-head-wu/remote-work")
+      FileUtils.mkdir_p(test_home.to_s, mode: 0o700)
+      config = RemoteWork::Config.new(client_home)
+      RemoteWork::HTTPClient.enroll(
+        endpoint: ENDPOINT,
+        token: token,
+        device_name: device_name,
+        secret_store: "file",
+        config: config
+      )
+      client = @root.join("capabilities/remote-work/adapters/remote-work")
+      environment = {
+        "HOME" => test_home.to_s,
+        "PATH" => "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "WU_REMOTE_HOME" => client_home.to_s,
+        "WU_REMOTE_SKIP_ON_USE_UPDATE" => "1"
+      }
+      stdout, stderr, status = Open3.capture3(environment, client.to_s, "sync", "air")
+      unless status.success?
+        stderr_tail = stderr.lines.map(&:strip).reject(&:empty?).last(6)
+        stdout_tail = stdout.lines.map(&:strip).reject(&:empty?).last(4)
+        detail = (stderr_tail + stdout_tail).join(" | ")[0, 1600]
+        raise RemoteWork::Error, "production Air synchronization failed: #{detail}"
+      end
+      unless stdout.lines.any? { |line| line.strip == "Air 同步\tcompleted" }
+        raise RemoteWork::Error, "production Air synchronization did not report completion"
+      end
+
+      installed_wu = test_home.join(".local/bin/wu")
+      raise RemoteWork::Error, "production Air synchronization did not install the managed client" unless installed_wu.executable?
+      status_out, _status_err, status_status = Open3.capture3(
+        environment, installed_wu.to_s, "remote", "update", "status"
+      )
+      raise RemoteWork::Error, "production Air synchronization state is unavailable" unless status_status.success?
+      state = JSON.parse(status_out)
+      unless state.dig("air_sync", "status") == "completed" && state.dig("air_sync", "job_id").to_s.start_with?("job-")
+        raise RemoteWork::Error, "production Air synchronization state proof is invalid"
+      end
+
+      abilities_out, _abilities_err, abilities_status = Open3.capture3(
+        environment, installed_wu.to_s, "remote", "abilities", "list", "--json"
+      )
+      raise RemoteWork::Error, "production Air synchronization final directory is unavailable" unless abilities_status.success?
+      abilities = JSON.parse(abilities_out)
+      expected_inventory = JSON.parse(@root.join("inventories/function_catalog.json").read(encoding: "UTF-8"))
+                               .dig("counts", "inventory_entries")
+      raise RemoteWork::Error, "local generated inventory count is unavailable" unless expected_inventory.is_a?(Integer)
+      unless abilities["catalog_signature"] == "verified" &&
+             Array(abilities["remote_capabilities"]).length == 25 &&
+             abilities.dig("mini_inventory", "signature") == "verified" &&
+             abilities.dig("mini_inventory", "total") == expected_inventory
+        raise RemoteWork::Error, "production Air synchronization final directory proof is invalid"
+      end
+      puts "production Air sync smoke: ok"
+      puts "job: #{state.dig('air_sync', 'job_id')}"
+      puts "client_release: #{state['current_release']}"
+      puts "capability_catalog: signature-verified"
+      puts "mini_inventory: signature-verified"
+    end
+    sites = check_sites!(catalogs)
+    print_sites(sites)
+    0
+  rescue JSON::ParserError, KeyError
+    raise RemoteWork::Error, "production Air sync smoke returned invalid data"
+  end
+
+  def production_artifact_smoke
+    options = parse_project_options!(approve: true)
+    require_approval!(options)
+    catalogs = authorized_catalogs!(options.fetch(:project))
+    sites = check_sites!(catalogs)
+    public_health!
+    device_name = "production-artifact-#{Time.now.utc.strftime('%Y%m%d%H%M%S')}-#{SecureRandom.hex(2)}"
+    token = issue_remote_token(device_name, "owner-air")
+
+    Dir.mktmpdir("two-head-wu-production-artifact-") do |temporary|
+      root = Pathname.new(temporary)
+      client_home = root.join("client")
+      project = root.join("project")
+      FileUtils.mkdir_p(project.to_s, mode: 0o700)
+      project.join("README.md").write("# 生产附件验收\n", encoding: "UTF-8")
+      attachment = root.join("air-attachment.md")
+      attachment.write("# Air 附件生产验收\n\nartifact channel ok\n", encoding: "UTF-8")
+      config = RemoteWork::Config.new(client_home)
+      RemoteWork::HTTPClient.enroll(
+        endpoint: ENDPOINT,
+        token: token,
+        device_name: device_name,
+        secret_store: "file",
+        config: config
+      )
+      client = @root.join("capabilities/remote-work/adapters/remote-work")
+      upload_out, _upload_err, upload_status = Open3.capture3(
+        { "WU_REMOTE_HOME" => client_home.to_s },
+        client.to_s, "artifacts", "upload", attachment.to_s, "--media-type", "text/markdown"
+      )
+      raise RemoteWork::Error, "production artifact upload failed" unless upload_status.success?
+      artifact_id = JSON.parse(upload_out).dig("artifact", "id")
+      raise RemoteWork::Error, "production artifact returned an invalid ID" unless artifact_id&.match?(/\Aart-[a-f0-9]{24}\z/)
+      submit_out, _submit_err, submit_status = Open3.capture3(
+        { "WU_REMOTE_HOME" => client_home.to_s },
+        client.to_s, "jobs", "submit", "--project", project.to_s, "--artifact", artifact_id, "--",
+        "只读取附件，回复附件的一级标题；不要访问网络，不要修改任何文件。"
+      )
+      raise RemoteWork::Error, "production artifact job submission failed" unless submit_status.success?
+      job_id = JSON.parse(submit_out).dig("job", "id")
+      http = RemoteWork::HTTPClient.new(config)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 300
+      job = nil
+      loop do
+        job = http.get("jobs/#{job_id}").fetch("job")
+        break if %w[succeeded failed cancelled expired].include?(job.fetch("state"))
+        if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+          http.post("jobs/#{job_id}/cancel", {})
+          raise RemoteWork::Error, "production artifact smoke timed out and was cancelled"
+        end
+        sleep 2
+      end
+      unless job.fetch("state") == "succeeded"
+        events = http.get("jobs/#{job_id}/events?after=0").fetch("events", [])
+        last_event = events.last || {}
+        http.post("artifacts/#{artifact_id}/remove", {})
+        detail = job["failure"] || last_event["message"] || "no diagnostic"
+        raise RemoteWork::Error, "production artifact job did not succeed: #{job.fetch('state')} (#{detail})"
+      end
+      result = http.get_bytes("jobs/#{job_id}/result")
+      raise RemoteWork::Error, "production artifact result hash mismatch" unless Digest::SHA256.hexdigest(result) == job.fetch("result_sha256")
+      archive = root.join("result.tar.gz")
+      File.open(archive.to_s, "wb", 0o600) { |file| file.write(result) }
+      extracted = root.join("result")
+      RemoteWork::Archive.unpack(archive, extracted)
+      final = extracted.join("final.md").read(encoding: "UTF-8")
+      raise RemoteWork::Error, "production artifact was not read by Mini" unless final.include?("Air 附件生产验收")
+      removed = http.post("artifacts/#{artifact_id}/remove", {}).dig("artifact", "state")
+      raise RemoteWork::Error, "production artifact cleanup failed" unless removed == "removed"
+      puts "production artifact smoke: ok"
+      puts "job: #{job_id}"
+      puts "artifact: transferred-and-removed"
+      provenance = JSON.parse(extracted.join("provenance.json").read(encoding: "UTF-8"))
+      unless %w[owner-primary owner-secondary].include?(provenance["identity"])
+        raise RemoteWork::Error, "production artifact job escaped the owner automatic identity pool"
+      end
+      puts "identity: #{provenance.fetch('identity')} (owner-auto)"
+    end
+    print_sites(sites)
+    0
+  rescue JSON::ParserError, KeyError
+    raise RemoteWork::Error, "production artifact smoke returned invalid data"
+  end
+
+  def parse_project_options!(approve: false, device: false)
+    options = {}
+    parser = OptionParser.new do |item|
+      item.on("--project ID") { |value| options[:project] = value }
+      item.on("--approve") { options[:approve] = true } if approve
+      item.on("--device NAME") { |value| options[:device] = value } if device
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    raise RemoteWork::Error, "--project is required" unless options[:project]
+    if device
+      name = options[:device]
+      raise RemoteWork::Error, "--device is required" unless name
+      raise RemoteWork::Error, "invalid device name" unless name.match?(/\A[a-z][a-z0-9-]{0,62}\z/)
+    end
+    options
+  end
+
+  def parse_air_pairing_kit_options!
+    options = {}
+    parser = OptionParser.new do |item|
+      item.on("--project ID") { |value| options[:project] = value }
+      item.on("--identity ALIAS") { |value| options[:identity] = value }
+      item.on("--role ROLE") { |value| options[:role] = value }
+      item.on("--platform PLATFORM") { |value| options[:platform] = value }
+      item.on("--approve") { options[:approve] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    raise RemoteWork::Error, "--project is required" unless options[:project]
+    identity = options[:identity].to_s
+    raise RemoteWork::Error, "--identity is invalid" unless identity.match?(/\A[a-z][a-z0-9-]{0,62}\z/)
+    raise RemoteWork::Error, "legacy pseudo-identities cannot receive an Air kit" if %w[owner-auto owner-local-catalog].include?(identity)
+    role = options[:role].to_s
+    raise RemoteWork::Error, "--role must be owner or member" unless AIR_GRANT_PROFILES.key?(role)
+    if %w[owner-primary owner-secondary].include?(identity) && role != "owner"
+      raise RemoteWork::Error, "owner-primary and owner-secondary Air kits require the owner role"
+    end
+    platform = options[:platform].to_s
+    raise RemoteWork::Error, "--platform must be macos or windows" unless %w[macos windows].include?(platform)
+    options.merge(identity: identity, role: role, platform: platform)
+  end
+
+  def require_approval!(options)
+    raise RemoteWork::Error, "--approve is required for this external mutation" unless options[:approve]
+  end
+
+  def load_catalogs
+    {
+      resources: Array(load_yaml("catalog/resources/infrastructure.yaml").fetch("resources")),
+      sites: Array(load_yaml("catalog/deployments/personal-static-sites.yaml").fetch("sites")),
+      policy: load_yaml("catalog/policies/remote-work.yaml"),
+      projects: Array(load_yaml("registries/projects_registry.yaml").fetch("projects"))
+    }
+  end
+
+  def load_yaml(relative)
+    YAML.safe_load(@root.join(relative).read(encoding: "UTF-8"), permitted_classes: [Date, Time], aliases: false)
+  end
+
+  def validate_catalogs!(catalogs)
+    resource = catalogs.fetch(:resources).find { |item| item.fetch("id") == RESOURCE_ID }
+    raise RemoteWork::Error, "edge-server is not registered for remote work" unless resource && Array(resource.dig("operations", "allowed_actions")).include?(REQUIRED_ACTION)
+    policy = catalogs.fetch(:policy)
+    raise RemoteWork::Error, "remote-work policy drift" unless policy["id"] == PACKAGE_ID && policy.dig("remote_service", "root") == REMOTE_ROOT
+    raise RemoteWork::Error, "remote-work endpoint drift" unless policy.dig("remote_service", "public_path") == "/two-head-wu/v1"
+    sites = catalogs.fetch(:sites).select { |item| SITE_IDS.include?(item.fetch("id")) }
+    raise RemoteWork::Error, "registered website set is incomplete" unless sites.map { |item| item.fetch("id") }.sort == SITE_IDS
+  end
+
+  def authorized_catalogs!(project_id)
+    catalogs = load_catalogs
+    validate_catalogs!(catalogs)
+    raise RemoteWork::Error, "only project two-head-wu may deploy remote work" unless project_id == PROJECT_ID
+    project = catalogs.fetch(:projects).find { |item| item.fetch("id") == project_id }
+    raise RemoteWork::Error, "project is unavailable" unless project
+    raise RemoteWork::Error, "project is not bound to remote-work" unless Array(project.dig("capabilities", "packages")).include?(PACKAGE_ID)
+    required = [RESOURCE_ID] + SITE_IDS
+    raise RemoteWork::Error, "project lacks required resources" unless (required - Array(project.dig("resources", "allowed"))).empty?
+    catalogs
+  end
+
+  def check_sites!(catalogs)
+    SITE_IDS.each_with_object({}) do |site_id, result|
+      site = catalogs.fetch(:sites).find { |item| item.fetch("id") == site_id }
+      uri = URI(site.fetch("public_url"))
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = true
+      http.open_timeout = 8
+      http.read_timeout = 12
+      response = http.request(Net::HTTP::Get.new(uri.request_uri, "User-Agent" => "two-head-wu-remote-work-deploy/#{RemoteWork::VERSION}"))
+      code = response.code.to_i
+      acceptable = (200..399).cover?(code) || (site_id == "private-site" && [401, 403].include?(code))
+      raise RemoteWork::Error, "registered website guard failed for #{site_id}" unless acceptable
+      result[site_id] = code
+    end
+  rescue OpenSSL::SSL::SSLError, Net::OpenTimeout, Net::ReadTimeout, Errno::ECONNREFUSED => error
+    raise RemoteWork::Error, "registered website guard failed: #{error.class}"
+  end
+
+  def require_same_sites!(before, after)
+    raise RemoteWork::Error, "registered website status changed during remote-work deployment" unless before == after
+  end
+
+  def print_sites(status)
+    status.each { |id, code| puts "site #{id}: reachable (HTTP #{code})" }
+  end
+
+  def public_health!
+    uri = URI("#{ENDPOINT}/health")
+    response = Net::HTTP.get_response(uri)
+    raise RemoteWork::Error, "public remote-work health check failed" unless response.code.to_i == 200
+    value = JSON.parse(response.body)
+    valid = value["status"] == "ok" && value["scope"] == "owner-only" && value["version"] == RemoteWork::VERSION
+    raise RemoteWork::Error, "public remote-work health response is invalid or stale" unless valid
+  rescue OpenSSL::SSL::SSLError, SocketError, Net::OpenTimeout, Net::ReadTimeout, Errno::ECONNREFUSED, JSON::ParserError => error
+    raise RemoteWork::Error, "public remote-work health check failed: #{error.class}"
+  end
+
+  def public_air_health!
+    uri = URI("#{AIR_ENDPOINT}/health")
+    response = Net::HTTP.get_response(uri)
+    raise RemoteWork::Error, "public Air v2 health check failed" unless response.code.to_i == 200
+    value = JSON.parse(response.body)
+    valid = value["status"] == "ok" && value["scope"] == "air-v2" &&
+            value["version"] == RemoteWork::VERSION && value["authentication"] == "configured"
+    raise RemoteWork::Error, "public Air v2 health response is invalid or stale" unless valid
+  rescue OpenSSL::SSL::SSLError, SocketError, Net::OpenTimeout, Net::ReadTimeout, Errno::ECONNREFUSED, JSON::ParserError => error
+    raise RemoteWork::Error, "public Air v2 health check failed: #{error.class}"
+  end
+
+  def remote_control_plane_json(*arguments)
+    command = Shellwords.join([
+      "sudo", "-n", "-u", "twoheadwu", "/usr/bin/python3",
+      "/srv/two-head-wu/app/current/control_plane.py", "--root", REMOTE_ROOT,
+      *arguments
+    ])
+    stdout, stderr, status = run_ssh(command)
+    raise RemoteWork::Error, "remote Air administration failed: #{classify_ssh_error(stderr)}" unless status.success?
+    value = JSON.parse(stdout)
+    raise RemoteWork::Error, "remote Air administration returned invalid data" unless value.is_a?(Hash)
+    value
+  rescue JSON::ParserError
+    raise RemoteWork::Error, "remote Air administration returned invalid data"
+  end
+
+  def remote_air_pairing_token(user_id, platform)
+    stdout, stderr, status = run_ssh(Shellwords.join([
+      "sudo", "-n", "-u", "twoheadwu", "/usr/bin/python3",
+      "/srv/two-head-wu/app/current/control_plane.py", "--root", REMOTE_ROOT,
+      "issue-air-pairing", "--user", user_id, "--platform", platform,
+      "--ttl", AIR_PAIRING_TTL.to_s
+    ]))
+    raise RemoteWork::Error, "remote Air pairing issuance failed: #{classify_ssh_error(stderr)}" unless status.success?
+    token = stdout.strip
+    raise RemoteWork::Error, "remote Air pairing issuance returned invalid material" unless token.match?(/\Apair-[A-Za-z0-9_-]{43}\z/)
+    token
+  end
+
+  def air_pairing_kit_root
+    @root.join("var/remote-work/air-pairing-kits")
+  end
+
+  def air_pairing_instructions(platform)
+    common = <<~TEXT
+      两头乌 Air 配对包（一次性）
+
+      1. 先安装单独提供、已验证发布者签名的通用 Air 安装包。本目录不包含程序私钥。
+      2. pairing.token 只用于这一账号、这一平台的一次配对；不要粘贴到聊天、命令参数或项目文件。
+      3. 配对时 Air 在本机生成不可导出的硬件钥匙。复制本目录或程序不能复制设备身份。
+      4. 配对凭证一小时后过期；失败后由 Mini 管理员重新签发，不要复用旧文件。
+
+    TEXT
+    platform == "macos" ? common + <<~TEXT : common + <<~TEXT
+      macOS：安装 .pkg 后，在本目录打开终端并执行：
+        read -r TWO_HEAD_WU_AIR_PAIRING < pairing.token
+        export TWO_HEAD_WU_AIR_PAIRING
+        two-head-wu-air enroll --endpoint '#{AIR_ENDPOINT}' --token-env TWO_HEAD_WU_AIR_PAIRING --review-root "$HOME/Documents/TwoHeadWu/Review"
+        unset TWO_HEAD_WU_AIR_PAIRING
+        two-head-wu-air diagnose
+    TEXT
+      Windows：解压已签名通用 ZIP 后，在 PowerShell 中执行安装脚本；当脚本显示隐藏输入提示时，
+      从 pairing.token 复制一次性配对值并粘贴。不要把值写进命令行参数。安装后运行健康检查脚本。
+    TEXT
+  end
+
+  def inspect_or_raise!
+    stdout, stderr, status = run_ssh("sh -s", stdin_data: INSPECT_SCRIPT)
+    raise RemoteWork::Error, "remote prerequisite inspection failed: #{safe_result(stdout) || classify_ssh_error(stderr)}" unless status.success?
+  end
+
+  def build_bundle
+    admin = @root.join("capabilities/remote-work/adapters/remote-work-admin")
+    _stdout, _stderr, status = Open3.capture3(admin.to_s, "build", chdir: @root.to_s)
+    raise RemoteWork::Error, "remote-work build failed" unless status.success?
+    output = @root.join("var/remote-work/deploy")
+    FileUtils.mkdir_p(output.to_s, mode: 0o700)
+    stage = Pathname.new(Dir.mktmpdir("deploy-stage-", output.to_s))
+    FileUtils.mkdir_p(stage.join("app").to_s)
+    FileUtils.cp(@root.join("capabilities/remote-work/server/control_plane.py").to_s, stage.join("app/control_plane.py").to_s)
+    FileUtils.cp(@root.join("capabilities/remote-work/server/multi_user_contracts.py").to_s, stage.join("app/multi_user_contracts.py").to_s)
+    FileUtils.cp(@root.join("capabilities/remote-work/server/member_auth.py").to_s, stage.join("app/member_auth.py").to_s)
+    FileUtils.cp_r(@root.join("var/remote-work/build/current/capabilities").to_s, stage.join("capabilities").to_s)
+    FileUtils.cp_r(@root.join("var/remote-work/build/current/components").to_s, stage.join("components").to_s)
+    FileUtils.cp_r(@root.join("var/remote-work/build/current/releases").to_s, stage.join("releases").to_s)
+    provisional = output.join("bundle-#{Process.pid}-#{SecureRandom.hex(3)}.tar.gz")
+    metadata = RemoteWork::Archive.pack_directory(stage, provisional)
+    build_id = "v#{RemoteWork::VERSION}-#{metadata.fetch('sha256')[0, 12]}"
+    final = output.join("#{build_id}.tar.gz")
+    if final.file?
+      FileUtils.rm_f(provisional.to_s)
+    else
+      FileUtils.mv(provisional.to_s, final.to_s)
+    end
+    [final, build_id, metadata.fetch("sha256")]
+  ensure
+    FileUtils.rm_rf(stage.to_s) if defined?(stage) && stage
+  end
+
+  def allocate_remote_upload
+    stdout, stderr, status = run_ssh("sh -c 'umask 077; mktemp /srv/two-head-wu/tmp/upload.XXXXXXXX.tar.gz'")
+    raise RemoteWork::Error, "cannot allocate fixed remote upload: #{classify_ssh_error(stderr)}" unless status.success?
+    path = stdout.strip
+    raise RemoteWork::Error, "remote upload path was invalid" unless path.match?(%r{\A/srv/two-head-wu/tmp/upload\.[A-Za-z0-9]{8}\.tar\.gz\z})
+    path
+  end
+
+  def upload_bundle(local_path, remote_path)
+    raise RemoteWork::Error, "fixed artifact upload path was invalid" unless remote_path.match?(%r{\A/srv/two-head-wu/tmp/upload\.[A-Za-z0-9]{8}\.tar\.gz\z})
+    command = ["ssh", *SSH_OPTIONS, ssh_target, "umask 077; cat > #{remote_path}"]
+    stdin, stdout, stderr_stream, wait = Open3.popen3({ "LC_ALL" => "C" }, *command, pgroup: true)
+    writer_error = nil
+    writer = Thread.new do
+      File.open(local_path.to_s, "rb") { |file| IO.copy_stream(file, stdin) }
+    rescue StandardError => error
+      writer_error = error
+    ensure
+      stdin.close unless stdin.closed?
+    end
+    stdout_reader = Thread.new { stdout.read }
+    stderr_reader = Thread.new { stderr_stream.read }
+    unless wait.join(UPLOAD_TIMEOUT_SECONDS)
+      Process.kill("TERM", -wait.pid)
+      unless wait.join(5)
+        Process.kill("KILL", -wait.pid)
+        wait.join
+      end
+      writer.join(1) || writer.kill
+      stdout_reader.value
+      stderr_reader.value
+      raise RemoteWork::Error, "fixed artifact upload timed out"
+    end
+    writer.join
+    status = wait.value
+    stdout_reader.value
+    stderr = stderr_reader.value
+    raise RemoteWork::Error, "fixed artifact upload failed: local stream error" if writer_error
+    raise RemoteWork::Error, "fixed artifact upload failed: #{classify_ssh_error(stderr)}" unless status.success?
+  rescue Errno::ESRCH
+    raise RemoteWork::Error, "fixed artifact upload timed out"
+  ensure
+    [stdin, stdout, stderr_stream].compact.each { |stream| stream.close unless stream.closed? }
+  end
+
+  def issue_remote_token(device, role, ttl: 86_400)
+    ttl = Integer(ttl)
+    raise RemoteWork::Error, "remote enrollment TTL is invalid" unless (60..86_400).cover?(ttl)
+    command = "sudo -n -u twoheadwu /usr/bin/python3 /srv/two-head-wu/app/current/control_plane.py --root /srv/two-head-wu issue-enrollment --device #{device} --role #{role} --ttl #{ttl}"
+    stdout, stderr, status = run_ssh(command)
+    raise RemoteWork::Error, "remote enrollment issuance failed: #{classify_ssh_error(stderr)}" unless status.success?
+    token = stdout.strip
+    raise RemoteWork::Error, "remote enrollment issuance returned invalid material" unless token.match?(/\A[A-Za-z0-9_-]{32,256}\z/)
+    token
+  end
+
+  def ensure_worker_enrollment(worker_home, device_name)
+    config = RemoteWork::Config.new(worker_home)
+    if config.configured?
+      values = config.load
+      raise RemoteWork::Error, "existing Mac mini worker endpoint does not match the registered service" unless values.fetch("endpoint") == ENDPOINT
+      raise RemoteWork::Error, "existing Mac mini worker device name does not match" unless values.fetch("device_name") == device_name
+      device = RemoteWork::HTTPClient.new(config).get("me").fetch("device")
+      raise RemoteWork::Error, "existing device is not a Mac mini worker" unless device.fetch("role") == "mac-mini-worker"
+      return "reused"
+    end
+
+    token = issue_remote_token(device_name, "mac-mini-worker")
+    client = @root.join("capabilities/remote-work/adapters/remote-work")
+    token_env = "TWO_HEAD_WU_WORKER_ENROLLMENT"
+    _stdout, _stderr, status = Open3.capture3(
+      { "WU_REMOTE_HOME" => worker_home.to_s, token_env => token },
+      client.to_s, "enroll", "--endpoint", ENDPOINT, "--device", device_name,
+      "--token-env", token_env, "--secret-store", "keychain", chdir: @root.to_s
+    )
+    raise RemoteWork::Error, "Mac mini worker enrollment failed" unless status.success?
+    "created"
+  rescue KeyError
+    raise RemoteWork::Error, "existing Mac mini worker configuration is incomplete"
+  end
+
+  def install_worker_runtime
+    sources = {
+      "capabilities/remote-work/worker/ltw-worker" => 0o555,
+      "capabilities/remote-work/worker/app_server_bridge.rb" => 0o444,
+      "capabilities/remote-work/worker/owner_capability_adapters.rb" => 0o444,
+      "capabilities/remote-work/worker/capability-adapters.yaml" => 0o444,
+      "capabilities/remote-work/lib/remote_work.rb" => 0o444,
+      "capabilities/remote-work/adapters/remote-work-admin" => 0o555,
+      "capabilities/remote-work/policies/owner-only.yaml" => 0o444,
+      "core/lib/function_catalog.rb" => 0o444,
+      "capabilities/agent-identity/adapters/agent-identity" => 0o555,
+      "capabilities/agent-identity/lib/codex_quota_probe.rb" => 0o444,
+      "catalog/resources/infrastructure.yaml" => 0o444,
+      "catalog/deployments/personal-static-sites.yaml" => 0o444
+    }
+    skill_bundle = remote_task_skill_releases
+    digest = Digest::SHA256.new
+    sources.sort.each do |relative, _mode|
+      path = @root.join(relative)
+      raise RemoteWork::Error, "Mac mini worker runtime source is missing" unless path.file?
+      digest << relative << "\0" << path.binread << "\0"
+    end
+    skill_bundle.each do |entry|
+      digest << "remote-task-skill\0" << entry.fetch("skill_id") << "\0" << entry.fetch("digest") << "\0"
+      digest << skill_tree_digest(entry.fetch("source")) << "\0"
+    end
+    release_id = "v#{RemoteWork::VERSION}-#{digest.hexdigest[0, 12]}"
+    runtime_root = Pathname.new(File.join(Dir.home, ".local", "share", "two-head-wu", "remote-worker"))
+    releases = runtime_root.join("releases")
+    FileUtils.mkdir_p(releases.to_s, mode: 0o755)
+    release = releases.join(release_id)
+
+    unless release.directory?
+      stage = Pathname.new(Dir.mktmpdir("worker-release-", releases.to_s))
+      sources.each do |relative, mode|
+        destination = stage.join(relative)
+        FileUtils.mkdir_p(destination.dirname.to_s, mode: 0o755)
+        FileUtils.install(@root.join(relative).to_s, destination.to_s, mode: mode)
+      end
+      install_worker_skill_bundle(stage, skill_bundle)
+      File.rename(stage.to_s, release.to_s)
+    end
+
+    sources.each do |relative, _mode|
+      source_digest = Digest::SHA256.file(@root.join(relative).to_s).hexdigest
+      installed = release.join(relative)
+      raise RemoteWork::Error, "installed Mac mini worker runtime is incomplete" unless installed.file?
+      raise RemoteWork::Error, "installed Mac mini worker runtime failed verification" unless Digest::SHA256.file(installed.to_s).hexdigest == source_digest
+    end
+    verify_worker_skill_bundle(release, skill_bundle)
+    release.join("capabilities/remote-work/worker/ltw-worker")
+  ensure
+    FileUtils.rm_rf(stage.to_s) if defined?(stage) && stage&.exist?
+  end
+
+  def remote_task_skill_releases
+    policy = YAML.safe_load(
+      @root.join("capabilities/remote-work/policies/owner-only.yaml").read(encoding: "UTF-8"),
+      permitted_classes: [], aliases: false
+    )
+    wanted = Array(policy.dig("capability_inventory", "remote_task_skills"))
+    raise RemoteWork::Error, "remote-task Skill policy is empty" if wanted.empty?
+    registry = JSON.parse(@root.join("skills/registries/skill_releases.json").read(encoding: "UTF-8"))
+    current = registry.fetch("current")
+    releases = Array(registry.fetch("releases")).each_with_object({}) do |entry, index|
+      index[[entry.fetch("skill_id"), entry.fetch("digest")]] = entry
+    end
+    approvals = Array(registry.fetch("approvals"))
+    wanted.map do |skill_id|
+      raise RemoteWork::Error, "remote-task Skill ID is invalid" unless skill_id.to_s.match?(/\A[a-z][a-z0-9-]{0,62}\z/)
+      digest = current.fetch(skill_id) { raise RemoteWork::Error, "remote-task Skill has no current Release: #{skill_id}" }
+      release = releases.fetch([skill_id, digest]) { raise RemoteWork::Error, "remote-task Skill Release record is missing: #{skill_id}" }
+      approved = approvals.any? do |item|
+        item["skill_id"] == skill_id && item["digest"] == digest &&
+          item["decision"].to_s.start_with?("approved") && Array(item["runtimes"]).include?("codex")
+      end
+      raise RemoteWork::Error, "remote-task Skill is not approved for Codex: #{skill_id}" unless approved
+      source = @root.join(release.fetch("snapshot_path")).expand_path.cleanpath
+      release_root = @root.join("skills/releases").expand_path.cleanpath
+      unless source.to_s.start_with?("#{release_root}#{File::SEPARATOR}") && source.basename.to_s == digest.delete_prefix("sha256:")
+        raise RemoteWork::Error, "remote-task Skill Release path is invalid: #{skill_id}"
+      end
+      raise RemoteWork::Error, "remote-task Skill Release is missing: #{skill_id}" unless source.join("SKILL.md").file?
+      { "skill_id" => skill_id, "digest" => digest, "source" => source }
+    end
+  rescue JSON::ParserError, Psych::Exception, KeyError
+    raise RemoteWork::Error, "remote-task Skill Release registry is invalid"
+  end
+
+  def skill_tree_files(root)
+    root = root.realpath
+    files = []
+    Find.find(root.to_s) do |raw|
+      path = Pathname.new(raw)
+      next if path == root
+      raise RemoteWork::Error, "remote-task Skill Release contains a symlink" if path.symlink?
+      next if path.directory?
+      raise RemoteWork::Error, "remote-task Skill Release contains a non-file" unless path.file?
+      relative = path.relative_path_from(root).to_s
+      basename = path.basename.to_s
+      if RemoteWork::Archive.credential_shaped?(basename) || RemoteWork::Archive::DEFAULT_EXCLUDED_NAMES.include?(basename)
+        raise RemoteWork::Error, "remote-task Skill Release contains a forbidden file"
+      end
+      files << [relative, path]
+    end
+    raise RemoteWork::Error, "remote-task Skill Release is empty" if files.empty?
+    files.sort_by(&:first)
+  end
+
+  def skill_tree_digest(root)
+    digest = Digest::SHA256.new
+    skill_tree_files(root).each do |relative, path|
+      digest << relative << "\0" << path.binread << "\0"
+    end
+    digest.hexdigest
+  end
+
+  def install_worker_skill_bundle(stage, records)
+    bundle = stage.join("skills/remote-task")
+    FileUtils.mkdir_p(bundle.to_s, mode: 0o755)
+    manifest = {
+      "schema_version" => 1,
+      "source" => "current-approved-codex-skill-releases",
+      "skills" => records.map do |entry|
+        target = bundle.join(entry.fetch("skill_id"))
+        FileUtils.cp_r(entry.fetch("source").to_s, target.to_s, preserve: true)
+        {
+          "skill_id" => entry.fetch("skill_id"),
+          "digest" => entry.fetch("digest"),
+          "path" => entry.fetch("skill_id"),
+          "content_sha256" => skill_tree_digest(entry.fetch("source"))
+        }
+      end
+    }
+    bundle.join("manifest.json").write(JSON.pretty_generate(manifest) + "\n", encoding: "UTF-8")
+    Find.find(bundle.to_s) do |raw|
+      path = Pathname.new(raw)
+      next if path.symlink?
+      mode = if path.directory?
+               0o555
+             elsif path.executable?
+               0o555
+             else
+               0o444
+             end
+      File.chmod(mode, path.to_s)
+    end
+  end
+
+  def verify_worker_skill_bundle(release, records)
+    bundle = release.join("skills/remote-task")
+    manifest = JSON.parse(bundle.join("manifest.json").read(encoding: "UTF-8"))
+    expected = records.map { |entry| [entry.fetch("skill_id"), entry.fetch("digest")] }
+    actual = Array(manifest["skills"]).map { |entry| [entry["skill_id"], entry["digest"]] }
+    raise RemoteWork::Error, "installed remote-task Skill manifest drift" unless actual == expected
+    records.each do |entry|
+      installed = bundle.join(entry.fetch("skill_id"))
+      raise RemoteWork::Error, "installed remote-task Skill is incomplete" unless installed.join("SKILL.md").file?
+      unless skill_tree_digest(installed) == skill_tree_digest(entry.fetch("source"))
+        raise RemoteWork::Error, "installed remote-task Skill failed content verification"
+      end
+      writable = skill_tree_files(installed).any? { |_relative, path| (path.stat.mode & 0o222).positive? }
+      raise RemoteWork::Error, "installed remote-task Skill is writable" if writable
+    end
+  rescue JSON::ParserError, Errno::ENOENT
+    raise RemoteWork::Error, "installed remote-task Skill manifest is invalid"
+  end
+
+  def install_worker_launch_agent(worker_home, worker, pipeline_root)
+    launch_agents = Pathname.new(File.join(Dir.home, "Library", "LaunchAgents"))
+    logs = Pathname.new(File.join(Dir.home, "Library", "Logs", "TwoHeadWuRemoteWorker"))
+    FileUtils.mkdir_p(launch_agents.to_s, mode: 0o755)
+    FileUtils.mkdir_p(logs.to_s, mode: 0o700)
+    plist = launch_agents.join("com.twoheadwu.remote-worker.plist")
+    local_bin = File.join(Dir.home, ".local", "bin")
+    content = <<~PLIST
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+      <plist version="1.0"><dict>
+        <key>Label</key><string>com.twoheadwu.remote-worker</string>
+        <key>ProgramArguments</key><array><string>#{xml(worker.to_s)}</string><string>run</string><string>--executor</string><string>app-server</string></array>
+        <key>WorkingDirectory</key><string>#{xml(worker_home.to_s)}</string>
+        <key>EnvironmentVariables</key><dict>
+          <key>WU_REMOTE_WORKER_HOME</key><string>#{xml(worker_home.to_s)}</string>
+          <key>TWO_HEAD_WU_SOURCE_ROOT</key><string>#{xml(@root.to_s)}</string>
+          <key>TWO_HEAD_WU_PIPELINE_ROOT</key><string>#{xml(pipeline_root.to_s)}</string>
+          <key>LANG</key><string>en_US.UTF-8</string>
+          <key>LC_ALL</key><string>en_US.UTF-8</string>
+          <key>PATH</key><string>#{xml(local_bin)}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        </dict>
+        <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>
+        <key>StandardOutPath</key><string>#{xml(logs.join('worker.log').to_s)}</string>
+        <key>StandardErrorPath</key><string>#{xml(logs.join('worker.err.log').to_s)}</string>
+      </dict></plist>
+    PLIST
+    RemoteWork::Atomic.write(plist, content, mode: 0o644)
+    domain = "gui/#{Process.uid}"
+    system("launchctl", "bootout", domain, plist.to_s, out: File::NULL, err: File::NULL)
+    raise RemoteWork::Error, "cannot start Mac mini worker LaunchAgent" unless system("launchctl", "bootstrap", domain, plist.to_s)
+  end
+
+  def synchronize_source_mirror!
+    admin = @root.join("capabilities/remote-work/adapters/remote-work-admin")
+    stdout, _stderr, status = Open3.capture3(admin.to_s, "sync-source", chdir: @root.to_s)
+    raise RemoteWork::Error, "cannot synchronize the committed Mini workflow source" unless status.success?
+    result = JSON.parse(stdout)
+    raise RemoteWork::Error, "Mini workflow source synchronization returned invalid data" unless %w[synchronized current].include?(result["result"])
+    Pathname.new(
+      ENV.fetch("WU_REMOTE_SOURCE_MIRROR_ROOT", File.join(Dir.home, ".local", "share", "two-head-wu", "managed-source"))
+    ).expand_path.cleanpath.join("current")
+  rescue JSON::ParserError
+    raise RemoteWork::Error, "Mini workflow source synchronization returned invalid data"
+  end
+
+  def xml(value)
+    value.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;").gsub('"', "&quot;").gsub("'", "&apos;")
+  end
+
+  def ssh_target
+    value, = ProtectedSshTarget.read(SSH_TARGET_ENV)
+    raise RemoteWork::Error, "protected SSH target is not installed for secret://remote-work-bootstrap/edge-server/ssh-target" if value.empty?
+    raise RemoteWork::Error, "protected SSH target has invalid shape" unless TARGET_PATTERN.match?(value)
+    value
+  end
+
+  def run_ssh(remote_command, stdin_data: nil)
+    Open3.capture3({ "LC_ALL" => "C" }, "ssh", *SSH_OPTIONS, ssh_target, remote_command, stdin_data: stdin_data.to_s)
+  end
+
+  def classify_ssh_error(stderr)
+    text = stderr.to_s.downcase
+    return "host-key-not-trusted" if text.include?("host key verification failed") || text.include?("no host key is known")
+    return "public-key-authentication-failed" if text.include?("permission denied")
+    return "connection-timeout" if text.include?("timed out")
+    return "connection-refused" if text.include?("connection refused")
+    return "name-resolution-failed" if text.include?("could not resolve")
+    "fixed-remote-command-failed"
+  end
+
+  def parse_fields(output, allowed)
+    values = {}
+    output.to_s.each_line do |line|
+      key, value = line.strip.split("=", 2)
+      next unless allowed.include?(key)
+      raise RemoteWork::Error, "remote response contains invalid value" unless value&.match?(/\A[a-zA-Z0-9._-]+\z/)
+      values[key] = value
+    end
+    raise RemoteWork::Error, "remote response is missing required fields" unless (allowed - values.keys).empty?
+    values
+  end
+
+  def safe_result(output)
+    value = output.to_s.lines.find { |line| line.start_with?("result=") }&.split("=", 2)&.last&.strip
+    value if value&.match?(/\A[a-z0-9-]+\z/)
+  end
+
+  def ensure_no_arguments!
+    raise RemoteWork::Error, "unexpected arguments" unless @arguments.empty?
+  end
+end
+
+exit RemoteWorkDeploy.new(ARGV).run if $PROGRAM_NAME == __FILE__

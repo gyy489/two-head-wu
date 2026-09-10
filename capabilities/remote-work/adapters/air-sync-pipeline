@@ -1,0 +1,121 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "open3"
+require "pathname"
+require "time"
+
+class AirSyncPipeline
+  def initialize(arguments)
+    @arguments = arguments.dup
+    @root = Pathname.new(__dir__).join("../../..").expand_path.cleanpath
+    @stages = []
+  end
+
+  def run
+    raise ArgumentError, "air-sync-pipeline accepts no arguments" unless @arguments.empty?
+
+    run_stage("inventory", "发现并盘点受管组件", "scripts/capabilities-manager", "audit-updates", "--write")
+    pending = pending_capabilities
+    unless pending.empty?
+      emit("review-required", pending: pending)
+      return 0
+    end
+
+    run_stage(
+      "skill-registry", "验证隔离镜像中的已登记 Skill 集；不修改 Mini 外部运行面",
+      "scripts/capabilities-manager", "sync-skills", "--apply", "--isolated"
+    )
+    run_stage("documentation", "刷新说明、功能表与拓扑", "core/bin/wu-docs", "update")
+    run_stage("verification", "验收登记、说明、测试与存储策略", "core/bin/wu-docs", "verify")
+    run_stage(
+      "publish",
+      "构建签名客户端和能力清单并发布到固定阿里云控制面",
+      "capabilities/remote-work/adapters/remote-work-deploy",
+      "deploy-service", "--project", "two-head-wu", "--approve"
+    )
+    run_stage(
+      "production-smoke",
+      "验证固定控制面和两站保护条件",
+      "capabilities/remote-work/adapters/remote-work-deploy",
+      "production-smoke", "--project", "two-head-wu"
+    )
+    emit("completed", pending: [])
+    0
+  rescue ArgumentError, JSON::ParserError, KeyError, Errno::EACCES, Errno::ENOENT => error
+    warn "air-sync-pipeline failed: #{safe_error(error.message)}"
+    2
+  end
+
+  private
+
+  def run_stage(id, summary, *command)
+    executable = @root.join(command.first).cleanpath
+    prefix = @root.to_s + File::SEPARATOR
+    unless executable.to_s.start_with?(prefix) && executable.file?
+      raise ArgumentError, "registered pipeline executable is unavailable"
+    end
+
+    argv = [executable.to_s, *command.drop(1)]
+    stdout, stderr, status = Open3.capture3(
+      { "LANG" => "en_US.UTF-8", "LC_ALL" => "en_US.UTF-8" },
+      *argv,
+      chdir: @root.to_s
+    )
+    unless status.success?
+      detail = safe_error([stderr, stdout].join("\n"))
+      warn JSON.generate({
+        "schema" => "two-head-wu.air-sync.v1",
+        "status" => "failed",
+        "failed_stage" => id,
+        "reason" => detail,
+        "stages" => @stages
+      })
+      exit 2
+    end
+    @stages << { "id" => id, "status" => "completed", "summary" => summary }
+  end
+
+  def pending_capabilities
+    path = @root.join("contexts/capabilities/last-inventory.json")
+    value = JSON.parse(path.read(encoding: "UTF-8"))
+    Array(value.fetch("pending_capabilities")).map do |entry|
+      {
+        "skill" => entry.fetch("skill").to_s[0, 128],
+        "runtime" => entry.fetch("runtime").to_s[0, 64],
+        "discovery_root" => entry.fetch("root").to_s[0, 64]
+      }
+    end
+  end
+
+  def emit(status, pending:)
+    catalog = @root.join("inventories/function_catalog.json")
+    catalog_version = if catalog.file?
+                        JSON.parse(catalog.read(encoding: "UTF-8"))["catalog_version"]
+                      end
+    puts JSON.pretty_generate({
+      "schema" => "two-head-wu.air-sync.v1",
+      "source_device" => "mac-mini-worker",
+      "observed_at" => Time.now.utc.iso8601,
+      "status" => status,
+      "catalog_version" => catalog_version,
+      "pending_review" => pending,
+      "stages" => @stages
+    }.compact)
+  end
+
+  def safe_error(value)
+    value.to_s
+         .encode("UTF-8", invalid: :replace, undef: :replace, replace: "")
+         .gsub(@root.to_s, "<two-head-wu>")
+         .gsub(Dir.home, "<home>")
+         .lines
+         .map(&:strip)
+         .reject(&:empty?)
+         .last(8)
+         .join(" | ")[0, 1200]
+  end
+end
+
+exit AirSyncPipeline.new(ARGV).run

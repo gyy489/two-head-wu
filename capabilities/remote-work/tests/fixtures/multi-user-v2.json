@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "owner_v1_snapshot": {
+    "api_prefix": "/two-head-wu/v1",
+    "protocol_version": 2,
+    "device_roles": ["mac-mini-worker", "owner-air"],
+    "job_owner": "example-owner",
+    "job_identities": ["owner-auto", "owner-local-catalog"],
+    "owner_pool": ["owner-primary", "owner-secondary"],
+    "classmates": "forbidden"
+  },
+  "bundle": {
+    "schema_version": 2,
+    "users": [
+      {"schema_version": 2, "id": "usr-member-a001", "role": "member", "status": "active", "display_name": "member-a", "created_at": "2026-09-01T00:00:00Z"},
+      {"schema_version": 2, "id": "usr-member-b002", "role": "member", "status": "active", "display_name": "member-b", "created_at": "2026-09-01T00:00:00Z"}
+    ],
+    "devices": [
+      {"schema_version": 2, "id": "dev-member-a-macos", "user_id": "usr-member-a001", "role": "air", "platform": "macos", "key_provider": "secure-enclave", "public_key_spki_base64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEyKWHzxMxEPT3pigkiU6Ulr/7ZoQWb6wzYTPi87DwlX25aO/ggHinoA6xyVTOAStkdlcx5E8JTA0dqYFfkOTwRg==", "status": "active", "created_at": "2026-09-01T00:00:00Z"},
+      {"schema_version": 2, "id": "dev-member-b-windows", "user_id": "usr-member-b002", "role": "air", "platform": "windows", "key_provider": "tpm-cng", "public_key_spki_base64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEn2eKrYafjlY3pPukUre+yc1h671d5aznnBY/pjeWTvLLZcLBWdVhXV9Fpmfu6fl90v3I/paME/WWUH1LXmeYog==", "status": "active", "created_at": "2026-09-01T00:00:00Z"}
+    ],
+    "codex_bindings": [
+      {"schema_version": 2, "id": "cdx-member-a001", "user_id": "usr-member-a001", "identity_alias": "member-a", "routing_mode": "air-fixed", "status": "active", "created_at": "2026-09-01T00:00:00Z"},
+      {"schema_version": 2, "id": "cdx-member-b002", "user_id": "usr-member-b002", "identity_alias": "member-b", "routing_mode": "air-fixed", "status": "active", "created_at": "2026-09-01T00:00:00Z"}
+    ],
+    "grants": [
+      {"schema_version": 2, "id": "grant-member-a-codex", "user_id": "usr-member-a001", "capability_id": "codex:project-task", "effect": "allow", "status": "active", "scopes": ["project-read", "review-result"], "created_at": "2026-09-01T00:00:00Z"},
+      {"schema_version": 2, "id": "grant-member-a-research", "user_id": "usr-member-a001", "capability_id": "research-library:search", "effect": "allow", "status": "active", "scopes": ["metadata", "snippets"], "created_at": "2026-09-01T00:00:00Z"},
+      {"schema_version": 2, "id": "grant-member-b-codex", "user_id": "usr-member-b002", "capability_id": "codex:project-task", "effect": "allow", "status": "active", "scopes": ["project-read", "review-result"], "created_at": "2026-09-01T00:00:00Z"}
+    ],
+    "content_leases": [
+      {"schema_version": 2, "id": "content-member-a-result", "user_id": "usr-member-a001", "job_id": "job-member-a-project", "kind": "result-package", "state": "available", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 128, "receipt_required": true, "created_at": "2026-09-01T00:00:00Z", "expires_at": "2026-09-15T00:00:00Z"}
+    ],
+    "jobs": [
+      {"schema_version": 2, "id": "job-member-a-project", "request_id": "call-aaaaaaaaaaaaaaaaaaaaaaaa", "user_id": "usr-member-a001", "device_id": "dev-member-a-macos", "codex_binding_id": "cdx-member-a001", "kind": "codex", "state": "succeeded", "instruction": "review the selected project", "capability_envelope": {"schema_version": 2, "capabilities": ["codex:project-task", "research-library:search"], "egress_profile": "none", "secret_access": "none", "result_mode": "review-only"}, "content_lease_ids": ["content-member-a-result"], "created_at": "2026-09-01T00:00:00Z"}
+    ],
+    "interactions": []
+  },
+  "attacks": {
+    "secret_canary": "CANARY_DO_NOT_EXPORT_fixture-only",
+    "cross_tenant_device": "dev-member-b-windows",
+    "owner_fallback_alias": "owner-auto",
+    "disconnect_transition": {"entity": "job", "from": "running", "to": "queued"}
+  }
+}

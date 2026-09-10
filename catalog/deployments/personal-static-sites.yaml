@@ -1,0 +1,44 @@
+version: 3
+updated_at: "2026-09-10"
+contract: "core/contracts/static-site.schema.yaml"
+purpose: "脱敏静态站点声明；URL 是不可用于生产的 example 标识。"
+
+sites:
+  - id: private-site
+    capability: server-operations
+    summary: "需要认证的脱敏示例静态站点。"
+    public_url: "https://private.example/"
+    access: authenticated_private
+    content_mode: static_only
+    lifecycle: persistent_mutable
+    target_resource: edge-server
+    publication_policy:
+      preflight: [reject-secrets-and-private-keys, reject-environment-files-and-database-dumps, reject-git-metadata, summarize-file-count-and-size]
+      external_write: protected-executor-after-explicit-request
+      publish_method: protected-local-ipc-site-publisher
+      mirror_delete: automatic-for-registered-site-after-explicit-request
+      rollback: preserve-existing-server-side-recovery-policy
+      execution_status: codex-driven-private-executor-required
+      executor_boundary: separate-service-account-outside-project-repository
+      project_binding: protected-executor-configured-workspace-and-site-allowlist
+    private_ref: "private://two-head-wu/sites/private-site"
+
+  - id: public-site
+    capability: server-operations
+    summary: "可替换内容的脱敏示例公开站点。"
+    public_url: "https://public.example/site/"
+    access: public
+    content_mode: static_only
+    lifecycle: persistent_mutable
+    expiry: none
+    target_resource: edge-server
+    publication_policy:
+      preflight: [reject-secrets-and-private-keys, reject-environment-files-and-database-dumps, reject-git-metadata, summarize-file-count-and-size]
+      external_write: protected-executor-after-explicit-request
+      publish_method: protected-local-ipc-site-publisher
+      mirror_delete: automatic-for-registered-site-after-explicit-request
+      rollback: preserve-existing-server-side-recovery-policy
+      execution_status: codex-driven-private-executor-required
+      executor_boundary: separate-service-account-outside-project-repository
+      project_binding: protected-executor-configured-workspace-and-site-allowlist
+    private_ref: "private://two-head-wu/sites/public-site"

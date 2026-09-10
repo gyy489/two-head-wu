@@ -1,0 +1,156 @@
+#!/bin/zsh
+set -eu
+
+endpoint='@@ENDPOINT@@'
+enrollment_token='@@ENROLLMENT_TOKEN@@'
+release_public_key_base64='@@RELEASE_PUBLIC_KEY_BASE64@@'
+install_base="$HOME/.local/share/two-head-wu/remote-work"
+bin_root="$HOME/.local/bin"
+skills_root="$HOME/.agents/skills"
+config_root="$HOME/.config/two-head-wu/remote-work"
+
+fail() {
+  print -u2 -- "安装失败：$1"
+  exit 1
+}
+
+[[ "$(uname -s)" == "Darwin" ]] || fail "个人版安装器目前只支持 macOS"
+for tool in curl ruby tar shasum security grep; do
+  command -v "$tool" >/dev/null 2>&1 || fail "缺少必要命令：$tool"
+done
+
+existing_install=0
+if [[ -f "$config_root/config.json" && -x "$bin_root/wu" ]]; then
+  print -- "检测到已安装的两头乌 Air 客户端，正在做幂等诊断……"
+  if "$bin_root/wu" 诊断 && "$bin_root/wu" remote update status >/dev/null 2>&1 && "$bin_root/wu" remote modules pull skill:remote-work && "$bin_root/wu" remote abilities sync >/dev/null && [[ -f "$HOME/Library/LaunchAgents/com.twoheadwu.remote-update.plist" && -f "$HOME/Library/LaunchAgents/com.twoheadwu.remote-companion.plist" && -x "$bin_root/two-head-wu-mcp" ]]; then
+    print -- "客户端已经安装且连接正常；没有重复使用一次性配对凭证。"
+    exit 0
+  fi
+  "$bin_root/wu" 诊断 || fail "检测到旧安装，但现有设备诊断失败；没有消费一次性升级凭证"
+  existing_install=1
+  print -- "检测到旧版客户端，将保留现有设备登记并执行签名升级。"
+fi
+
+print -- "两头乌 Air 客户端个人版"
+print -- "服务器：$endpoint"
+print -- "安装位置：$install_base"
+print -- "此脚本中的配对凭证只能成功使用一次。"
+if (( existing_install )); then
+  device_name=owner-air
+else
+  print -n -- "设备名称 [owner-air]："
+  read device_name
+  device_name=${device_name:-owner-air}
+  [[ "$device_name" =~ '^[a-z][a-z0-9-]{0,62}$' ]] || fail "设备名称只能使用小写字母、数字和连字符"
+fi
+
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/two-head-wu-install.XXXXXX")
+trap 'rm -rf "$temporary"' EXIT HUP INT TERM
+
+curl --fail --silent --show-error \
+  -H "Authorization: Enrollment $enrollment_token" \
+  "$endpoint/bootstrap/manifest" -o "$temporary/current.json"
+curl --fail --silent --show-error \
+  -H "Authorization: Enrollment $enrollment_token" \
+  "$endpoint/bootstrap/release" -o "$temporary/current.tar.gz"
+
+release_version=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV[0])).fetch("version")' "$temporary/current.json")
+release_id=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV[0])).fetch("release_id")' "$temporary/current.json")
+release_sha=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV[0])).fetch("sha256")' "$temporary/current.json")
+actual_sha=$(shasum -a 256 "$temporary/current.tar.gz" | awk '{print $1}')
+[[ "$actual_sha" == "$release_sha" ]] || fail "客户端下载包哈希校验失败"
+ruby -rbase64 -e 'File.binwrite(ARGV[0], Base64.strict_decode64(ARGV[1]))' "$temporary/release-public.pem" "$release_public_key_base64"
+ruby -ropenssl -rjson -rbase64 -e '
+  manifest=JSON.parse(File.read(ARGV[0]));
+  fields=%w[schema_version release_id version channel sha256 size generated_at public_key_sha256];
+  abort "schema" unless manifest["schema_version"]==2;
+  canonical=JSON.generate(fields.each_with_object({}){|key,out| out[key]=manifest.fetch(key)});
+  key=OpenSSL::PKey::RSA.new(File.read(ARGV[1]));
+  fingerprint=OpenSSL::Digest::SHA256.hexdigest(key.public_key.to_der);
+  abort "fingerprint" unless fingerprint==manifest.fetch("public_key_sha256");
+  signature=Base64.strict_decode64(manifest.fetch("signature_base64"));
+  abort "signature" unless key.verify(OpenSSL::Digest::SHA256.new, signature, canonical)
+' "$temporary/current.json" "$temporary/release-public.pem" || fail "客户端发布签名验证失败"
+
+release_root="$install_base/releases/$release_id"
+mkdir -p "$release_root" "$bin_root" "$skills_root" "$config_root"
+chmod 700 "$config_root"
+if [[ ! -f "$release_root/RELEASE_ID" ]]; then
+  rmdir "$release_root"
+  mkdir -p "$temporary/release"
+  tar -xzf "$temporary/current.tar.gz" -C "$temporary/release"
+  [[ -x "$temporary/release/bin/wu" && -x "$temporary/release/bin/wu-codex-status" && -x "$temporary/release/bin/two-head-wu-mcp" && -x "$temporary/release/adapters/remote-work" ]] || fail "客户端更新包不完整"
+  [[ "$(<"$temporary/release/RELEASE_ID")" == "$release_id" ]] || fail "客户端更新包版本不匹配"
+  [[ "$(shasum -a 256 "$temporary/release/share/release-signing-public.pub" | awk '{print $1}')" == "$(shasum -a 256 "$temporary/release-public.pem" | awk '{print $1}')" ]] || fail "客户端更新包替换了发布公钥"
+  mv "$temporary/release" "$release_root"
+fi
+chmod 755 "$release_root/bin/wu" "$release_root/bin/wu-codex-status" "$release_root/bin/two-head-wu-mcp" "$release_root/adapters/remote-work"
+
+if [[ -e "$bin_root/wu" || -L "$bin_root/wu" ]]; then
+  existing=$(readlink "$bin_root/wu" 2>/dev/null || true)
+  if [[ "$existing" != "$release_root/bin/wu" && "$existing" != "$install_base"/* ]]; then
+    print -n -- "$bin_root/wu 已存在，是否替换链接？[y/N]："
+    read answer
+    [[ "$answer" == [yY] ]] || fail "保留了现有 wu，安装已停止"
+    mv "$bin_root/wu" "$bin_root/wu.before-two-head-wu"
+  fi
+fi
+ln -sfn "$release_root/bin/wu" "$bin_root/wu"
+ln -sfn "$release_root/bin/wu-codex-status" "$bin_root/wu-codex-status"
+ln -sfn "$release_root/bin/two-head-wu-mcp" "$bin_root/two-head-wu-mcp"
+
+path_marker='# Two-Headed-Wu user commands'
+for shell_profile in "$HOME/.zprofile" "$HOME/.zshrc"; do
+  if ! grep -Fq "$path_marker" "$shell_profile" 2>/dev/null; then
+    print -- "" >>"$shell_profile"
+    print -- "$path_marker" >>"$shell_profile"
+    print -- 'export PATH="$HOME/.local/bin:$PATH"' >>"$shell_profile"
+  fi
+done
+export PATH="$bin_root:$PATH"
+
+if (( existing_install )); then
+  curl --fail --silent --show-error -X POST \
+    -H "Authorization: Enrollment $enrollment_token" \
+    "$endpoint/bootstrap/consume" >/dev/null
+else
+  export WU_TWO_HEAD_WU_ENROLLMENT="$enrollment_token"
+  "$release_root/adapters/remote-work" enroll \
+    --endpoint "$endpoint" \
+    --device "$device_name" \
+    --token-env WU_TWO_HEAD_WU_ENROLLMENT \
+    --secret-store keychain
+  unset WU_TWO_HEAD_WU_ENROLLMENT
+fi
+enrollment_token='used'
+
+"$release_root/adapters/remote-work" modules pull skill:remote-work || fail "设备已配对，但 remote-work Skill 首次拉取失败；可稍后运行 wu 拉取模块 skill:remote-work"
+"$release_root/adapters/remote-work" abilities sync || fail "设备已配对，但签名能力目录首次同步失败；可稍后运行 wu 同步能力"
+if command -v codex >/dev/null 2>&1; then
+  "$release_root/adapters/remote-work" bridge install || fail "设备已配对，但 Codex MCP 能力桥注册失败；可稍后运行 wu remote bridge install"
+fi
+
+plist="$HOME/Library/LaunchAgents/com.twoheadwu.remote-update.plist"
+mkdir -p "${plist:h}"
+cat >"$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.twoheadwu.remote-update</string>
+  <key>ProgramArguments</key><array>
+    <string>$bin_root/wu</string><string>remote</string><string>update</string><string>all</string>
+  </array>
+  <key>StartInterval</key><integer>21600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$config_root/update.log</string>
+  <key>StandardErrorPath</key><string>$config_root/update-error.log</string>
+</dict></plist>
+PLIST
+chmod 600 "$plist"
+launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null
+"$release_root/adapters/remote-work" companion install || fail "设备已配对，但 Air 交互伴侣安装失败；可稍后运行 wu remote companion install"
+
+"$release_root/bin/wu" 诊断 || fail "安装完成，但端到端诊断没有通过"
+print -- "安装成功。已为 zsh 加入 ~/.local/bin；新开一个终端后可直接使用 wu。"
+print -- "常用命令：wu 能做什么、wu 查看额度、wu 上传附件 FILE、wu 远程任务 '你的任务'、wu 待处理 JOB_ID"

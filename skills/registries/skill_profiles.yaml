@@ -1,0 +1,67 @@
+version: 1
+updated_at: "2026-09-10"
+project_root: "."
+policy:
+  default_visibility: deny
+  global_profiles:
+    codex: codex-global
+    claude-code: claude-global
+    openclaw: openclaw-global
+  project_discovery_roots: {}
+  project_overlay_manifests: {}
+  legacy_project_mounts: {}
+  max_global_skills: 12
+  max_project_skills: 15
+  max_visible_descriptions: 40
+  max_description_characters: 8000
+  default_search_top_k: 5
+  max_search_top_k: 10
+  max_loaded_skills: 2
+  max_resource_bytes: 1048576
+  search_aliases: {}
+  generated_surfaces_are_disposable: true
+  cold_catalog_outside_discovery_roots: true
+stacks:
+  interface-core:
+    description: "最小两头乌入口。"
+    skills: [two-head-wu]
+    compatibility: { codex: native, claude-code: compatible, openclaw: compatible }
+  foundation-platform:
+    description: "公开基础平台的项目级运维入口。"
+    skills: [agent-identity, skills-dashboard, server-operations, remote-work-bootstrap, remote-work]
+    compatibility: { codex: native, claude-code: needs-review, openclaw: needs-review }
+profiles:
+  codex-global:
+    description: "最小 Codex 全局入口。"
+    stacks: [interface-core]
+    catalog_stacks: []
+    hot_skill_budget: 12
+  claude-global:
+    description: "最小 Claude Code 全局入口。"
+    stacks: [interface-core]
+    catalog_stacks: []
+    hot_skill_budget: 12
+  openclaw-global:
+    description: "最小 OpenClaw 全局入口。"
+    stacks: [interface-core]
+    catalog_stacks: []
+    hot_skill_budget: 12
+  two-head-wu-codex:
+    description: "公开基础平台的 Codex 项目配置。"
+    stacks: [foundation-platform]
+    catalog_stacks: []
+    hot_skill_budget: 15
+  two-head-wu-claude:
+    description: "公开基础平台的 Claude Code 项目配置。"
+    stacks: [foundation-platform]
+    catalog_stacks: []
+    hot_skill_budget: 15
+  two-head-wu-openclaw:
+    description: "公开基础平台的 OpenClaw 项目配置。"
+    stacks: [foundation-platform]
+    catalog_stacks: []
+    hot_skill_budget: 15
+bindings:
+  - { project: two-head-wu, agent: two-head-wu, runtime: codex, profile: two-head-wu-codex }
+  - { project: two-head-wu, agent: two-head-wu, runtime: claude-code, profile: two-head-wu-claude }
+  - { project: two-head-wu, agent: two-head-wu, runtime: openclaw, profile: two-head-wu-openclaw }

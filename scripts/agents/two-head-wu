@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+
+OPENCLAW="${OPENCLAW_BIN:-$HOME/.local/bin/openclaw}"
+AGENT_ID="main"
+
+if [ ! -x "$OPENCLAW" ]; then
+  echo "OpenClaw wrapper is missing: $OPENCLAW" >&2
+  exit 1
+fi
+
+command="${1:-status}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+case "$command" in
+  ask)
+    if [ "$#" -eq 0 ]; then
+      echo "Usage: scripts/agents/two-head-wu ask MESSAGE" >&2
+      exit 2
+    fi
+    exec "$OPENCLAW" agent --agent "$AGENT_ID" --message "$*"
+    ;;
+  chat)
+    exec "$OPENCLAW" chat "$@"
+    ;;
+  dashboard)
+    exec "$OPENCLAW" dashboard "$@"
+    ;;
+  start|stop|restart)
+    exec "$OPENCLAW" gateway "$command" "$@"
+    ;;
+  status)
+    exec "$OPENCLAW" status "$@"
+    ;;
+  health)
+    exec "$OPENCLAW" health "$@"
+    ;;
+  skills)
+    exec "$OPENCLAW" skills check --agent "$AGENT_ID" "$@"
+    ;;
+  *)
+    cat >&2 <<'HELP'
+Usage: scripts/agents/two-head-wu COMMAND [ARGS]
+
+Commands:
+  status                 Show OpenClaw and Two-Headed-Wu status
+  health                 Check the local Gateway
+  ask MESSAGE            Run one Two-Headed-Wu turn
+  chat                   Open the local terminal UI
+  dashboard              Open the local Control UI
+  skills                 Check the Agent skill allowlist
+  start|stop|restart     Manage the Gateway LaunchAgent
+HELP
+    exit 2
+    ;;
+esac

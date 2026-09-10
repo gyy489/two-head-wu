@@ -1,0 +1,173 @@
+#!/bin/zsh
+set -euo pipefail
+
+project_root=${0:A:h:h:h:h:h}
+go_root="$project_root/capabilities/remote-work/native/member-air"
+swift_source="$project_root/capabilities/remote-work/native/macos/MemberKey.swift"
+
+usage() {
+  print -u2 -- 'usage: Build-AirPackage plan --version VERSION --architecture arm64|amd64'
+  print -u2 -- '       Build-AirPackage build --version VERSION --architecture arm64|amd64 --application-identity NAME --installer-identity NAME --notary-profile NAME --output-directory PATH'
+}
+
+command_name=${1:-}
+[[ "$command_name" == plan || "$command_name" == build ]] || {
+  usage
+  exit 2
+}
+shift
+
+version=''
+architecture=''
+application_identity=''
+installer_identity=''
+notary_profile=''
+output_directory=''
+while (( $# > 0 )); do
+  (( $# >= 2 )) || {
+    usage
+    exit 2
+  }
+  case "$1" in
+    --version) version=$2 ;;
+    --architecture) architecture=$2 ;;
+    --application-identity) application_identity=$2 ;;
+    --installer-identity) installer_identity=$2 ;;
+    --notary-profile) notary_profile=$2 ;;
+    --output-directory) output_directory=$2 ;;
+    *) usage; exit 2 ;;
+  esac
+  shift 2
+done
+
+[[ "$version" =~ '^[0-9]+\.[0-9]+\.[0-9]+$' ]] || {
+  print -u2 -- 'Error: version must use MAJOR.MINOR.PATCH'
+  exit 2
+}
+[[ "$architecture" == arm64 || "$architecture" == amd64 ]] || {
+  print -u2 -- 'Error: architecture must be arm64 or amd64'
+  exit 2
+}
+[[ -f "$go_root/go.mod" && -f "$swift_source" ]] || {
+  print -u2 -- 'Error: native Air source is unavailable'
+  exit 2
+}
+
+required_tools=(go xcrun swiftc lipo codesign pkgbuild productbuild pkgutil spctl shasum)
+missing_tools=()
+for tool_name in $required_tools; do
+  command -v "$tool_name" >/dev/null 2>&1 || missing_tools+=("$tool_name")
+done
+
+if [[ "$command_name" == plan ]]; then
+  ruby -rjson -e 'puts JSON.generate({
+    result: "planned",
+    version: ARGV.fetch(0),
+    platform: "macos",
+    architecture: ARGV.fetch(1),
+    package: "signed-and-notarized-pkg",
+    listener: false,
+    background_service: false,
+    signing_required: true,
+    missing_tools: ARGV.drop(2)
+  })' "$version" "$architecture" $missing_tools
+  (( ${#missing_tools} == 0 ))
+  exit
+fi
+
+(( ${#missing_tools} == 0 )) || {
+  print -u2 -- "Error: required build tools are unavailable: ${missing_tools[*]}"
+  exit 2
+}
+[[ -n "$application_identity" && -n "$installer_identity" && -n "$notary_profile" && -n "$output_directory" ]] || {
+  usage
+  exit 2
+}
+host_architecture=$(uname -m)
+[[ "$host_architecture" == x86_64 ]] && host_architecture=amd64
+[[ "$host_architecture" == "$architecture" ]] || {
+  print -u2 -- 'Error: build the macOS Air package on the matching CPU architecture'
+  exit 2
+}
+[[ "$output_directory" == /* ]] || {
+  print -u2 -- 'Error: output directory must be absolute'
+  exit 2
+}
+
+output_directory=${output_directory:A}
+mkdir -p "$output_directory"
+package="$output_directory/two-head-wu-air-macos-$architecture-$version.pkg"
+[[ ! -e "$package" ]] || {
+  print -u2 -- 'Error: output package already exists'
+  exit 2
+}
+
+work_root=$(mktemp -d "${TMPDIR:-/tmp}/two-head-wu-air-macos.XXXXXX")
+cleanup() {
+  rm -rf -- "$work_root"
+}
+trap cleanup EXIT HUP INT TERM
+
+binary_architecture=$architecture
+[[ "$binary_architecture" == amd64 ]] && binary_architecture=x86_64
+(
+  cd "$go_root"
+  GOOS=darwin GOARCH="$architecture" CGO_ENABLED=0 \
+    go build -trimpath -ldflags='-s -w' -o "$work_root/two-head-wu-air" . \
+    </dev/null
+)
+xcrun --sdk macosx swiftc -O -o "$work_root/member-key" "$swift_source"
+[[ "$(lipo -archs "$work_root/two-head-wu-air")" == "$binary_architecture" ]] || {
+  print -u2 -- 'Error: Go client architecture verification failed'
+  exit 2
+}
+[[ "$(lipo -archs "$work_root/member-key")" == "$binary_architecture" ]] || {
+  print -u2 -- 'Error: Secure Enclave helper architecture verification failed'
+  exit 2
+}
+
+payload="$work_root/payload"
+program_root="$payload/usr/local/libexec/two-head-wu-air"
+mkdir -p "$program_root" "$payload/usr/local/bin" "$payload/usr/local/share/two-head-wu-air"
+cp "$work_root/two-head-wu-air" "$program_root/two-head-wu-air"
+cp "$work_root/member-key" "$program_root/member-key"
+chmod 0755 "$program_root/two-head-wu-air" "$program_root/member-key"
+
+for executable in "$program_root/member-key" "$program_root/two-head-wu-air"; do
+  codesign --force --options runtime --timestamp --sign "$application_identity" "$executable"
+  codesign --verify --strict --verbose=2 "$executable"
+done
+
+ln -s ../libexec/two-head-wu-air/two-head-wu-air "$payload/usr/local/bin/two-head-wu-air"
+ruby -rjson -e 'puts JSON.pretty_generate({
+  schema_version: 1,
+  version: ARGV.fetch(0),
+  platform: "macos",
+  architecture: ARGV.fetch(1),
+  listener: false,
+  background_service: false
+})' "$version" "$architecture" >"$payload/usr/local/share/two-head-wu-air/release.json"
+chmod 0644 "$payload/usr/local/share/two-head-wu-air/release.json"
+
+component="$work_root/Air-component.pkg"
+pkgbuild --root "$payload" \
+  --identifier com.twoheadwu.air \
+  --version "$version" \
+  --install-location / \
+  "$component"
+productbuild --package "$component" --sign "$installer_identity" "$package"
+xcrun notarytool submit "$package" --keychain-profile "$notary_profile" --wait
+xcrun stapler staple "$package"
+pkgutil --check-signature "$package"
+spctl --assess --type install --verbose=2 "$package"
+
+digest=$(shasum -a 256 "$package" | awk '{print $1}')
+ruby -rjson -e 'puts JSON.generate({
+  result: "built",
+  package: ARGV.fetch(0),
+  sha256: ARGV.fetch(1),
+  version: ARGV.fetch(2),
+  platform: "macos",
+  architecture: ARGV.fetch(3),
+  notarized: true
+})' "$package" "$digest" "$version" "$architecture"

@@ -1,0 +1,84 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "pathname"
+require "yaml"
+
+ROOT = Pathname.new(__dir__).join("..").expand_path.cleanpath
+EXPECTED_PACKAGES = %w[
+  agent-identity
+  agent-observability
+  capability-release-management
+  personal-memory
+  remote-work
+  remote-work-bootstrap
+  server-operations
+  skills-dashboard
+  spec-kit-governance
+  two-head-wu-core
+].freeze
+
+def load_yaml(path)
+  YAML.safe_load(path.read(encoding: "UTF-8"), permitted_classes: [], aliases: false)
+end
+
+def fail_audit(message)
+  warn "foundation platform audit failed: #{message}"
+  exit 1
+end
+
+catalog = load_yaml(ROOT.join("catalog/packages_registry.yaml"))
+catalog_entries = Array(catalog.fetch("packages"))
+catalog_ids = catalog_entries.map { |entry| entry.fetch("id") }.sort
+fail_audit("catalog must contain exactly the public 9+1 packages") unless catalog_ids == EXPECTED_PACKAGES
+
+directories = ROOT.join("capabilities").children
+  .select(&:directory?)
+  .select { |path| path.join("capability.yaml").file? }
+  .map { |path| path.basename.to_s }
+  .sort
+fail_audit("capability directories and package catalog differ") unless directories == EXPECTED_PACKAGES
+
+catalog_entries.each do |entry|
+  id = entry.fetch("id")
+  manifest_path = ROOT.join(entry.fetch("manifest"))
+  fail_audit("missing manifest for #{id}") unless manifest_path.file?
+  manifest = load_yaml(manifest_path)
+  fail_audit("manifest ID differs from directory for #{id}") unless manifest.fetch("id") == id
+  fail_audit("invalid version for #{id}") unless manifest.fetch("version").match?(/\A\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\z/)
+  fail_audit("missing summary for #{id}") if manifest.fetch("summary").strip.empty?
+
+  package_root = manifest_path.dirname
+  Array(manifest.fetch("interfaces")).each do |interface|
+    entrypoint = interface.fetch("entrypoint")
+    shipped = ROOT.join(entrypoint).exist? || package_root.join(entrypoint).exist?
+    fail_audit("missing interface #{interface.fetch('id')} for #{id}: #{entrypoint}") unless shipped
+  end
+
+  documentation = manifest.fetch("documentation")
+  paths = [
+    documentation.fetch("overview"),
+    *Array(documentation.fetch("skill_docs")),
+    *Array(documentation.fetch("references")),
+    *Array(documentation.fetch("generated"))
+  ]
+  paths.each do |relative|
+    shipped = ROOT.join(relative).exist? || package_root.join(relative).exist?
+    fail_audit("missing documentation for #{id}: #{relative}") unless shipped
+  end
+end
+
+project_registry = load_yaml(ROOT.join("registries/projects_registry.yaml"))
+project = Array(project_registry.fetch("projects")).find { |entry| entry.fetch("id") == "two-head-wu" }
+fail_audit("public two-head-wu project is missing") unless project
+bound_packages = Array(project.dig("capabilities", "packages")).sort
+fail_audit("public project binding must contain exactly the public 9+1 packages") unless bound_packages == EXPECTED_PACKAGES
+
+puts JSON.pretty_generate(
+  "result" => "ok",
+  "package_count" => EXPECTED_PACKAGES.length,
+  "infrastructure_count" => 9,
+  "platform_count" => 1,
+  "packages" => EXPECTED_PACKAGES
+)

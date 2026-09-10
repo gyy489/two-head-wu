@@ -1,0 +1,11 @@
+version: 1
+updated_at: "2026-09-10"
+documents:
+  - id: public-readme
+    path: README.md
+    kind: project-entry
+    owner: two-head-wu-core
+  - id: public-architecture
+    path: docs/architecture.md
+    kind: architecture
+    owner: two-head-wu-core

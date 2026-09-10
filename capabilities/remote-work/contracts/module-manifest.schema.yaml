@@ -1,0 +1,39 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Two-Headed-Wu module manifest
+type: object
+required: [schema_version, generated_at, modules, public_key_sha256, signature_base64]
+properties:
+  schema_version:
+    const: 2
+  generated_at:
+    type: string
+  modules:
+    type: array
+    items:
+      type: object
+      required: [id, classification, status, summary]
+      properties:
+        id:
+          type: string
+          pattern: "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"
+        classification:
+          enum: [portable, remote-only]
+        status:
+          enum: [active, retired, revoked]
+        summary:
+          type: string
+        version:
+          type: string
+        sha256:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        size:
+          type: integer
+          minimum: 0
+        default_mode:
+          enum: [off, metadata-only, on-demand, auto-update, pinned]
+  public_key_sha256:
+    type: string
+    pattern: "^[a-f0-9]{64}$"
+  signature_base64:
+    type: string

@@ -1,0 +1,122 @@
+#!/bin/sh
+set -u
+
+project_root=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
+expected_version=$(ruby -rjson -e '
+  data = JSON.parse(File.read(ARGV.fetch(0), encoding: "UTF-8"))
+  puts data.fetch("speckit_version")
+' "$project_root/.specify/init-options.json" 2>/dev/null || printf 'unknown')
+
+specify_version() {
+  if ! command -v specify >/dev/null 2>&1; then
+    printf 'missing\n'
+    return
+  fi
+  specify --version 2>/dev/null | awk 'NR == 1 { print $2 }'
+}
+
+integration_value() {
+  label=$1
+  printf '%s\n' "$2" | sed -n "s/^${label}: //p" | sed -n '1p'
+}
+
+status_command() {
+  version=$(specify_version)
+  integration_status=''
+  if [ "$version" != 'missing' ]; then
+    integration_status=$(cd "$project_root" && specify integration status 2>/dev/null) || true
+  fi
+
+  default_integration=$(integration_value 'Default integration' "$integration_status")
+  installed_integrations=$(integration_value 'Installed integrations' "$integration_status")
+
+  printf 'spec-kit-governance: %s\n' "$project_root"
+  printf 'specify-version: %s\n' "$version"
+  printf 'expected-version: %s\n' "$expected_version"
+  printf 'default-integration: %s\n' "${default_integration:-unknown}"
+  printf 'installed-integrations: %s\n' "${installed_integrations:-unknown}"
+  printf 'shared-infrastructure: %s\n' "$(test -d "$project_root/.specify" && printf present || printf missing)"
+  printf 'codex-project-skills: %s\n' "$(test -d "$project_root/.agents/skills" && printf present || printf missing)"
+  printf 'claude-project-skills: %s\n' "$(test -d "$project_root/.claude/skills" && printf present || printf missing)"
+}
+
+doctor_command() {
+  problems=0
+  version=$(specify_version)
+
+  if [ "$version" = 'missing' ]; then
+    printf 'error: Specify CLI is missing\n' >&2
+    problems=$((problems + 1))
+  elif [ "$version" != "$expected_version" ]; then
+    printf 'error: Specify CLI version mismatch: expected %s, found %s\n' "$expected_version" "$version" >&2
+    problems=$((problems + 1))
+  fi
+
+  for required_path in \
+    '.specify/memory/constitution.md' \
+    '.specify/feature.json' \
+    '.specify/integrations/codex.manifest.json' \
+    '.specify/integrations/claude.manifest.json' \
+    '.agents/skills/speckit-specify/SKILL.md' \
+    '.claude/skills/speckit-specify/SKILL.md' \
+    'capabilities/spec-kit-governance/contracts/change-capsule.schema.yaml' \
+    'capabilities/spec-kit-governance/adapters/change-governance'
+  do
+    if [ ! -f "$project_root/$required_path" ]; then
+      printf 'error: required Spec Kit file is missing: %s\n' "$required_path" >&2
+      problems=$((problems + 1))
+    fi
+  done
+
+  integration_status=''
+  if [ "$version" != 'missing' ]; then
+    if ! integration_status=$(cd "$project_root" && specify integration status 2>&1); then
+      printf 'error: Spec Kit integration status failed\n' >&2
+      problems=$((problems + 1))
+    else
+      for expected_line in \
+        'Integration status: OK' \
+        'Default integration: codex' \
+        'Installed integrations: codex, claude' \
+        'Modified managed files: 0' \
+        'Missing managed files: 0' \
+        'Invalid manifest paths: 0'
+      do
+        if ! printf '%s\n' "$integration_status" | grep -Fqx "$expected_line"; then
+          printf 'error: integration invariant failed: %s\n' "$expected_line" >&2
+          problems=$((problems + 1))
+        fi
+      done
+    fi
+  fi
+
+  if find "$project_root/skills/.active" -maxdepth 2 -name 'speckit-*' -print -quit | grep -q .; then
+    printf 'error: project-local Spec Kit Skill is exposed through skills/.active\n' >&2
+    problems=$((problems + 1))
+  fi
+
+  if ! "$project_root/capabilities/spec-kit-governance/adapters/change-governance" validate-all >/dev/null; then
+    printf 'error: Change Capsule governance validation failed\n' >&2
+    problems=$((problems + 1))
+  fi
+
+  if [ "$problems" -ne 0 ]; then
+    printf 'spec-kit-governance doctor failed: %s problem(s)\n' "$problems" >&2
+    return 1
+  fi
+
+  printf 'spec-kit-governance doctor ok\n'
+}
+
+case "${1:-}" in
+  status)
+    status_command
+    ;;
+  doctor)
+    doctor_command
+    ;;
+  *)
+    printf 'Usage: %s {status|doctor}\n' "$0" >&2
+    exit 2
+    ;;
+esac

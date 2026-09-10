@@ -1,0 +1,73 @@
+version: 3
+updated_at: "2026-09-10"
+contract: "core/contracts/resource.schema.yaml"
+purpose: "脱敏逻辑资源图；不包含地址、端口、账号、凭据、密钥或可连接配置。"
+
+private_resource_package:
+  id: two-head-wu-private
+  reference: "private://two-head-wu/"
+  availability: operator-supplied-outside-this-repository
+  encryption_at_rest: required
+  tracked_in_git: false
+
+resources:
+  - id: local-workstation
+    kind: workstation
+    capability: server-operations
+    summary: "脱敏示例：操作者工作站。"
+    classification: public-example
+    roles: [operator-workstation, tunnel-client]
+    operations:
+      allowed_actions: [resource-query]
+      change_control: query-only
+      execution_status: unavailable-without-private-binding
+    policy_ref: "policy://server-operations/default"
+    private_ref: "private://two-head-wu/resources/local-workstation"
+    secret_ref_count: 0
+
+  - id: edge-server
+    kind: edge-server
+    capability: server-operations
+    summary: "脱敏示例：承载静态站点与远程工作控制面的边缘服务器。"
+    classification: public-example
+    roles: [public-edge, tunnel-server, static-site-target, https-termination, two-head-wu-control-plane-host]
+    operations:
+      allowed_actions:
+        - publish-registered-static-sites
+        - probe-remote-work-ssh
+        - bootstrap-remote-work-storage
+        - host-owner-remote-work-control-plane
+      change_control: protected-executor-after-explicit-request
+      execution_status: unavailable-without-private-binding
+    policy_ref: "policy://server-operations/edge"
+    private_ref: "private://two-head-wu/resources/edge-server"
+    secret_ref_count: 1
+
+  - id: private-services
+    kind: private-server
+    capability: server-operations
+    summary: "脱敏示例：通过边缘网络连接的内部服务节点。"
+    classification: public-example
+    roles: [private-services, database, tunnel-client]
+    operations:
+      allowed_actions: [resource-query]
+      change_control: query-only
+      execution_status: unavailable-without-private-binding
+    policy_ref: "policy://server-operations/private-services"
+    private_ref: "private://two-head-wu/resources/private-services"
+    secret_ref_count: 1
+
+  - id: standby-node
+    kind: standby-server
+    capability: server-operations
+    summary: "脱敏示例：默认关机且禁止自动唤醒的备用节点。"
+    classification: public-example
+    roles: [standby-compute, tunnel-client-when-online]
+    operations:
+      allowed_actions: [resource-query]
+      change_control: query-only
+      automatic_wake: forbidden
+      execution_status: unavailable-without-private-binding
+    policy_ref: "policy://server-operations/standby"
+    private_ref: "private://two-head-wu/resources/standby-node"
+    secret_ref_count: 1

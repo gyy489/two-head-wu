@@ -1,0 +1,63 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Two-Headed-Wu remote research-library artifact export
+type: object
+required: [schema, source_device, observed_at, document, relay, artifact]
+properties:
+  schema: {const: two-head-wu.research-library.export.v1}
+  source_device: {const: mac-mini-worker}
+  observed_at: {type: string}
+  document:
+    type: object
+    required: [work_id, version_id, sha256, canonical_title, export_available, citation_authority]
+    properties:
+      id: {type: string, format: uuid}
+      work_id: {type: string, format: uuid}
+      version_id: {type: string, format: uuid}
+      role: {type: string}
+      sha256: {type: string, pattern: "^[a-f0-9]{64}$"}
+      mime: {type: string}
+      bytes: {type: integer, minimum: 1, maximum: 52428800}
+      language: {type: [string, "null"]}
+      generator: {type: [string, "null"]}
+      quality_status: {type: [string, "null"]}
+      authoritative: {type: [integer, boolean]}
+      created_at: {type: string}
+      canonical_title: {type: string}
+      kind: {type: string}
+      publication_date: {type: [string, "null"]}
+      version_kind: {type: string}
+      doi: {type: [string, "null"]}
+      publisher: {type: [string, "null"]}
+      journal: {type: [string, "null"]}
+      volume: {type: [string, "null"]}
+      issue: {type: [string, "null"]}
+      pages: {type: [string, "null"]}
+      creators: {type: array}
+      export_available: {const: true}
+      citation_authority: {enum: [original, non-authoritative]}
+    additionalProperties: false
+  relay:
+    type: object
+    required: [retention_days, maximum_bytes]
+    properties:
+      retention_days: {const: 14}
+      maximum_bytes: {const: 52428800}
+    additionalProperties: false
+  artifact:
+    type: object
+    required: [id, request_id, owner, device_id, filename, media_type, sha256, size, state, created_at, expires_at]
+    properties:
+      schema_version: {const: 1}
+      id: {type: string, pattern: "^art-[a-f0-9]{24}$"}
+      request_id: {type: string, pattern: "^call-[a-f0-9]{24}$"}
+      owner: {const: example-owner}
+      device_id: {type: string}
+      filename: {type: string, minLength: 1, maxLength: 255}
+      media_type: {type: string}
+      sha256: {type: string, pattern: "^[a-f0-9]{64}$"}
+      size: {type: integer, minimum: 1, maximum: 52428800}
+      state: {const: active}
+      created_at: {type: string}
+      expires_at: {type: integer}
+    additionalProperties: false
+additionalProperties: false

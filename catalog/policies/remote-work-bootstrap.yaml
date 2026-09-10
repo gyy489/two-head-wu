@@ -1,0 +1,49 @@
+version: 1
+updated_at: "2026-09-10"
+id: remote-work-bootstrap
+purpose: "在没有通用远程 Shell 的前提下，初始化一个固定、仓库外绑定的远端运行区。"
+
+scope:
+  resource: edge-server
+  project: two-head-wu
+  allowed_operations: [fixed-ssh-reachability-probe, fixed-public-key-authentication-check, fixed-read-only-host-inspection, bootstrap-two-head-wu-runtime-root]
+  approval:
+    connectivity_probe: none
+    authentication_check: direct-owner-request
+    read_only_inspection: direct-owner-request
+    bootstrap: direct-owner-request-plus-approve-flag
+
+ssh:
+  target_secret_ref: "secret://remote-work-bootstrap/edge-server/ssh-target"
+  target_delivery: "operator-supplied-outside-this-repository"
+  authentication: public-key-only
+  host_key_policy: strict-existing-trust-only
+  password_authentication: forbidden
+  interactive_authentication: forbidden
+  arbitrary_target: forbidden
+  arbitrary_command: forbidden
+  credential_output: forbidden
+
+remote_runtime:
+  root: "/srv/two-head-wu"
+  system_identity: twoheadwu
+  system_identity_role: two-head-wu-remote-runtime
+  reusable_by: [component-registry, task-mailbox, result-mailbox, event-relay]
+  login_shell: forbidden
+  password_login: forbidden
+  sudo: forbidden
+  owns_registered_sites: false
+
+website_guard:
+  sites: [private-site, public-site]
+  required_before_mutation: true
+  required_after_mutation: true
+  content_change: forbidden
+  deployment_identity_reuse: forbidden
+  web_root_access: forbidden
+  server_configuration_change: forbidden
+
+audit:
+  root: "var/remote-work-bootstrap/receipts"
+  record: [request-id, operation, timestamp, site-guard-status, redacted-result]
+  forbidden: [ssh-target, secret-value, username, address, private-key, key-path, raw-ssh-output, raw-configuration]

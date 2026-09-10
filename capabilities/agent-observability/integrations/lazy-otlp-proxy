@@ -1,0 +1,35 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "optparse"
+require_relative "../lib/lazy_otlp_proxy"
+
+options = {}
+parser = OptionParser.new do |item|
+  item.on("--project-root PATH") { |value| options[:project_root] = value }
+  item.on("--data-root PATH") { |value| options[:data_root] = value }
+end
+parser.parse!(ARGV)
+raise OptionParser::MissingArgument, "--project-root" if options[:project_root].to_s.empty?
+raise OptionParser::MissingArgument, "--data-root" if options[:data_root].to_s.empty?
+
+observability = TwoHeadWu::AgentObservability.new(
+  project_root: options.fetch(:project_root),
+  data_root: options.fetch(:data_root)
+)
+begin
+  exit TwoHeadWu::LazyOtlpProxy.new(observability: observability).run
+rescue StandardError => error
+  observability.record_coverage_gap("proxy-start-failed")
+  diagnostic = Pathname.new(Dir.home).join("Library/Logs/TwoHeadWu/agent-observability-errors.jsonl")
+  FileUtils.mkdir_p(diagnostic.dirname, mode: 0o700)
+  File.open(diagnostic, File::WRONLY | File::APPEND | File::CREAT, 0o600) do |file|
+    file.puts(JSON.generate(
+      "timestamp" => Time.now.utc.iso8601,
+      "error_class" => error.class.name,
+      "message" => error.message.to_s[0, 500]
+    ))
+  end
+  FileUtils.chmod(0o600, diagnostic)
+  exit 1
+end

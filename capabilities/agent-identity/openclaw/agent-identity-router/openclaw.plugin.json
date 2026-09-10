@@ -1,0 +1,47 @@
+{
+  "id": "agent-identity-router",
+  "name": "Agent Identity Router",
+  "description": "Owner-only commands that switch the explicit Two-Headed-Wu identity route for the current channel session.",
+  "activation": {
+    "onStartup": true,
+    "onCommands": [
+      "owner-primary",
+      "owner-secondary",
+      "member-one",
+      "member-two",
+      "member-three"
+    ]
+  },
+  "commandAliases": [
+    {
+      "name": "owner-primary",
+      "kind": "runtime-slash",
+      "cliCommand": "owner-primary"
+    },
+    {
+      "name": "owner-secondary",
+      "kind": "runtime-slash",
+      "cliCommand": "owner-secondary"
+    },
+    {
+      "name": "member-one",
+      "kind": "runtime-slash",
+      "cliCommand": "member-one"
+    },
+    {
+      "name": "member-two",
+      "kind": "runtime-slash",
+      "cliCommand": "member-two"
+    },
+    {
+      "name": "member-three",
+      "kind": "runtime-slash",
+      "cliCommand": "member-three"
+    }
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

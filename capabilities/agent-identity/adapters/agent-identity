@@ -1,0 +1,3599 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "digest"
+require "json"
+require "open3"
+require "optparse"
+require "pathname"
+require "securerandom"
+require "time"
+
+require_relative "../lib/codex_quota_probe"
+require_relative "../lib/codex_session_observer"
+require_relative "../lib/codex_thread_lifecycle"
+require_relative "../lib/codex_thread_namer"
+require_relative "../lib/codex_turn_probe"
+
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = Encoding::UTF_8
+
+class AgentIdentityError < StandardError; end
+
+# A deliberately narrow local launcher. It records aliases and chooses an existing
+# Codex state root; it never reads, copies, archives, or parses credential material.
+class AgentIdentity
+  ALIAS_PATTERN = /\A[a-z][a-z0-9-]{0,62}\z/.freeze
+  PROJECT_PATTERN = /\A[a-z][a-z0-9-]{0,62}\z/.freeze
+  POOL_PATTERN = /\A[a-z][a-z0-9-]{0,62}\z/.freeze
+  CHANNEL_PATTERN = /\A[a-z][a-z0-9-]{0,62}\z/.freeze
+  SESSION_PATTERN = /\A[-A-Za-z0-9_:.@%]{1,256}\z/.freeze
+  MODES = %w[manual project-auto].freeze
+  STATE_KINDS = %w[default isolated].freeze
+  USAGE_SCOPES = %w[owner-local member-remote-work].freeze
+  SHARED_CONVERSATION_DIRS = %w[sessions archived_sessions attachments].freeze
+  SHARED_STATE_DATABASE = "state_5.sqlite"
+  SHARED_STATE_TABLES = %w[
+    thread_sections
+    projects
+    project_roots
+    threads
+    thread_dynamic_tools
+    thread_spawn_edges
+  ].freeze
+  DEFAULT_CONVERSATION_POOL = "main"
+  TERMINAL_SLOT_ENV = "TWO_HEAD_WU_TERMINAL_SLOT"
+  TERMINAL_ALIAS_ENV = "TWO_HEAD_WU_CODEX_ALIAS"
+  TERMINAL_INSTANCE_ENV = "TWO_HEAD_WU_TERMINAL_INSTANCE_ID"
+  PROJECT_TERMINAL_ID_ENV = "TWO_HEAD_WU_PROJECT_TERMINAL_ID"
+  PROJECT_ID_ENV = "TWO_HEAD_WU_PROJECT_ID"
+  TERMINAL_SLOT_MAX_LENGTH = 80
+  TERMINAL_CONTINUATION_LIMIT = 256
+  PROJECT_TERMINAL_LIMIT = 256
+  PROJECT_TERMINAL_STATES = %w[allocated recoverable restoring inactive blocked user-closed].freeze
+  THREAD_EXECUTION_LIMIT = 512
+  CONTINUATION_TASK_LIMIT = 512
+  CONTINUE_DELAY_SECONDS = 180
+  CONTINUE_MESSAGE_MAX_LENGTH = 10_000
+  CONTINUE_COMMAND_TIMEOUT_SECONDS = 14_400
+  UUID_PATTERN = /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i.freeze
+  LOCAL_TIME_ARGUMENT_PATTERN = /\A\d{1,2}:\d{2}\z/.freeze
+  THREAD_TITLE_CONFIG = 'tui.terminal_title=["thread"]'
+  NONINTERACTIVE_CODEX_COMMANDS = %w[
+    agents exec e review login logout mcp plugin mcp-server app-server remote-control app
+    completion update doctor sandbox debug apply queue archive delete migrate-rollouts
+    unarchive cloud exec-server features execpolicy responses-api-proxy stdio-to-uds a help
+  ].freeze
+  CODEX_GLOBAL_OPTIONS_WITH_VALUE = %w[
+    -c --config --enable --disable --remote --remote-auth-token-env -m --model
+    --local-provider -p --profile -s --sandbox -C --cd --add-dir -a --ask-for-approval
+  ].freeze
+  CODEX_GLOBAL_BOOLEAN_OPTIONS = %w[
+    --strict-config --oss --approve-for-me --not-so-yolo
+    --dangerously-bypass-approvals-and-sandbox --yolo
+    --dangerously-bypass-hook-trust --search --no-alt-screen
+  ].freeze
+  CODEX_GLOBAL_VARIADIC_OPTIONS = %w[-i --image].freeze
+  CODEX_TOP_LEVEL_INFORMATION_OPTIONS = %w[-h --help -V --version].freeze
+  OWNER_AUTO_MEMBERS = %w[owner-primary owner-secondary].freeze
+  OWNER_AUTO_CHANNELS = %w[remote-work openclaw-weixin].freeze
+
+  def initialize(arguments)
+    @arguments = arguments.dup
+    @root = Pathname.new(utf8_path(__dir__)).join("../../..").expand_path.cleanpath
+  end
+
+  def run
+    command = if File.basename($PROGRAM_NAME) == "codex-continue"
+                "continue-schedule"
+              else
+                @arguments.shift || "help"
+              end
+    case command
+    when "help", "--help", "-h" then help
+    when "init" then init
+    when "register-current" then register_current
+    when "add" then add
+    when "add-member" then add_member
+    when "set-mode" then set_mode
+    when "bind" then bind
+    when "unbind" then unbind
+    when "select" then select
+    when "pool-create" then pool_create
+    when "pool-attach" then pool_attach
+    when "pool-status" then pool_status
+    when "pool-state" then pool_state
+    when "route-command" then route_command
+    when "route-set" then route_set
+    when "route-select" then route_select
+    when "route-status" then route_status
+    when "owner-auto" then owner_auto
+    when "terminal-session" then terminal_session
+    when "project-terminal" then project_terminal
+    when "thread-lifecycle" then thread_lifecycle
+    when "status" then status
+    when "home" then home
+    when "member-home" then member_home
+    when "continue-schedule" then continue_schedule
+    when "continue-run" then continue_run
+    when "login" then login
+    when "make-default" then make_default
+    when "remove" then remove
+    when "launch" then launch
+    else raise AgentIdentityError, "unknown command: #{command}"
+    end
+  rescue OptionParser::ParseError
+    warn "Error: invalid command options"
+    2
+  rescue AgentIdentityError, CodexThreadLifecycleError, CodexTurnProbeError, JSON::ParserError, Errno::EACCES, Errno::ENOENT => error
+    warn "Error: #{error.message}"
+    2
+  end
+
+  private
+
+  def help
+    puts <<~HELP
+      Usage: agent-identity COMMAND [OPTIONS]
+
+      Commands:
+        init
+        register-current --alias NAME [--mode manual|project-auto] [--pool NAME | --no-pool]
+        add --alias NAME [--mode manual|project-auto] [--pool NAME | --no-pool]
+        add-member --alias NAME
+        set-mode --alias NAME --mode manual|project-auto
+        bind --project PROJECT_ID --alias NAME
+        unbind --project PROJECT_ID
+        select --project PROJECT_ID [--json]
+        pool-create --pool NAME
+        pool-attach --pool NAME --alias NAME
+        pool-status [--json]
+        pool-state status --pool NAME [--json]
+        pool-state enable --pool NAME [--base-alias NAME] [--yes] [--json]
+        route-command --channel CHANNEL --session SESSION --text TEXT [--json]
+        route-set --channel CHANNEL --session SESSION --alias NAME [--json]
+        route-select --channel CHANNEL --session SESSION [--json]
+        route-status [--json]
+        owner-auto enable|disable|status [--json]
+        terminal-session status [--slot NAME] [--json]
+        terminal-session forget --slot NAME [--json]
+        terminal-session hook
+        project-terminal allocate --project PROJECT_ID --cwd DIR [--json]
+        project-terminal adopt --project PROJECT_ID --thread UUID --alias NAME --cwd DIR [--json]
+        project-terminal list --project PROJECT_ID [--json]
+        project-terminal status --terminal UUID [--json]
+        project-terminal start --terminal UUID --alias NAME
+        project-terminal restore --terminal UUID
+        project-terminal close --terminal UUID --reason user|extension [--json]
+        thread-lifecycle inspect [--thread UUID ...] [--existence-only] [--json]
+        status [--json]
+        home --alias NAME [--json]
+        member-home --alias NAME [--json]
+        continue-schedule [HH:MM] [MESSAGE] [--until-complete] [--dry-run] [--json]
+        continue-run --fallback-alias NAME --pool NAME_OR_NONE --thread UUID --cwd DIR --message TEXT --codex-bin PATH [--until-complete] [--json]
+        login --alias NAME [--dry-run]
+        make-default --alias NAME [--yes] [--json]
+        remove --alias NAME [--yes] [--json]
+        launch (--alias NAME | --project PROJECT_ID) [--fresh | --resume] [--dry-run] [-- CODEX_ARGUMENTS...]
+
+      The registry stores aliases and policy only. It never imports or reads credentials.
+      register-current and add attach the new identity to the "#{DEFAULT_CONVERSATION_POOL}"
+      conversation pool by default; pass --no-pool to keep it unpooled or --pool NAME to use a
+      different pool instead.
+    HELP
+    0
+  end
+
+  def thread_lifecycle
+    action = @arguments.shift || "inspect"
+    raise AgentIdentityError, "unknown thread-lifecycle action: #{action}" unless action == "inspect"
+
+    options = { threads: [], json: false, existence_only: false }
+    parser = OptionParser.new do |item|
+      item.on("--thread UUID") { |value| options.fetch(:threads) << value }
+      item.on("--existence-only") { options[:existence_only] = true }
+      item.on("--json") { options[:json] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+
+    payload = CodexThreadLifecycle.new(environment: ENV).inspect_threads(
+      thread_ids: options.fetch(:threads),
+      include_session_metadata: !options.fetch(:existence_only)
+    )
+    emit(payload, json: options.fetch(:json))
+    0
+  end
+
+  def init
+    ensure_private_root!
+    write_state(default_state) unless state_path.exist?
+    emit("result" => "initialized", "private_registry" => "ready")
+    0
+  end
+
+  def register_current
+    options = parse_alias_and_mode!
+    state = load_state
+    alias_name = options.fetch(:alias)
+    raise AgentIdentityError, "identity already exists: #{alias_name}" if state.fetch("identities").key?(alias_name)
+    raise AgentIdentityError, "the current default Codex environment is already registered" if state.fetch("identities").values.any? { |item| item.fetch("state_kind") == "default" }
+    raise AgentIdentityError, "the default Codex environment is unavailable" unless default_codex_home.directory?
+
+    identity = identity_record(alias_name, "default", options.fetch(:mode))
+    state.fetch("identities")[alias_name] = identity
+    pool_name = options.fetch(:pool)
+    attach_to_pool!(state, identity, pool_name) if pool_name
+    write_state(state)
+    emit("result" => "registered-current", "identity" => alias_name, "state_kind" => "default", "mode" => options.fetch(:mode), "conversation_pool" => pool_name || "none")
+    0
+  end
+
+  def add
+    options = parse_alias_and_mode!
+    state = load_state
+    alias_name = options.fetch(:alias)
+    raise AgentIdentityError, "identity already exists: #{alias_name}" if state.fetch("identities").key?(alias_name)
+
+    identity = identity_record(alias_name, "isolated", options.fetch(:mode))
+    state.fetch("identities")[alias_name] = identity
+    ensure_isolated_home!(alias_name)
+    shared_skills = attach_shared_skills!(alias_name)
+    pool_name = options.fetch(:pool)
+    attach_to_pool!(state, identity, pool_name) if pool_name
+    write_state(state)
+    emit("result" => "added", "identity" => alias_name, "state_kind" => "isolated", "mode" => options.fetch(:mode), "shared_skills" => shared_skills, "conversation_pool" => pool_name || "none", "next" => "run login --alias #{alias_name}")
+    0
+  end
+
+  def add_member
+    options = parse_alias!(allow_json: true)
+    state = load_state
+    alias_name = validate_alias!(options.fetch(:alias))
+    if OWNER_AUTO_MEMBERS.include?(alias_name) && !dedicated_air_worker_registry?
+      raise AgentIdentityError, "owner automatic aliases are reserved outside the dedicated Air Worker registry"
+    end
+    raise AgentIdentityError, "identity already exists: #{alias_name}" if state.fetch("identities").key?(alias_name)
+
+    identity = identity_record(alias_name, "isolated", "manual", usage_scope: "member-remote-work")
+    state.fetch("identities")[alias_name] = identity
+    ensure_isolated_home!(alias_name)
+    write_state(state)
+    emit({
+      "result" => "member-added",
+      "identity" => alias_name,
+      "state_kind" => "isolated",
+      "mode" => "manual",
+      "usage_scope" => "member-remote-work",
+      "shared_skills" => "none",
+      "conversation_pool" => "none",
+      "next" => "run login --alias #{alias_name}"
+    }, json: options.fetch(:json))
+    0
+  end
+
+  def set_mode
+    options = {}
+    parser = OptionParser.new do |item|
+      item.on("--alias NAME") { |value| options[:alias] = value }
+      item.on("--mode MODE") { |value| options[:mode] = value }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    alias_name = validate_alias!(options.fetch(:alias) { raise AgentIdentityError, "--alias is required" })
+    mode = validate_mode!(options.fetch(:mode) { raise AgentIdentityError, "--mode is required" })
+    state = load_state
+    identity = fetch_identity!(state, alias_name)
+    ensure_owner_local!(identity, "change selection mode")
+    identity["selection_mode"] = mode
+    write_state(state)
+    emit("result" => "mode-updated", "identity" => alias_name, "mode" => mode)
+    0
+  end
+
+  def bind
+    options = parse_project_and_alias!
+    state = load_state
+    project_id = validate_project!(options.fetch(:project))
+    alias_name = validate_alias!(options.fetch(:alias))
+    identity = fetch_identity!(state, alias_name)
+    ensure_owner_local!(identity, "bind a project")
+    unless identity.fetch("selection_mode") == "project-auto"
+      raise AgentIdentityError, "identity #{alias_name} is manual; run set-mode --alias #{alias_name} --mode project-auto first"
+    end
+
+    state.fetch("project_bindings")[project_id] = alias_name
+    write_state(state)
+    emit("result" => "bound", "project" => project_id, "identity" => alias_name)
+    0
+  end
+
+  def unbind
+    options = parse_project!
+    state = load_state
+    project_id = validate_project!(options.fetch(:project))
+    raise AgentIdentityError, "project is not bound: #{project_id}" unless state.fetch("project_bindings").delete(project_id)
+
+    write_state(state)
+    emit("result" => "unbound", "project" => project_id)
+    0
+  end
+
+  def select
+    options = parse_project!(allow_json: true)
+    state = load_state
+    project_id = validate_project!(options.fetch(:project))
+    alias_name = selected_project_identity!(state, project_id)
+    emit({ "result" => "selected", "project" => project_id, "identity" => alias_name }, json: options.fetch(:json))
+    0
+  end
+
+  def pool_create
+    options = parse_pool!
+    state = load_state
+    pool_name = validate_pool!(options.fetch(:pool))
+    ensure_pool_root!(pool_name)
+    state.fetch("conversation_pools")[pool_name] ||= { "id" => pool_name, "created_at" => Time.now.utc.iso8601, "identities" => [] }
+    write_state(state)
+    emit("result" => "pool-created", "pool" => pool_name, "shared_dirs" => SHARED_CONVERSATION_DIRS.join(","))
+    0
+  end
+
+  def pool_attach
+    options = parse_pool_and_alias!
+    state = load_state
+    pool_name = validate_pool!(options.fetch(:pool))
+    alias_name = validate_alias!(options.fetch(:alias))
+    identity = fetch_identity!(state, alias_name)
+    attach_to_pool!(state, identity, pool_name)
+    write_state(state)
+    emit("result" => "pool-attached", "pool" => pool_name, "identity" => alias_name, "shared_dirs" => SHARED_CONVERSATION_DIRS.join(","))
+    0
+  end
+
+  # Shared by the explicit pool-attach command and by register-current/add's
+  # default-pool behavior. Mutates identity/state in place; caller writes state.
+  def attach_to_pool!(state, identity, pool_name)
+    ensure_owner_local!(identity, "join a conversation pool")
+    pool = state.fetch("conversation_pools")[pool_name] ||= { "id" => pool_name, "created_at" => Time.now.utc.iso8601, "identities" => [] }
+    preflight_shared_state_attachment!(identity, pool_name, pool)
+    ensure_pool_root!(pool_name)
+    attach_conversation_pool!(identity, pool_name)
+    attach_shared_state!(identity, pool_name) if shared_state_enabled?(pool)
+    pool.fetch("identities") << identity.fetch("id") unless pool.fetch("identities").include?(identity.fetch("id"))
+    identity["conversation_pool"] = pool_name
+  end
+
+  def pool_status
+    json = parse_json_flag!
+    state = load_state
+    pools = state.fetch("conversation_pools").values.sort_by { |item| item.fetch("id") }.map do |item|
+      pool_name = item.fetch("id")
+      {
+        "id" => pool_name,
+        "configured" => pool_root(pool_name).directory?,
+        "identities" => Array(item["identities"]).sort,
+        "shared_dirs" => SHARED_CONVERSATION_DIRS,
+        "shared_state" => public_shared_state(state, item, pool_name)
+      }
+    end
+    emit({ "result" => "pool-status", "pools" => pools }, json: json)
+    0
+  end
+
+  def pool_state
+    command = @arguments.shift || "status"
+    case command
+    when "status"
+      options = parse_pool_state_status!
+      state = load_state
+      pool_name = validate_pool!(options.fetch(:pool))
+      pool = state.fetch("conversation_pools")[pool_name]
+      raise AgentIdentityError, "unknown conversation pool: #{pool_name}" unless pool
+
+      emit(shared_state_status_payload(state, pool_name, pool), json: options.fetch(:json))
+      0
+    when "enable"
+      options = parse_pool_state_enable!
+      state = load_state
+      pool_name = validate_pool!(options.fetch(:pool))
+      pool = state.fetch("conversation_pools")[pool_name]
+      raise AgentIdentityError, "unknown conversation pool: #{pool_name}" unless pool
+
+      payload = shared_state_enable_payload(state, pool_name, pool, options[:base_alias])
+      unless options.fetch(:yes)
+        emit(payload.merge("result" => "pool-state-enable-preview"), json: options.fetch(:json))
+        return 0
+      end
+      blockers = payload.fetch("blockers")
+      raise AgentIdentityError, "shared state migration is blocked: #{blockers.join('; ')}" unless blockers.empty?
+
+      result = enable_shared_state!(state, pool_name, pool, payload.fetch("base_alias"))
+      emit(result, json: options.fetch(:json))
+      0
+    else
+      raise AgentIdentityError, "pool-state command must be status or enable"
+    end
+  end
+
+  def route_command
+    options = parse_route_command!
+    state = load_state
+    channel = validate_channel!(options.fetch(:channel))
+    session = validate_session!(options.fetch(:session))
+    text = options.fetch(:text).strip
+    command = text.split(/\s+/, 2).first || ""
+    alias_name = command.start_with?("/") ? command.delete_prefix("/") : command
+    if command == "/codex"
+      alias_name = text.split(/\s+/, 2).last.to_s if command == "/codex"
+    end
+    alias_name = validate_alias!(alias_name)
+    identity = fetch_identity!(state, alias_name)
+    ensure_owner_local!(identity, "receive a channel route")
+    set_route!(state, channel, session, alias_name)
+    write_state(state)
+    emit({ "result" => "route-updated", "channel" => channel, "session" => session, "identity" => alias_name }, json: options.fetch(:json))
+    0
+  end
+
+  def route_set
+    options = parse_route_and_alias!
+    state = load_state
+    channel = validate_channel!(options.fetch(:channel))
+    session = validate_session!(options.fetch(:session))
+    alias_name = validate_alias!(options.fetch(:alias))
+    identity = fetch_identity!(state, alias_name)
+    ensure_owner_local!(identity, "receive a channel route")
+    set_route!(state, channel, session, alias_name)
+    write_state(state)
+    emit({ "result" => "route-updated", "channel" => channel, "session" => session, "identity" => alias_name }, json: options.fetch(:json))
+    0
+  end
+
+  def route_select
+    options = parse_route!(allow_json: true)
+    state = load_state
+    channel = validate_channel!(options.fetch(:channel))
+    session = validate_session!(options.fetch(:session))
+    route = selected_route_identity(state, channel, session)
+    preferred = route ? route.fetch("identity") : nil
+    selection = select_route_identity(state, channel, preferred)
+    alias_name = selection.fetch("identity")
+    identity = fetch_identity!(state, alias_name)
+    emit({
+      "result" => "route-selected",
+      "channel" => channel,
+      "session" => session,
+      "canonical_session" => normalize_route_session(channel, session),
+      "identity" => alias_name,
+      "state_kind" => identity.fetch("state_kind"),
+      "source" => selection.fetch("source"),
+      "selection_reason" => selection["selection_reason"],
+      "quota_probe" => selection["quota_probe"],
+      "matched_session" => route&.fetch("matched_session", nil)
+    }.compact, json: options.fetch(:json))
+    0
+  end
+
+  def owner_auto
+    command = @arguments.shift || "status"
+    json = parse_json_flag!
+    state = load_state
+    case command
+    when "enable"
+      missing = OWNER_AUTO_MEMBERS.reject { |alias_name| state.fetch("identities").key?(alias_name) }
+      raise AgentIdentityError, "owner automatic identities are not registered: #{missing.join(', ')}" unless missing.empty?
+      state["owner_auto"] = {
+        "enabled" => true,
+        "members" => OWNER_AUTO_MEMBERS,
+        "channels" => OWNER_AUTO_CHANNELS,
+        "updated_at" => Time.now.utc.iso8601
+      }
+      write_state(state)
+    when "disable"
+      state["owner_auto"] = default_owner_auto.merge("updated_at" => Time.now.utc.iso8601)
+      write_state(state)
+    when "status"
+      # Read-only.
+    else
+      raise AgentIdentityError, "owner-auto command must be enable, disable, or status"
+    end
+    emit({ "result" => "owner-auto-#{command}", "owner_auto" => public_owner_auto(state) }, json: json)
+    0
+  end
+
+  def route_status
+    json = parse_json_flag!
+    state = load_state
+    emit({ "result" => "route-status", "channel_routes" => state.fetch("channel_routes").sort.to_h }, json: json)
+    0
+  end
+
+  def terminal_session
+    command = @arguments.shift || "status"
+    case command
+    when "status"
+      terminal_session_status
+    when "forget"
+      terminal_session_forget
+    when "hook"
+      terminal_session_hook
+    else
+      raise AgentIdentityError, "terminal-session command must be status, forget, or hook"
+    end
+  end
+
+  def terminal_session_status
+    options = parse_terminal_slot!(required: false, allow_json: true)
+    registry = read_terminal_session_registry
+    if options[:slot]
+      slot = validate_terminal_slot!(options.fetch(:slot))
+      binding = registry.fetch("slots")[slot]
+      emit({
+        "result" => "terminal-session-status",
+        "slot" => slot,
+        "bound" => !binding.nil?,
+        "binding" => binding
+      }, json: options.fetch(:json))
+    else
+      slots = registry.fetch("slots").sort.map do |slot, binding|
+        binding.merge("slot" => slot)
+      end
+      emit({ "result" => "terminal-session-status", "slots" => slots }, json: options.fetch(:json))
+    end
+    0
+  end
+
+  def terminal_session_forget
+    options = parse_terminal_slot!(required: true, allow_json: true)
+    slot = validate_terminal_slot!(options.fetch(:slot))
+    removed = false
+    with_terminal_session_registry(write: true) do |registry|
+      removed = !registry.fetch("slots").delete(slot).nil?
+    end
+    emit({ "result" => "terminal-session-forgotten", "slot" => slot, "removed" => removed }, json: options.fetch(:json))
+    0
+  end
+
+  # Internal Codex SessionStart hook. It deliberately emits no stdout because
+  # hook stdout becomes model-visible developer context.
+  def terminal_session_hook
+    ensure_no_arguments!
+    slot_raw = ENV[TERMINAL_SLOT_ENV]
+    alias_raw = ENV[TERMINAL_ALIAS_ENV]
+    return 0 if slot_raw.to_s.empty? || alias_raw.to_s.empty?
+
+    payload = JSON.parse($stdin.read)
+    return 0 unless payload["hook_event_name"] == "SessionStart"
+
+    slot = validate_terminal_slot!(slot_raw)
+    alias_name = validate_alias!(alias_raw)
+    session_id = validate_session!(payload.fetch("session_id"))
+    state = load_state
+    identity = fetch_identity!(state, alias_name)
+    record_terminal_session!(slot, session_id, alias_name)
+    CodexThreadNamer.new(environment: environment_for(identity)).call(thread_id: session_id, name: slot)
+    0
+  end
+
+  def project_terminal
+    command = @arguments.shift || "list"
+    case command
+    when "allocate" then project_terminal_allocate
+    when "adopt" then project_terminal_adopt
+    when "list" then project_terminal_list
+    when "status" then project_terminal_status
+    when "start" then project_terminal_start
+    when "restore" then project_terminal_restore
+    when "close" then project_terminal_close
+    else
+      raise AgentIdentityError, "project-terminal command must be allocate, adopt, list, status, start, restore, or close"
+    end
+  end
+
+  def project_terminal_allocate
+    options = parse_project_terminal_project_and_cwd!
+    state = load_state
+    project_id = validate_project!(options.fetch(:project))
+    selected_project_identity!(state, project_id)
+    cwd = validate_project_terminal_cwd!(options.fetch(:cwd))
+    terminal_id = SecureRandom.uuid
+    now = Time.now.utc.iso8601
+    entry = {
+      "id" => terminal_id,
+      "project" => project_id,
+      "session_id" => nil,
+      "identity" => nil,
+      "conversation_pool" => nil,
+      "cwd" => cwd,
+      "status" => "allocated",
+      "created_at" => now,
+      "updated_at" => now,
+      "last_exit_code" => nil
+    }
+    with_project_terminal_registry(write: true) do |registry|
+      registry.fetch("terminals")[terminal_id] = entry
+      prune_project_terminals!(registry)
+    end
+    emit(project_terminal_payload(state, entry).merge("result" => "project-terminal-allocated"), json: options.fetch(:json))
+    0
+  end
+
+  def project_terminal_adopt
+    options = { json: false }
+    parser = OptionParser.new do |item|
+      item.on("--project PROJECT_ID") { |value| options[:project] = value }
+      item.on("--thread UUID") { |value| options[:thread] = value }
+      item.on("--alias NAME") { |value| options[:alias] = value }
+      item.on("--cwd DIR") { |value| options[:cwd] = value }
+      item.on("--json") { options[:json] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    state = load_state
+    project_id = validate_project!(options.fetch(:project) { raise AgentIdentityError, "--project is required" })
+    selected_project_identity!(state, project_id)
+    alias_name = validate_alias!(options.fetch(:alias) { raise AgentIdentityError, "--alias is required" })
+    identity = fetch_identity!(state, alias_name)
+    ensure_owner_local!(identity, "adopt a project terminal")
+    thread_id = validate_uuid!(options.fetch(:thread) { raise AgentIdentityError, "--thread is required" })
+    metadata = project_terminal_thread_metadata!(identity, thread_id)
+    cwd = validate_project_terminal_cwd!(options.fetch(:cwd) { raise AgentIdentityError, "--cwd is required" })
+    terminal_id = SecureRandom.uuid
+    now = Time.now.utc.iso8601
+    entry = {
+      "id" => terminal_id,
+      "project" => project_id,
+      "session_id" => thread_id,
+      "identity" => alias_name,
+      "conversation_pool" => identity["conversation_pool"],
+      "cwd" => cwd,
+      "status" => "recoverable",
+      "created_at" => now,
+      "updated_at" => now,
+      "last_exit_code" => nil
+    }
+    with_project_terminal_registry(write: true) do |registry|
+      registry.fetch("terminals")[terminal_id] = entry
+      prune_project_terminals!(registry)
+    end
+    emit(project_terminal_payload(state, entry, metadata: metadata).merge("result" => "project-terminal-adopted"), json: options.fetch(:json))
+    0
+  end
+
+  def project_terminal_list
+    options = { json: false }
+    parser = OptionParser.new do |item|
+      item.on("--project PROJECT_ID") { |value| options[:project] = value }
+      item.on("--json") { options[:json] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    state = load_state
+    project_id = validate_project!(options.fetch(:project) { raise AgentIdentityError, "--project is required" })
+    selected_project_identity!(state, project_id)
+    entries = read_project_terminal_registry.fetch("terminals").values
+             .select { |entry| entry.fetch("project") == project_id }
+             .sort_by { |entry| [entry.fetch("created_at"), entry.fetch("id")] }
+    public_entries = entries.map { |entry| project_terminal_payload(state, entry) }
+    restore = public_entries.select { |entry| entry.fetch("auto_restore") }
+    emit({
+      "result" => "project-terminal-list",
+      "project" => project_id,
+      "terminals" => public_entries,
+      "restore" => restore
+    }, json: options.fetch(:json))
+    0
+  end
+
+  def project_terminal_status
+    options = parse_project_terminal_id!(allow_json: true)
+    state = load_state
+    entry = fetch_project_terminal!(options.fetch(:terminal))
+    emit(project_terminal_payload(state, entry).merge("result" => "project-terminal-status"), json: options.fetch(:json))
+    0
+  end
+
+  def project_terminal_start
+    options = parse_project_terminal_id_and_alias!
+    state = load_state
+    entry = fetch_project_terminal!(options.fetch(:terminal))
+    status = entry.fetch("status")
+    if %w[inactive blocked user-closed].include?(status)
+      return enter_project_terminal_shell(entry, 0)
+    end
+    if %w[recoverable restoring].include?(status)
+      alias_name = validate_alias!(entry.fetch("identity"))
+      thread_id = validate_uuid!(entry.fetch("session_id"))
+      identity = fetch_identity!(state, alias_name)
+      project_terminal_thread_metadata!(identity, thread_id)
+      arguments = ["resume", thread_id]
+      expected_thread_id = thread_id
+    elsif status == "allocated"
+      alias_name = validate_alias!(options.fetch(:alias))
+      arguments = []
+      expected_thread_id = nil
+    else
+      raise AgentIdentityError, "project terminal is not ready to start: #{status}"
+    end
+    exit_code, signaled = run_project_terminal_session(state, entry, alias_name, arguments, expected_thread_id: expected_thread_id)
+    return exit_code if signaled
+
+    enter_project_terminal_shell(entry, exit_code)
+  end
+
+  def project_terminal_restore
+    options = parse_project_terminal_id!(allow_json: false)
+    state = load_state
+    entry = fetch_project_terminal!(options.fetch(:terminal))
+    unless %w[recoverable restoring].include?(entry.fetch("status"))
+      raise AgentIdentityError, "project terminal is not recoverable: #{entry.fetch('status')}"
+    end
+    alias_name = validate_alias!(entry.fetch("identity"))
+    thread_id = validate_uuid!(entry.fetch("session_id"))
+    identity = fetch_identity!(state, alias_name)
+    project_terminal_thread_metadata!(identity, thread_id)
+    exit_code, signaled = run_project_terminal_session(
+      state,
+      entry,
+      alias_name,
+      ["resume", thread_id],
+      expected_thread_id: thread_id
+    )
+    return exit_code if signaled
+
+    enter_project_terminal_shell(entry, exit_code)
+  end
+
+  def project_terminal_close
+    options = { json: false }
+    parser = OptionParser.new do |item|
+      item.on("--terminal UUID") { |value| options[:terminal] = value }
+      item.on("--reason REASON") { |value| options[:reason] = value }
+      item.on("--json") { options[:json] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    terminal_id = validate_uuid!(options.fetch(:terminal) { raise AgentIdentityError, "--terminal is required" })
+    reason = options.fetch(:reason) { raise AgentIdentityError, "--reason is required" }
+    raise AgentIdentityError, "project terminal close reason must be user or extension" unless %w[user extension].include?(reason)
+
+    entry = nil
+    with_project_terminal_registry(write: true) do |registry|
+      entry = registry.fetch("terminals")[terminal_id]
+      raise AgentIdentityError, "unknown project terminal: #{terminal_id}" unless entry
+
+      entry["status"] = "user-closed"
+      entry["updated_at"] = Time.now.utc.iso8601
+      entry["last_exit_code"] = nil
+    end
+    emit({
+      "result" => "project-terminal-closed",
+      "terminal" => terminal_id,
+      "project" => entry.fetch("project"),
+      "reason" => reason,
+      "status" => entry.fetch("status")
+    }, json: options.fetch(:json))
+    0
+  end
+
+  def status
+    json = parse_json_flag!
+    state = load_state
+    identities = state.fetch("identities").values.sort_by { |item| item.fetch("id") }.map do |item|
+      {
+        "id" => item.fetch("id"),
+        "state_kind" => item.fetch("state_kind"),
+        "selection_mode" => item.fetch("selection_mode"),
+        "configured" => item.fetch("state_kind") == "default" ? default_codex_home.directory? : isolated_home(item.fetch("id")).directory?,
+        "shared_skills" => item.fetch("state_kind") == "default" ? "managed-by-default" : shared_skills_status(item.fetch("id")),
+        "conversation_pool" => item["conversation_pool"],
+        "usage_scope" => item.fetch("usage_scope", "owner-local")
+      }
+    end
+    emit({
+      "result" => "status",
+      "identities" => identities,
+      "project_bindings" => state.fetch("project_bindings").sort.to_h,
+      "owner_auto" => public_owner_auto(state)
+    }, json: json)
+    0
+  end
+
+  def home
+    options = parse_alias!(allow_json: true)
+    state = load_state
+    alias_name = validate_alias!(options.fetch(:alias))
+    identity = fetch_identity!(state, alias_name)
+    home = codex_home_for(identity)
+    emit({ "result" => "home", "identity" => alias_name, "state_kind" => identity.fetch("state_kind"), "codex_home" => home.to_s }, json: options.fetch(:json))
+    0
+  end
+
+  def member_home
+    options = parse_alias!(allow_json: true)
+    state = load_state
+    alias_name = validate_alias!(options.fetch(:alias))
+    identity = fetch_identity!(state, alias_name)
+    unless identity.fetch("usage_scope", "owner-local") == "member-remote-work" &&
+           identity.fetch("state_kind") == "isolated" &&
+           identity.fetch("selection_mode") == "manual" &&
+           !identity.key?("conversation_pool")
+      raise AgentIdentityError, "identity is not an isolated member remote-work identity"
+    end
+    home = codex_home_for(identity)
+    raise AgentIdentityError, "member Codex home is unavailable" unless home.directory?
+    emit({
+      "result" => "member-home",
+      "identity" => alias_name,
+      "usage_scope" => "member-remote-work",
+      "codex_home" => home.to_s
+    }, json: options.fetch(:json))
+    0
+  end
+
+  def continue_schedule
+    options = { json: false, dry_run: false, until_complete: false }
+    parser = OptionParser.new do |item|
+      item.banner = "Usage: codex-continue [HH:MM] [MESSAGE] [--message TEXT] [--until-complete] [--complete] [--dry-run] [--json]"
+      item.on("--at WHEN") { |value| options[:at] = value }
+      item.on("--message TEXT") { |value| options[:message] = value }
+      item.on("--until-complete") { options[:until_complete] = true }
+      item.on("--complete") { options[:complete] = true }
+      item.on("--dry-run") { options[:dry_run] = true }
+      item.on("--json") { options[:json] = true }
+      item.on("-h", "--help") do
+        puts item
+        return 0
+      end
+    end
+    parser.parse!(@arguments)
+    if options[:complete]
+      ensure_no_arguments!
+      if options[:at] || options[:message] || options[:until_complete] || options[:dry_run]
+        raise AgentIdentityError, "--complete cannot be combined with scheduling options"
+      end
+      thread_id = validate_uuid!(ENV.fetch("CODEX_THREAD_ID") { raise AgentIdentityError, "CODEX_THREAD_ID is unavailable; run !codex-continue --complete from the target Codex TUI" })
+      changed = complete_continuation_task!(thread_id)
+      emit({ "result" => changed ? "continue-marked-complete" : "continue-no-active-task", "task_scope" => "thread", "thread" => thread_id, "changed" => changed, "completion_command" => "!codex-continue --complete" }, json: options.fetch(:json))
+      return 0
+    end
+    unless @arguments.empty?
+      first = @arguments.shift
+      if options[:at]
+        options[:message] ||= first
+      elsif LOCAL_TIME_ARGUMENT_PATTERN.match?(first)
+        options[:at] = first
+        options[:message] ||= @arguments.shift unless @arguments.empty?
+      elsif options[:message]
+        raise AgentIdentityError, "unexpected arguments: #{([first] + @arguments).join(' ')}"
+      else
+        # Natural shorthand: a non-time positional argument replaces the
+        # default message while retaining quota-reset scheduling.
+        options[:message] = first
+      end
+    end
+    ensure_no_arguments!
+    if options.fetch(:until_complete) && options[:at]
+      raise AgentIdentityError, "--until-complete is only available for quota-reset insurance and cannot be combined with an explicit time"
+    end
+
+    state = load_state
+    identity = current_identity!(state)
+    alias_name = identity.fetch("id")
+    conversation_pool = identity["conversation_pool"]
+    thread_id = validate_uuid!(ENV.fetch("CODEX_THREAD_ID") { raise AgentIdentityError, "CODEX_THREAD_ID is unavailable; run codex-continue from the target Codex TUI with !codex-continue" })
+    cwd = Pathname.new(utf8_path(Dir.pwd)).expand_path.cleanpath
+    raise AgentIdentityError, "current working directory is unavailable: #{cwd}" unless cwd.directory?
+
+    message = validate_continue_message!(options[:message] || "继续")
+    now = continuation_clock_now
+    codex_bin = resolve_executable!(ENV["TWO_HEAD_WU_CODEX_BIN"] || "codex", "Codex")
+    source = options[:at] ? "local-time" : "quota-insurance"
+    turn_guard = nil
+    run_at = if options[:at]
+               next_local_clock_time(options.fetch(:at), now)
+             else
+               probe_environment = environment_for(identity)
+               turn_guard = continuation_turn_marker!(
+                 environment: probe_environment,
+                 codex_bin: codex_bin,
+                 thread_id: thread_id
+               )
+               if options.fetch(:until_complete) && turn_guard.fetch("status") == "none"
+                 raise AgentIdentityError, "--until-complete requires a persisted current Codex turn"
+               end
+               continuation_run_at!(
+                 environment: probe_environment,
+                 codex_bin: codex_bin,
+                 now: now
+               )
+             end
+    openclaw_bin = resolve_openclaw_executable!
+    payload = {
+      "result" => options.fetch(:dry_run) ? "continue-schedule-preview" : "continue-scheduled",
+      "task_scope" => "thread",
+      "identity" => alias_name,
+      "identity_role" => "execution-fallback",
+      "thread" => thread_id,
+      "cwd" => cwd.to_s,
+      "source" => source,
+      "run_at" => run_at.iso8601,
+      "message_length" => message.length
+    }
+    payload["mode"] = "until-complete" if options.fetch(:until_complete)
+    if turn_guard
+      payload["condition"] = options.fetch(:until_complete) ? "continue-until-thread-task-completes" : "continue-if-thread-task-remains-incomplete"
+      payload["guard_turn"] = turn_guard.fetch("id")
+    end
+    if options.fetch(:dry_run)
+      payload["completion_command"] = "!codex-continue --complete" if turn_guard
+      emit(payload, json: options.fetch(:json))
+      return 0
+    end
+
+    record_thread_execution!(thread_id, alias_name, conversation_pool)
+    task_id = if turn_guard
+                begin_continuation_task!(thread_id, options.fetch(:until_complete) ? "until-complete" : "one-shot")
+              end
+    delivery_message = if task_id
+                         "#{message}\n\n当前会话的整个任务真实完成后，请运行本地命令 !codex-continue --complete；未完成时不要运行。"
+                       else
+                         message
+                       end
+    validate_continue_message!(delivery_message)
+    payload["task_id"] = task_id if task_id
+    payload["completion_command"] = "!codex-continue --complete" if task_id
+    job_id = register_continuation_cron!(
+      openclaw_bin: openclaw_bin,
+      alias_name: alias_name,
+      conversation_pool: conversation_pool,
+      thread_id: thread_id,
+      cwd: cwd,
+      message: delivery_message,
+      codex_bin: codex_bin,
+      run_at: run_at,
+      turn_guard: turn_guard,
+      until_complete: options.fetch(:until_complete),
+      task_id: task_id
+    )
+    payload["job_id"] = job_id if job_id
+    emit(payload, json: options.fetch(:json))
+    0
+  rescue JSON::ParserError
+    raise AgentIdentityError, "OpenClaw returned invalid JSON while registering the continuation task"
+  end
+
+  # Internal command stored as an exact argv payload in OpenClaw cron.
+  def continue_run
+    options = { json: false, until_complete: false }
+    parser = OptionParser.new do |item|
+      item.on("--alias NAME") { |value| options[:alias] = value }
+      item.on("--fallback-alias NAME") { |value| options[:alias] = value }
+      item.on("--pool NAME_OR_NONE") { |value| options[:pool] = value }
+      item.on("--thread UUID") { |value| options[:thread] = value }
+      item.on("--cwd DIR") { |value| options[:cwd] = value }
+      item.on("--message TEXT") { |value| options[:message] = value }
+      item.on("--codex-bin PATH") { |value| options[:codex_bin] = value }
+      item.on("--guard-turn UUID_OR_NONE") { |value| options[:guard_turn] = value }
+      item.on("--guard-status STATUS") { |value| options[:guard_status] = value }
+      item.on("--task UUID") { |value| options[:task] = value }
+      item.on("--until-complete") { options[:until_complete] = true }
+      item.on("--json") { options[:json] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+
+    state = load_state
+    fallback_alias = validate_alias!(options.fetch(:alias) { raise AgentIdentityError, "--alias is required" })
+    thread_id = validate_uuid!(options.fetch(:thread) { raise AgentIdentityError, "--thread is required" })
+    task_id = options[:task] && validate_uuid!(options[:task])
+    task = task_id && continuation_task(thread_id)
+    if task_id && (task.nil? || task.fetch("task_id") != task_id)
+      emit({ "result" => "continue-skipped-superseded", "task_scope" => "thread", "task_id" => task_id, "thread" => thread_id }, json: options.fetch(:json))
+      return 0
+    end
+    if task && task.fetch("status") == "completed"
+      emit({ "result" => "continue-skipped-task-completed", "task_scope" => "thread", "task_id" => task.fetch("task_id"), "thread" => thread_id }, json: options.fetch(:json))
+      return 0
+    end
+    scheduled_pool = if options.key?(:pool)
+                       options.fetch(:pool) == "none" ? nil : validate_pool!(options.fetch(:pool))
+                     else
+                       :unspecified
+                     end
+    execution = continuation_execution_identity!(
+      state: state,
+      thread_id: thread_id,
+      fallback_alias: fallback_alias,
+      scheduled_pool: scheduled_pool
+    )
+    identity = execution.fetch("identity")
+    alias_name = execution.fetch("alias")
+    identity_source = execution.fetch("source")
+    conversation_pool = execution.fetch("conversation_pool")
+    cwd = Pathname.new(utf8_path(options.fetch(:cwd) { raise AgentIdentityError, "--cwd is required" })).expand_path.cleanpath
+    raise AgentIdentityError, "scheduled working directory is unavailable: #{cwd}" unless cwd.directory?
+    message = validate_continue_message!(options.fetch(:message) { raise AgentIdentityError, "--message is required" })
+    codex_bin = resolve_executable!(options.fetch(:codex_bin) { raise AgentIdentityError, "--codex-bin is required" }, "Codex")
+    environment = environment_for(identity).merge(
+      TERMINAL_SLOT_ENV => nil,
+      TERMINAL_ALIAS_ENV => nil,
+      TERMINAL_INSTANCE_ENV => nil,
+      "CODEX_THREAD_ID" => nil,
+      "CODEX_SESSION_ID" => nil
+    )
+
+    if options.fetch(:until_complete) && !(options[:guard_turn] && options[:guard_status])
+      raise AgentIdentityError, "--until-complete requires a turn guard"
+    end
+
+    current_turn = nil
+    current_status = nil
+    next_turn_guard = nil
+    if options[:guard_turn] || options[:guard_status]
+      unless options[:guard_turn] && options[:guard_status]
+        raise AgentIdentityError, "--guard-turn and --guard-status must be provided together"
+      end
+      guard_turn = options.fetch(:guard_turn).to_s.downcase
+      guard_status = options.fetch(:guard_status).to_s
+      unless guard_turn == "none" || UUID_PATTERN.match?(guard_turn)
+        raise AgentIdentityError, "--guard-turn must be a UUID or none"
+      end
+      unless (CodexTurnProbe::TURN_STATUSES + ["none"]).include?(guard_status)
+        raise AgentIdentityError, "--guard-status is invalid"
+      end
+
+      marker = continuation_turn_marker!(
+        environment: environment,
+        codex_bin: codex_bin,
+        thread_id: thread_id
+      )
+      current_turn = marker.fetch("id")
+      current_status = marker.fetch("status")
+      same_incomplete_guard = continuation_same_incomplete_guard?(
+        guard_turn: guard_turn,
+        guard_status: guard_status,
+        current_turn: current_turn
+      )
+      next_turn_guard = same_incomplete_guard ? { "id" => guard_turn, "status" => guard_status } : marker
+      if !task_id && continuation_task_completed?(
+        guard_turn: guard_turn,
+        guard_status: guard_status,
+        current_turn: current_turn,
+        current_status: current_status
+      )
+        emit({ "result" => "continue-skipped-completed", "identity" => alias_name, "identity_source" => identity_source, "thread" => thread_id }, json: options.fetch(:json))
+        return 0
+      end
+      if current_turn == guard_turn && current_status == guard_status && !same_incomplete_guard
+        if options.fetch(:until_complete)
+        return rearm_continuation!(
+            result: "continue-rearmed-unchanged",
+            alias_name: alias_name,
+            conversation_pool: conversation_pool,
+            identity_source: identity_source,
+            thread_id: thread_id,
+            cwd: cwd,
+            message: message,
+            codex_bin: codex_bin,
+            environment: environment,
+            turn_guard: marker,
+          json: options.fetch(:json),
+          task_id: task_id
+          )
+        end
+        emit({ "result" => "continue-skipped-unchanged", "identity" => alias_name, "identity_source" => identity_source, "thread" => thread_id }, json: options.fetch(:json))
+        return 0
+      end
+      if current_status == "inProgress"
+        if options.fetch(:until_complete)
+          return rearm_continuation!(
+            result: "continue-rearmed-active",
+            alias_name: alias_name,
+            conversation_pool: conversation_pool,
+            identity_source: identity_source,
+            thread_id: thread_id,
+            cwd: cwd,
+            message: message,
+            codex_bin: codex_bin,
+            environment: environment,
+            turn_guard: marker,
+            json: options.fetch(:json),
+            task_id: task_id
+          )
+        end
+        emit({ "result" => "continue-skipped-active", "identity" => alias_name, "identity_source" => identity_source, "thread" => thread_id }, json: options.fetch(:json))
+        return 0
+      end
+      unless task_id || %w[failed interrupted].include?(current_status) || (same_incomplete_guard && current_status == "completed")
+        raise AgentIdentityError, "Codex turn status changed to an unsupported state; conditional continuation was not sent"
+      end
+    end
+
+    _queue_output, _queue_error, queue_status = Open3.capture3(
+      environment,
+      codex_bin, "queue", "-C", cwd.to_s, "--thread", thread_id, "--message", message
+    )
+    if queue_status.success?
+      if options.fetch(:until_complete)
+          return rearm_continuation!(
+          result: "continue-queued-and-rearmed",
+          alias_name: alias_name,
+          conversation_pool: conversation_pool,
+          identity_source: identity_source,
+          thread_id: thread_id,
+          cwd: cwd,
+          message: message,
+          codex_bin: codex_bin,
+          environment: environment,
+          turn_guard: next_turn_guard,
+            json: options.fetch(:json),
+            task_id: task_id
+        )
+      end
+      emit({ "result" => "continue-queued", "identity" => alias_name, "identity_source" => identity_source, "thread" => thread_id }, json: options.fetch(:json))
+      return 0
+    end
+
+    resumed = system(environment, codex_bin, "exec", "-C", cwd.to_s, "resume", thread_id, message)
+    if options.fetch(:until_complete)
+      marker = continuation_turn_marker!(
+        environment: environment,
+        codex_bin: codex_bin,
+        thread_id: thread_id
+      )
+      if !task_id && continuation_task_completed?(
+        guard_turn: next_turn_guard.fetch("id"),
+        guard_status: next_turn_guard.fetch("status"),
+        current_turn: marker.fetch("id"),
+        current_status: marker.fetch("status")
+      )
+        emit({ "result" => "continue-resumed-completed", "identity" => alias_name, "identity_source" => identity_source, "thread" => thread_id }, json: options.fetch(:json))
+        return 0
+      end
+      if task_id && continuation_task(thread_id)&.fetch("status") == "completed"
+        emit({ "result" => "continue-resumed-completed", "task_scope" => "thread", "task_id" => task_id, "identity" => alias_name, "identity_source" => identity_source, "thread" => thread_id }, json: options.fetch(:json))
+        return 0
+      end
+      unless task_id || %w[inProgress failed interrupted].include?(marker.fetch("status")) ||
+             continuation_same_incomplete_guard?(
+               guard_turn: next_turn_guard.fetch("id"),
+               guard_status: next_turn_guard.fetch("status"),
+               current_turn: marker.fetch("id")
+             )
+        raise AgentIdentityError, "Codex resume ended in an unsupported state; continuous continuation was paused"
+      end
+      return rearm_continuation!(
+        result: resumed ? "continue-resumed-and-rearmed" : "continue-resume-failed-and-rearmed",
+        alias_name: alias_name,
+        conversation_pool: conversation_pool,
+        identity_source: identity_source,
+        thread_id: thread_id,
+        cwd: cwd,
+        message: message,
+        codex_bin: codex_bin,
+        environment: environment,
+        turn_guard: if continuation_same_incomplete_guard?(
+                         guard_turn: next_turn_guard.fetch("id"),
+                         guard_status: next_turn_guard.fetch("status"),
+                         current_turn: marker.fetch("id")
+                       )
+                      next_turn_guard
+                    else
+                      marker
+                    end,
+        json: options.fetch(:json),
+        task_id: task_id
+      )
+    end
+    raise AgentIdentityError, "Codex could neither queue nor resume the scheduled thread" unless resumed
+
+    emit({ "result" => "continue-resumed", "identity" => alias_name, "identity_source" => identity_source, "thread" => thread_id }, json: options.fetch(:json))
+    0
+  end
+
+  def login
+    options = parse_alias_and_dry_run!
+    state = load_state
+    alias_name = validate_alias!(options.fetch(:alias))
+    identity = fetch_identity!(state, alias_name)
+    login_arguments = ["login"]
+    login_arguments << "--device-auth" if ENV["TWO_HEAD_WU_CODEX_LOGIN_DEVICE_AUTH"] == "1"
+    if options.fetch(:dry_run)
+      emit(
+        "result" => "login-ready",
+        "identity" => alias_name,
+        "state_kind" => identity.fetch("state_kind"),
+        "command" => (["codex"] + login_arguments).join(" ")
+      )
+      return 0
+    end
+
+    raise AgentIdentityError, "login can only initialize an isolated identity; the default identity already owns its native login" unless identity.fetch("state_kind") == "isolated"
+    ensure_isolated_home!(alias_name)
+    codex = resolve_executable!(ENV["TWO_HEAD_WU_CODEX_BIN"] || "codex", "Codex")
+    success = system(environment_for(identity), codex, *login_arguments)
+    raise AgentIdentityError, "native Codex login did not complete" unless success
+
+    emit("result" => "login-completed", "identity" => alias_name)
+    0
+  end
+
+  def make_default
+    options = parse_alias_confirm!
+    state = load_state
+    alias_name = validate_alias!(options.fetch(:alias))
+    identity = fetch_identity!(state, alias_name)
+    ensure_owner_local!(identity, "become the default identity")
+    raise AgentIdentityError, "identity is already the default: #{alias_name}" if identity.fetch("state_kind") == "default"
+    if options.fetch(:yes) && state.dig("owner_auto", "enabled")
+      raise AgentIdentityError, "disable owner-auto before replacing the default identity"
+    end
+
+    old_default = state.fetch("identities").find { |_key, item| item.fetch("state_kind") == "default" }
+    raise AgentIdentityError, "no current default identity is registered" unless old_default
+
+    old_alias, old_identity = old_default
+    old_pool = old_identity["conversation_pool"]
+    new_pool = identity["conversation_pool"]
+    unless old_pool == new_pool
+      raise AgentIdentityError, "default replacement requires both identities to use the same conversation pool"
+    end
+
+    home = codex_home_for(identity)
+    raise AgentIdentityError, "isolated Codex home is unavailable: #{home}" unless home.directory?
+    raise AgentIdentityError, "the default Codex environment is unavailable" unless default_codex_home.directory?
+    unless home.to_s.start_with?("#{private_root}#{File::SEPARATOR}")
+      raise AgentIdentityError, "isolated Codex home escaped the private registry"
+    end
+
+    payload = {
+      "identity" => alias_name,
+      "old_default" => old_alias,
+      "new_default" => alias_name,
+      "default_codex_home" => default_codex_home.to_s,
+      "isolated_codex_home_to_delete" => home.to_s,
+      "conversation_pool" => new_pool,
+      "note" => "the default Codex home must already be signed in to the intended account; this command never reads or copies credentials"
+    }
+    unless options.fetch(:yes)
+      emit(payload.merge("result" => "make-default-preview"), json: options.fetch(:json))
+      return 0
+    end
+    ensure_shared_state_safe_for_home_removal!(state, identity, home)
+
+    identity["state_kind"] = "default"
+    state.fetch("identities").delete(old_alias)
+    state.fetch("project_bindings").transform_values! { |value| value == old_alias ? alias_name : value }
+    state.fetch("channel_routes").transform_values! { |value| value == old_alias ? alias_name : value }
+    state.fetch("conversation_pools").each_value do |pool|
+      identities = pool.fetch("identities", [])
+      identities.delete(old_alias)
+      identities << alias_name if new_pool == pool.fetch("id") && !identities.include?(alias_name)
+    end
+    replace_thread_execution_identity!(old_alias, alias_name)
+    write_state(state)
+
+    FileUtils.rm_rf(home.to_s)
+    if home.exist? || home.symlink?
+      raise AgentIdentityError, "default identity changed, but the retired isolated Codex home could not be deleted: #{home}"
+    end
+
+    emit(payload.merge("result" => "default-updated"), json: options.fetch(:json))
+    0
+  end
+
+  def remove
+    options = parse_alias_confirm!
+    state = load_state
+    alias_name = validate_alias!(options.fetch(:alias))
+    identity = fetch_identity!(state, alias_name)
+    raise AgentIdentityError, "cannot remove the default identity: #{alias_name}" if identity.fetch("state_kind") == "default"
+    if options.fetch(:yes) && state.dig("owner_auto", "enabled") && OWNER_AUTO_MEMBERS.include?(alias_name)
+      raise AgentIdentityError, "disable owner-auto before removing an owner automatic identity"
+    end
+
+    bound_projects = state.fetch("project_bindings").select { |_key, value| value == alias_name }.keys
+    raise AgentIdentityError, "identity is still bound to project(s): #{bound_projects.join(', ')}; run unbind first" unless bound_projects.empty?
+
+    home = codex_home_for(identity)
+    unless options.fetch(:yes)
+      emit({
+        "result" => "remove-preview",
+        "identity" => alias_name,
+        "codex_home" => home.to_s,
+        "note" => "pass --yes to permanently delete this identity's registration and isolated Codex home"
+      }, json: options.fetch(:json))
+      return 0
+    end
+    ensure_shared_state_safe_for_home_removal!(state, identity, home)
+
+    state.fetch("identities").delete(alias_name)
+    state.fetch("channel_routes").delete_if { |_key, value| value == alias_name }
+    state.fetch("conversation_pools").each_value { |pool| pool.fetch("identities", []).delete(alias_name) }
+    forget_thread_execution_identity!(alias_name)
+    write_state(state)
+
+    if identity.fetch("state_kind") == "isolated"
+      raise AgentIdentityError, "isolated Codex home escaped the private registry" unless home.to_s.start_with?("#{private_root}#{File::SEPARATOR}")
+
+      FileUtils.rm_rf(home.to_s)
+    end
+
+    emit({ "result" => "removed", "identity" => alias_name, "codex_home" => home.to_s }, json: options.fetch(:json))
+    0
+  end
+
+  def launch
+    options = { dry_run: false, resume_mode: nil }
+    parser = OptionParser.new do |item|
+      item.on("--alias NAME") { |value| options[:alias] = value }
+      item.on("--project PROJECT_ID") { |value| options[:project] = value }
+      item.on("--fresh") { options[:resume_mode] = select_launch_mode!(options[:resume_mode], :fresh) }
+      item.on("--resume") { options[:resume_mode] = select_launch_mode!(options[:resume_mode], :resume) }
+      item.on("--dry-run") { options[:dry_run] = true }
+    end
+    parser.parse!(@arguments)
+    raise AgentIdentityError, "use exactly one of --alias or --project" if [options[:alias], options[:project]].compact.length != 1
+
+    state = load_state
+    alias_name = if options[:alias]
+                   validate_alias!(options.fetch(:alias))
+                 else
+                   selected_project_identity!(state, validate_project!(options.fetch(:project)))
+                 end
+    identity = fetch_identity!(state, alias_name)
+    ensure_owner_local!(identity, "launch through the interactive identity router")
+    resume_last = options.fetch(:resume_mode) == :resume
+    explicit_fresh = options.fetch(:resume_mode) == :fresh
+    explicit_resume = codex_subcommand(@arguments) == "resume"
+    options_only = codex_global_options_only?(@arguments)
+    if explicit_fresh && explicit_resume
+      raise AgentIdentityError, "--fresh cannot be combined with the resume subcommand"
+    end
+    terminal_key = active_terminal_instance_key
+    project_terminal_context = active_project_terminal_context
+    binding = terminal_key && options_only && !resume_last && !explicit_fresh ? terminal_continuation_binding(terminal_key) : nil
+    launch_mode = if binding
+                    "terminal-resume"
+                  elsif resume_last
+                    "resume-last"
+                  elsif options_only
+                    "fresh"
+                  elsif explicit_resume
+                    "resume-named-or-explicit"
+                  else
+                    "fresh-or-explicit"
+                  end
+    if options.fetch(:dry_run)
+      emit({
+        "result" => "launch-ready",
+        "identity" => alias_name,
+        "state_kind" => identity.fetch("state_kind"),
+        "launch_mode" => launch_mode,
+        "argument_count" => @arguments.length,
+        "project_terminal" => project_terminal_context && project_terminal_context.fetch("terminal")
+      })
+      return 0
+    end
+
+    ensure_isolated_home!(alias_name) if identity.fetch("state_kind") == "isolated"
+    environment = environment_for(identity)
+    # The wrapper consumes the terminal instance id. The Codex process and any
+    # tool shells it creates must not inherit terminal navigation state.
+    environment[TERMINAL_SLOT_ENV] = nil
+    environment[TERMINAL_ALIAS_ENV] = nil
+    environment[TERMINAL_INSTANCE_ENV] = nil
+    environment[PROJECT_TERMINAL_ID_ENV] = nil
+    environment[PROJECT_ID_ENV] = nil
+    interactive_arguments = if binding
+                              ["resume", binding.fetch("session_id"), *@arguments]
+                            elsif resume_last
+                              ["resume", "--last", *@arguments]
+                            else
+                              @arguments
+                            end
+    title_arguments = interactive_codex_arguments?(interactive_arguments) ? ["--config", THREAD_TITLE_CONFIG] : []
+    command = ["codex", *title_arguments, *interactive_arguments]
+
+    if resume_last && terminal_key.nil?
+      resumed = system(environment, *command)
+      return 0 if resumed
+
+      raise AgentIdentityError, "Codex could not resume the last session for the current project"
+    end
+    unless interactive_codex_arguments?(interactive_arguments) && terminal_key
+      exec(environment, *command)
+    end
+
+    forget_terminal_continuation!(terminal_key) if starts_fresh_session?(binding, resume_last, explicit_fresh, explicit_resume)
+    observer = CodexSessionObserver.new(allowed_roots: conversation_rollout_roots(identity))
+    expected_id = binding && binding.fetch("session_id")
+    mark_project_terminal_status!(project_terminal_context.fetch("terminal"), "restoring", exit_code: nil) if project_terminal_context
+    on_thread_observed = lambda do |thread_id|
+      record_terminal_continuation!(terminal_key, thread_id, alias_name)
+      record_thread_execution!(thread_id, alias_name, identity["conversation_pool"])
+      if project_terminal_context
+        activate_project_terminal!(
+          project_terminal_context.fetch("terminal"),
+          thread_id,
+          alias_name,
+          identity["conversation_pool"],
+          Dir.pwd
+        )
+      end
+    end
+    result = observer.run(
+      environment,
+      *command,
+      expected_thread_id: expected_id,
+      on_thread_observed: on_thread_observed
+    )
+    if result.thread_id
+      record_terminal_continuation!(terminal_key, result.thread_id, alias_name)
+      record_thread_execution!(result.thread_id, alias_name, identity["conversation_pool"])
+      if project_terminal_context
+        activate_project_terminal!(
+          project_terminal_context.fetch("terminal"),
+          result.thread_id,
+          alias_name,
+          identity["conversation_pool"],
+          Dir.pwd
+        )
+      end
+    elsif result.exit_code.zero? && (resume_last || explicit_resume)
+      # A successful explicit resume replaced the terminal's navigation target,
+      # but observation did not establish which UUID was actually opened. Do not
+      # leave the previous, now-stale target behind. Failed resumes preserve it.
+      forget_terminal_continuation!(terminal_key)
+    end
+    if project_terminal_context
+      status = if result.signal
+                 "recoverable"
+               elsif result.exit_code.zero?
+                 "inactive"
+               else
+                 "blocked"
+               end
+      mark_project_terminal_status!(project_terminal_context.fetch("terminal"), status, exit_code: result.exit_code)
+    end
+    result.exit_code
+  end
+
+  def select_launch_mode!(current, requested)
+    raise AgentIdentityError, "use at most one of --fresh or --resume" if current && current != requested
+
+    requested
+  end
+
+  def starts_fresh_session?(binding, resume_last, explicit_fresh, explicit_resume)
+    return false if binding || resume_last
+    return true if explicit_fresh
+
+    !explicit_resume
+  end
+
+  def parse_project_terminal_project_and_cwd!
+    options = { json: false }
+    parser = OptionParser.new do |item|
+      item.on("--project PROJECT_ID") { |value| options[:project] = value }
+      item.on("--cwd DIR") { |value| options[:cwd] = value }
+      item.on("--json") { options[:json] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:project] = options.fetch(:project) { raise AgentIdentityError, "--project is required" }
+    options[:cwd] = options.fetch(:cwd) { raise AgentIdentityError, "--cwd is required" }
+    options
+  end
+
+  def parse_project_terminal_id!(allow_json:)
+    options = { json: false }
+    parser = OptionParser.new do |item|
+      item.on("--terminal UUID") { |value| options[:terminal] = value }
+      item.on("--json") { options[:json] = true } if allow_json
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:terminal] = validate_uuid!(options.fetch(:terminal) { raise AgentIdentityError, "--terminal is required" })
+    options
+  end
+
+  def parse_project_terminal_id_and_alias!
+    options = {}
+    parser = OptionParser.new do |item|
+      item.on("--terminal UUID") { |value| options[:terminal] = value }
+      item.on("--alias NAME") { |value| options[:alias] = value }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:terminal] = validate_uuid!(options.fetch(:terminal) { raise AgentIdentityError, "--terminal is required" })
+    options[:alias] = validate_alias!(options.fetch(:alias) { raise AgentIdentityError, "--alias is required" })
+    options
+  end
+
+  def validate_project_terminal_cwd!(value)
+    path = Pathname.new(utf8_path(value)).expand_path.cleanpath
+    raise AgentIdentityError, "project terminal cwd must be an existing absolute directory" unless path.absolute? && path.directory?
+
+    path.to_s
+  end
+
+  def active_project_terminal_context
+    raw_terminal = ENV[PROJECT_TERMINAL_ID_ENV]
+    raw_project = ENV[PROJECT_ID_ENV]
+    return nil if raw_terminal.to_s.empty? && raw_project.to_s.empty?
+    if raw_terminal.to_s.empty? || raw_project.to_s.empty?
+      raise AgentIdentityError, "managed project terminal requires both #{PROJECT_TERMINAL_ID_ENV} and #{PROJECT_ID_ENV}"
+    end
+
+    terminal_id = validate_uuid!(raw_terminal)
+    project_id = validate_project!(raw_project)
+    entry = fetch_project_terminal!(terminal_id)
+    unless entry.fetch("project") == project_id
+      raise AgentIdentityError, "managed project terminal does not belong to project #{project_id}"
+    end
+
+    { "terminal" => terminal_id, "project" => project_id }
+  end
+
+  def run_project_terminal_session(state, entry, alias_name, interactive_arguments, expected_thread_id:)
+    project_id = validate_project!(entry.fetch("project"))
+    selected_project_identity!(state, project_id)
+    identity = fetch_identity!(state, alias_name)
+    ensure_owner_local!(identity, "run a managed project terminal")
+    cwd = validate_project_terminal_cwd!(entry.fetch("cwd"))
+    ensure_isolated_home!(alias_name) if identity.fetch("state_kind") == "isolated"
+    mark_project_terminal_status!(entry.fetch("id"), "restoring", exit_code: nil)
+
+    environment = environment_for(identity)
+    environment[TERMINAL_SLOT_ENV] = nil
+    environment[TERMINAL_ALIAS_ENV] = nil
+    environment[TERMINAL_INSTANCE_ENV] = nil
+    environment[PROJECT_TERMINAL_ID_ENV] = nil
+    environment[PROJECT_ID_ENV] = nil
+    command = ["codex", "-C", cwd, "--config", THREAD_TITLE_CONFIG, *interactive_arguments]
+    observer = CodexSessionObserver.new(allowed_roots: conversation_rollout_roots(identity))
+    on_thread_observed = lambda do |thread_id|
+      activate_project_terminal!(entry.fetch("id"), thread_id, alias_name, identity["conversation_pool"], cwd)
+      record_terminal_continuation!(Digest::SHA256.hexdigest(entry.fetch("id")), thread_id, alias_name)
+      record_thread_execution!(thread_id, alias_name, identity["conversation_pool"])
+    end
+    result = observer.run(
+      environment,
+      *command,
+      expected_thread_id: expected_thread_id,
+      on_thread_observed: on_thread_observed
+    )
+    if result.thread_id
+      activate_project_terminal!(entry.fetch("id"), result.thread_id, alias_name, identity["conversation_pool"], cwd)
+      record_terminal_continuation!(Digest::SHA256.hexdigest(entry.fetch("id")), result.thread_id, alias_name)
+      record_thread_execution!(result.thread_id, alias_name, identity["conversation_pool"])
+    end
+
+    if result.signal
+      signal_status = (expected_thread_id || result.thread_id) ? "recoverable" : "blocked"
+      mark_project_terminal_status!(entry.fetch("id"), signal_status, exit_code: result.exit_code)
+      [result.exit_code, true]
+    elsif result.exit_code.zero?
+      mark_project_terminal_status!(entry.fetch("id"), "inactive", exit_code: 0)
+      [0, false]
+    else
+      mark_project_terminal_status!(entry.fetch("id"), "blocked", exit_code: result.exit_code)
+      [result.exit_code, false]
+    end
+  end
+
+  def enter_project_terminal_shell(entry, exit_code)
+    return exit_code if ENV["TWO_HEAD_WU_TESTING"] == "1"
+
+    status = exit_code.zero? ? "Codex 已正常退出；此终端不会在下次项目打开时自动恢复会话。" : "Codex 恢复失败（exit #{exit_code}）；已暂停自动恢复。"
+    warn status
+    shell = resolve_executable!(ENV.fetch("SHELL", "/bin/zsh"), "interactive shell")
+    environment = {
+      PROJECT_TERMINAL_ID_ENV => entry.fetch("id"),
+      PROJECT_ID_ENV => entry.fetch("project"),
+      TERMINAL_INSTANCE_ENV => entry.fetch("id")
+    }
+    exec(environment, shell, "-l")
+  end
+
+  def activate_project_terminal!(terminal_id, thread_id, alias_name, conversation_pool, cwd)
+    terminal_id = validate_uuid!(terminal_id)
+    thread_id = validate_uuid!(thread_id)
+    alias_name = validate_alias!(alias_name)
+    with_project_terminal_registry(write: true) do |registry|
+      entry = registry.fetch("terminals")[terminal_id]
+      raise AgentIdentityError, "unknown project terminal: #{terminal_id}" unless entry
+
+      entry["session_id"] = thread_id
+      entry["identity"] = alias_name
+      entry["conversation_pool"] = conversation_pool
+      entry["cwd"] = validate_project_terminal_cwd!(cwd)
+      entry["status"] = "recoverable"
+      entry["updated_at"] = Time.now.utc.iso8601
+      entry["last_exit_code"] = nil
+    end
+  end
+
+  def mark_project_terminal_status!(terminal_id, status, exit_code:)
+    terminal_id = validate_uuid!(terminal_id)
+    raise AgentIdentityError, "project terminal status is invalid" unless PROJECT_TERMINAL_STATES.include?(status)
+    unless exit_code.nil? || exit_code.is_a?(Integer)
+      raise AgentIdentityError, "project terminal exit code is invalid"
+    end
+
+    with_project_terminal_registry(write: true) do |registry|
+      entry = registry.fetch("terminals")[terminal_id]
+      raise AgentIdentityError, "unknown project terminal: #{terminal_id}" unless entry
+
+      entry["status"] = status
+      entry["updated_at"] = Time.now.utc.iso8601
+      entry["last_exit_code"] = exit_code
+    end
+  end
+
+  def project_terminal_payload(state, entry, metadata: nil)
+    identity = state.fetch("identities")[entry["identity"]]
+    metadata ||= project_terminal_thread_metadata(identity, entry["session_id"]) if identity && entry["session_id"]
+    cwd_ready = Pathname.new(entry.fetch("cwd")).directory?
+    status = entry.fetch("status")
+    auto_restore = %w[recoverable restoring].include?(status) && !metadata.nil? && cwd_ready &&
+                   identity && identity.fetch("usage_scope", "owner-local") == "owner-local"
+    {
+      "terminal" => entry.fetch("id"),
+      "project" => entry.fetch("project"),
+      "thread" => entry["session_id"],
+      "identity" => entry["identity"],
+      "conversation_pool" => entry["conversation_pool"],
+      "cwd" => entry.fetch("cwd"),
+      "status" => status,
+      "auto_restore" => !!auto_restore,
+      "name" => metadata && metadata.fetch("name"),
+      "updated_at" => entry.fetch("updated_at"),
+      "last_exit_code" => entry["last_exit_code"]
+    }
+  end
+
+  def project_terminal_thread_metadata(identity, thread_id)
+    return nil unless identity && thread_id
+
+    database = state_database_for(identity)
+    return nil unless database.file? && command_available?("sqlite3")
+
+    columns = sqlite_rows(database, "PRAGMA table_info(threads)").map { |row| row.fetch("name") }
+    archived = columns.include?("archived") ? "COALESCE(archived, 0)" : "0"
+    names = []
+    names << "NULLIF(name, '')" if columns.include?("name")
+    names << "NULLIF(title, '')" if columns.include?("title")
+    display_name = names.empty? ? "''" : "COALESCE(#{names.join(', ')}, '')"
+    row = sqlite_rows(
+      database,
+      "SELECT id, #{archived} AS archived, #{display_name} AS display_name FROM threads WHERE id = #{sqlite_literal(validate_uuid!(thread_id))} LIMIT 1"
+    ).first
+    return nil unless row && row.fetch("archived").to_i.zero?
+
+    { "id" => row.fetch("id"), "name" => row.fetch("display_name").to_s.empty? ? "Codex #{thread_id[0, 8]}" : row.fetch("display_name") }
+  rescue AgentIdentityError, JSON::ParserError
+    nil
+  end
+
+  def project_terminal_thread_metadata!(identity, thread_id)
+    metadata = project_terminal_thread_metadata(identity, thread_id)
+    raise AgentIdentityError, "project terminal thread is missing, archived, or unavailable: #{thread_id}" unless metadata
+
+    metadata
+  end
+
+  def parse_alias_and_mode!
+    options = { mode: "manual", pool: DEFAULT_CONVERSATION_POOL, pool_given: false, no_pool: false }
+    parser = OptionParser.new do |item|
+      item.on("--alias NAME") { |value| options[:alias] = value }
+      item.on("--mode MODE") { |value| options[:mode] = value }
+      item.on("--pool NAME") { |value| options[:pool] = value; options[:pool_given] = true }
+      item.on("--no-pool") { options[:no_pool] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:alias] = validate_alias!(options.fetch(:alias) { raise AgentIdentityError, "--alias is required" })
+    options[:mode] = validate_mode!(options.fetch(:mode))
+    raise AgentIdentityError, "use at most one of --pool or --no-pool" if options[:no_pool] && options[:pool_given]
+
+    options[:pool] = options[:no_pool] ? nil : validate_pool!(options.fetch(:pool))
+    options
+  end
+
+  def parse_alias!(allow_json: false)
+    options = { json: false }
+    parser = OptionParser.new do |item|
+      item.on("--alias NAME") { |value| options[:alias] = value }
+      item.on("--json") { options[:json] = true } if allow_json
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:alias] = options.fetch(:alias) { raise AgentIdentityError, "--alias is required" }
+    options
+  end
+
+  def parse_project_and_alias!
+    options = {}
+    parser = OptionParser.new do |item|
+      item.on("--project PROJECT_ID") { |value| options[:project] = value }
+      item.on("--alias NAME") { |value| options[:alias] = value }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:project] = options.fetch(:project) { raise AgentIdentityError, "--project is required" }
+    options[:alias] = options.fetch(:alias) { raise AgentIdentityError, "--alias is required" }
+    options
+  end
+
+  def parse_project!(allow_json: false)
+    options = { json: false }
+    parser = OptionParser.new do |item|
+      item.on("--project PROJECT_ID") { |value| options[:project] = value }
+      item.on("--json") { options[:json] = true } if allow_json
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:project] = options.fetch(:project) { raise AgentIdentityError, "--project is required" }
+    options
+  end
+
+  def parse_pool!
+    options = {}
+    parser = OptionParser.new do |item|
+      item.on("--pool NAME") { |value| options[:pool] = value }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:pool] = options.fetch(:pool) { raise AgentIdentityError, "--pool is required" }
+    options
+  end
+
+  def parse_pool_and_alias!
+    options = {}
+    parser = OptionParser.new do |item|
+      item.on("--pool NAME") { |value| options[:pool] = value }
+      item.on("--alias NAME") { |value| options[:alias] = value }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:pool] = options.fetch(:pool) { raise AgentIdentityError, "--pool is required" }
+    options[:alias] = options.fetch(:alias) { raise AgentIdentityError, "--alias is required" }
+    options
+  end
+
+  def parse_pool_state_status!
+    options = { json: false }
+    parser = OptionParser.new do |item|
+      item.on("--pool NAME") { |value| options[:pool] = value }
+      item.on("--json") { options[:json] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:pool] = options.fetch(:pool) { raise AgentIdentityError, "--pool is required" }
+    options
+  end
+
+  def parse_pool_state_enable!
+    options = { json: false, yes: false }
+    parser = OptionParser.new do |item|
+      item.on("--pool NAME") { |value| options[:pool] = value }
+      item.on("--base-alias NAME") { |value| options[:base_alias] = value }
+      item.on("--yes") { options[:yes] = true }
+      item.on("--json") { options[:json] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:pool] = options.fetch(:pool) { raise AgentIdentityError, "--pool is required" }
+    options[:base_alias] = validate_alias!(options[:base_alias]) if options[:base_alias]
+    options
+  end
+
+  def parse_route!(allow_json: false)
+    options = { json: false }
+    parser = OptionParser.new do |item|
+      item.on("--channel CHANNEL") { |value| options[:channel] = value }
+      item.on("--session SESSION") { |value| options[:session] = value }
+      item.on("--json") { options[:json] = true } if allow_json
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:channel] = options.fetch(:channel) { raise AgentIdentityError, "--channel is required" }
+    options[:session] = options.fetch(:session) { raise AgentIdentityError, "--session is required" }
+    options
+  end
+
+  def parse_route_and_alias!
+    options = { json: false }
+    parser = OptionParser.new do |item|
+      item.on("--channel CHANNEL") { |value| options[:channel] = value }
+      item.on("--session SESSION") { |value| options[:session] = value }
+      item.on("--alias NAME") { |value| options[:alias] = value }
+      item.on("--json") { options[:json] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:channel] = options.fetch(:channel) { raise AgentIdentityError, "--channel is required" }
+    options[:session] = options.fetch(:session) { raise AgentIdentityError, "--session is required" }
+    options[:alias] = options.fetch(:alias) { raise AgentIdentityError, "--alias is required" }
+    options
+  end
+
+  def parse_route_command!
+    options = { json: false }
+    parser = OptionParser.new do |item|
+      item.on("--channel CHANNEL") { |value| options[:channel] = value }
+      item.on("--session SESSION") { |value| options[:session] = value }
+      item.on("--text TEXT") { |value| options[:text] = value }
+      item.on("--json") { options[:json] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:channel] = options.fetch(:channel) { raise AgentIdentityError, "--channel is required" }
+    options[:session] = options.fetch(:session) { raise AgentIdentityError, "--session is required" }
+    options[:text] = options.fetch(:text) { raise AgentIdentityError, "--text is required" }
+    options
+  end
+
+  def parse_alias_and_dry_run!
+    options = { dry_run: false }
+    parser = OptionParser.new do |item|
+      item.on("--alias NAME") { |value| options[:alias] = value }
+      item.on("--dry-run") { options[:dry_run] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:alias] = options.fetch(:alias) { raise AgentIdentityError, "--alias is required" }
+    options
+  end
+
+  def parse_alias_confirm!
+    options = { yes: false, json: false }
+    parser = OptionParser.new do |item|
+      item.on("--alias NAME") { |value| options[:alias] = value }
+      item.on("--yes") { options[:yes] = true }
+      item.on("--json") { options[:json] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options[:alias] = options.fetch(:alias) { raise AgentIdentityError, "--alias is required" }
+    options
+  end
+
+  def parse_terminal_slot!(required:, allow_json: false)
+    options = { json: false }
+    parser = OptionParser.new do |item|
+      item.on("--slot NAME") { |value| options[:slot] = value }
+      item.on("--json") { options[:json] = true } if allow_json
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    if required && !options[:slot]
+      raise AgentIdentityError, "--slot is required"
+    end
+    options
+  end
+
+  def parse_json_flag!
+    options = { json: false }
+    parser = OptionParser.new { |item| item.on("--json") { options[:json] = true } }
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options.fetch(:json)
+  end
+
+  def ensure_no_arguments!
+    raise AgentIdentityError, "unexpected arguments: #{@arguments.join(' ')}" unless @arguments.empty?
+  end
+
+  def private_root
+    raw = ENV.fetch("TWO_HEAD_WU_IDENTITY_ROOT", File.join(Dir.home, ".two-head-wu-private", "agent-identity"))
+    Pathname.new(utf8_path(raw)).expand_path.cleanpath
+  end
+
+  def state_path
+    private_root.join("identities.json")
+  end
+
+  def terminal_session_path
+    private_root.join("terminal-sessions.json")
+  end
+
+  def terminal_session_lock_path
+    private_root.join("terminal-sessions.lock")
+  end
+
+  def terminal_continuation_path
+    private_root.join("terminal-continuations.json")
+  end
+
+  def terminal_continuation_lock_path
+    private_root.join("terminal-continuations.lock")
+  end
+
+  def project_terminal_path
+    private_root.join("project-terminals.json")
+  end
+
+  def project_terminal_lock_path
+    private_root.join("project-terminals.lock")
+  end
+
+  def thread_execution_path
+    private_root.join("thread-executions.json")
+  end
+
+  def thread_execution_lock_path
+    private_root.join("thread-executions.lock")
+  end
+
+  def continuation_task_path
+    private_root.join("continuation-tasks.json")
+  end
+
+  def continuation_task_lock_path
+    private_root.join("continuation-tasks.lock")
+  end
+
+  def default_codex_home
+    Pathname.new(utf8_path(Dir.home)).join(".codex")
+  end
+
+  def isolated_home(alias_name)
+    private_root.join("codex-homes", alias_name).cleanpath
+  end
+
+  def pool_root(pool_name)
+    private_root.join("conversation-pools", pool_name).cleanpath
+  end
+
+  def shared_state_root(pool_name)
+    pool_root(pool_name).join("codex-state")
+  end
+
+  def shared_state_database(pool_name)
+    shared_state_root(pool_name).join(SHARED_STATE_DATABASE)
+  end
+
+  def state_database_for(identity)
+    codex_home_for(identity).join(SHARED_STATE_DATABASE)
+  end
+
+  def shared_state_enabled?(pool)
+    pool.dig("shared_state", "enabled") == true
+  end
+
+  def public_shared_state(state, pool, pool_name)
+    database = shared_state_database(pool_name)
+    {
+      "enabled" => shared_state_enabled?(pool),
+      "database_ready" => database.file?,
+      "linked_identities" => Array(pool["identities"]).count do |alias_name|
+        identity = state.fetch("identities")[alias_name]
+        identity && linked_to?(state_database_for(identity), database)
+      end
+    }
+  end
+
+  def shared_state_status_payload(state, pool_name, pool)
+    database = shared_state_database(pool_name)
+    identities = Array(pool["identities"]).sort.map do |alias_name|
+      identity = fetch_identity!(state, alias_name)
+      source = state_database_for(identity)
+      {
+        "identity" => alias_name,
+        "database_present" => source.file?,
+        "linked" => linked_to?(source, database)
+      }
+    end
+    payload = {
+      "result" => "pool-state-status",
+      "pool" => pool_name,
+      "enabled" => shared_state_enabled?(pool),
+      "database" => database.to_s,
+      "database_ready" => database.file?,
+      "identities" => identities
+    }
+    if database.file? && command_available?("sqlite3")
+      payload["thread_count"] = sqlite_scalar(database, "SELECT count(*) FROM threads").to_i
+      payload["integrity"] = sqlite_scalar(database, "PRAGMA integrity_check")
+    end
+    payload
+  end
+
+  def shared_state_enable_payload(state, pool_name, pool, requested_base_alias)
+    members = Array(pool["identities"]).sort
+    raise AgentIdentityError, "conversation pool has no identities: #{pool_name}" if members.empty?
+
+    identities = members.to_h { |alias_name| [alias_name, fetch_identity!(state, alias_name)] }
+    base_alias = requested_base_alias || members.find { |alias_name| identities.fetch(alias_name).fetch("state_kind") == "default" } || members.first
+    raise AgentIdentityError, "base identity is not a member of pool #{pool_name}: #{base_alias}" unless identities.key?(base_alias)
+
+    database = shared_state_database(pool_name)
+    if shared_state_enabled?(pool)
+      return {
+        "pool" => pool_name,
+        "base_alias" => base_alias,
+        "database" => database.to_s,
+        "source_databases" => [],
+        "source_thread_counts" => {},
+        "expected_unique_thread_count" => database.file? && command_available?("sqlite3") ? sqlite_scalar(database, "SELECT count(*) FROM threads").to_i : nil,
+        "empty_identities" => [],
+        "blockers" => [],
+        "already_enabled" => true
+      }
+    end
+
+    blockers = []
+    blockers << "sqlite3 command is unavailable" unless command_available?("sqlite3")
+    blockers << "lsof command is unavailable" unless command_available?("lsof")
+    blockers << "unregistered pool database already exists: #{database}" if database.exist? || database.symlink?
+
+    sources = {}
+    empty_identities = []
+    identities.each do |alias_name, identity|
+      source = state_database_for(identity)
+      if source.symlink?
+        blockers << "identity #{alias_name} already uses an unmanaged state database link"
+      elsif source.file?
+        sources[alias_name] = source
+      elsif source.exist?
+        blockers << "identity #{alias_name} state path is not a regular database"
+      else
+        empty_identities << alias_name
+      end
+    end
+    blockers << "no identity has a state database to migrate" if sources.empty?
+    blockers << "base identity has no state database: #{base_alias}" unless sources.key?(base_alias)
+
+    source_thread_counts = {}
+    unique_thread_ids = {}
+    if command_available?("sqlite3")
+      signatures = {}
+      sources.each do |alias_name, source|
+        begin
+          integrity = sqlite_scalar(source, "PRAGMA integrity_check")
+          blockers << "identity #{alias_name} database integrity is #{integrity}" unless integrity == "ok"
+          signatures[alias_name] = shared_table_signature(source)
+          thread_ids = sqlite_rows(source, "SELECT id FROM threads").map { |row| row.fetch("id") }
+          source_thread_counts[alias_name] = thread_ids.length
+          thread_ids.each { |thread_id| unique_thread_ids[thread_id] = true }
+        rescue AgentIdentityError => error
+          blockers << "identity #{alias_name} database cannot be inspected (#{error.message})"
+        end
+      end
+      unless signatures.empty?
+        expected = signatures[base_alias]
+        signatures.each do |alias_name, signature|
+          blockers << "identity #{alias_name} uses an incompatible state database schema" unless expected && signature == expected
+        end
+      end
+    end
+    blockers.concat(open_database_blockers(sources)) if command_available?("lsof")
+
+    {
+      "pool" => pool_name,
+      "base_alias" => base_alias,
+      "database" => database.to_s,
+      "source_databases" => sources.transform_values(&:to_s),
+      "source_thread_counts" => source_thread_counts,
+      "expected_unique_thread_count" => unique_thread_ids.length,
+      "empty_identities" => empty_identities,
+      "blockers" => blockers.uniq,
+      "already_enabled" => false
+    }
+  end
+
+  def enable_shared_state!(state, pool_name, pool, base_alias)
+    if shared_state_enabled?(pool)
+      return shared_state_status_payload(state, pool_name, pool).merge("result" => "pool-state-already-enabled")
+    end
+
+    members = Array(pool["identities"]).sort
+    identities = members.to_h { |alias_name| [alias_name, fetch_identity!(state, alias_name)] }
+    sources = identities.transform_values { |identity| state_database_for(identity) }.select { |_alias_name, path| path.file? && !path.symlink? }
+    destination = shared_state_database(pool_name)
+    timestamp = Time.now.utc.strftime("%Y%m%dT%H%M%SZ")
+    backup_root = pool_root(pool_name).join("backups", "state-#{timestamp}-#{SecureRandom.hex(4)}")
+    snapshots = {}
+    temporary = shared_state_root(pool_name).join(".state-merge-#{Process.pid}-#{SecureRandom.hex(6)}.sqlite")
+    published = false
+    switch_started = false
+
+    begin
+      FileUtils.mkdir_p(backup_root.to_s, mode: 0o700)
+      File.chmod(0o700, backup_root.to_s)
+      FileUtils.mkdir_p(shared_state_root(pool_name).to_s, mode: 0o700)
+      File.chmod(0o700, shared_state_root(pool_name).to_s)
+
+      sources.each do |alias_name, source|
+        sqlite_execute(source, "PRAGMA busy_timeout=5000; PRAGMA wal_checkpoint(TRUNCATE);")
+        snapshot = backup_root.join("#{alias_name}-#{SHARED_STATE_DATABASE}")
+        sqlite_execute(source, "VACUUM INTO #{sqlite_literal(snapshot.to_s)};")
+        File.chmod(0o600, snapshot.to_s)
+        snapshots[alias_name] = snapshot
+      end
+      current_blockers = open_database_blockers(sources)
+      raise AgentIdentityError, "state database opened during migration: #{current_blockers.join('; ')}" unless current_blockers.empty?
+
+      base_snapshot = snapshots.fetch(base_alias)
+      sqlite_execute(base_snapshot, "VACUUM INTO #{sqlite_literal(temporary.to_s)};")
+      (snapshots.keys - [base_alias]).sort.each do |alias_name|
+        merge_state_database!(temporary, snapshots.fetch(alias_name))
+      end
+      normalize_rollout_paths!(temporary, identities.values, pool_name)
+      integrity = sqlite_scalar(temporary, "PRAGMA integrity_check")
+      raise AgentIdentityError, "merged database integrity check failed: #{integrity}" unless integrity == "ok"
+      foreign_keys = sqlite_rows(temporary, "PRAGMA foreign_key_check")
+      raise AgentIdentityError, "merged database has foreign key violations" unless foreign_keys.empty?
+
+      write_private_json(backup_root.join("manifest.json"), {
+        "pool" => pool_name,
+        "created_at" => Time.now.utc.iso8601,
+        "base_alias" => base_alias,
+        "identities" => snapshots.transform_values(&:to_s),
+        "destination" => destination.to_s
+      })
+      File.chmod(0o600, temporary.to_s)
+      File.rename(temporary.to_s, destination.to_s)
+      published = true
+
+      switch_started = true
+      identities.each_value do |identity|
+        source = state_database_for(identity)
+        FileUtils.rm_f(source.to_s)
+        FileUtils.rm_f("#{source}-wal")
+        FileUtils.rm_f("#{source}-shm")
+        File.symlink(destination.to_s, source.to_s)
+        raise AgentIdentityError, "failed to attach shared state for #{identity.fetch('id')}" unless linked_to?(source, destination)
+      end
+
+      thread_count = sqlite_scalar(destination, "SELECT count(*) FROM threads").to_i
+      pool["shared_state"] = {
+        "enabled" => true,
+        "database" => "codex-state/#{SHARED_STATE_DATABASE}",
+        "base_alias" => base_alias,
+        "enabled_at" => Time.now.utc.iso8601,
+        "backup" => backup_root.to_s
+      }
+      write_state(state)
+      {
+        "result" => "pool-state-enabled",
+        "pool" => pool_name,
+        "base_alias" => base_alias,
+        "database" => destination.to_s,
+        "identities" => members,
+        "thread_count" => thread_count,
+        "backup" => backup_root.to_s
+      }
+    rescue StandardError => error
+      restore_state_snapshots!(identities, snapshots, destination) if switch_started
+      FileUtils.rm_f(destination.to_s) if published
+      raise error if error.is_a?(AgentIdentityError)
+
+      raise AgentIdentityError, "shared state migration failed and was rolled back: #{error.message}"
+    ensure
+      FileUtils.rm_f(temporary.to_s)
+    end
+  end
+
+  def merge_state_database!(destination, source)
+    statements = []
+    SHARED_STATE_TABLES.each do |table|
+      columns = sqlite_table_columns(destination, table)
+      names = columns.map { |column| sqlite_identifier(column) }.join(", ")
+      select_names = columns.map { |column| "incoming.#{sqlite_identifier(table)}.#{sqlite_identifier(column)}" }.join(", ")
+      if table == "threads"
+        updates = (columns - ["id"]).map { |column| "#{sqlite_identifier(column)} = excluded.#{sqlite_identifier(column)}" }.join(", ")
+        statements << <<~SQL
+          INSERT INTO #{sqlite_identifier(table)} (#{names})
+          SELECT #{select_names} FROM incoming.#{sqlite_identifier(table)} WHERE 1
+          ON CONFLICT(id) DO UPDATE SET #{updates}
+          WHERE COALESCE(excluded.updated_at_ms, excluded.updated_at * 1000, 0) >=
+                COALESCE(threads.updated_at_ms, threads.updated_at * 1000, 0);
+        SQL
+      elsif %w[thread_dynamic_tools thread_spawn_edges].include?(table)
+        statements << "INSERT OR REPLACE INTO #{sqlite_identifier(table)} (#{names}) SELECT #{select_names} FROM incoming.#{sqlite_identifier(table)};"
+      else
+        statements << "INSERT OR IGNORE INTO #{sqlite_identifier(table)} (#{names}) SELECT #{select_names} FROM incoming.#{sqlite_identifier(table)};"
+      end
+    end
+    sqlite_execute(destination, <<~SQL)
+      PRAGMA foreign_keys=OFF;
+      ATTACH DATABASE #{sqlite_literal(source.to_s)} AS incoming;
+      BEGIN IMMEDIATE;
+      #{statements.join("\n")}
+      COMMIT;
+      DETACH DATABASE incoming;
+    SQL
+  end
+
+  def normalize_rollout_paths!(database, identities, pool_name)
+    session_root = pool_root(pool_name).join("sessions").to_s
+    archive_root = pool_root(pool_name).join("archived_sessions").to_s
+    statements = identities.flat_map do |identity|
+      home = codex_home_for(identity).to_s
+      [
+        "UPDATE threads SET rollout_path = replace(rollout_path, #{sqlite_literal("#{home}/sessions/")}, #{sqlite_literal("#{session_root}/")});",
+        "UPDATE threads SET rollout_path = replace(rollout_path, #{sqlite_literal("#{home}/archived_sessions/")}, #{sqlite_literal("#{archive_root}/")});"
+      ]
+    end
+    sqlite_execute(database, "BEGIN IMMEDIATE; #{statements.join(' ')} COMMIT;")
+  end
+
+  def restore_state_snapshots!(identities, snapshots, destination)
+    identities.each do |alias_name, identity|
+      source = state_database_for(identity)
+      FileUtils.rm_f(source.to_s) if source.symlink? && linked_to?(source, destination)
+      snapshot = snapshots[alias_name]
+      next unless snapshot&.file?
+
+      FileUtils.rm_f(source.to_s)
+      FileUtils.cp(snapshot.to_s, source.to_s)
+      File.chmod(0o600, source.to_s)
+    rescue SystemCallError
+      # Preserve the original migration exception; the backup directory remains
+      # available for a deliberate manual recovery if filesystem restoration fails.
+    end
+  end
+
+  def preflight_shared_state_attachment!(identity, pool_name, pool)
+    return unless shared_state_enabled?(pool)
+
+    source = state_database_for(identity)
+    destination = shared_state_database(pool_name)
+    raise AgentIdentityError, "shared state database is unavailable for pool #{pool_name}" unless destination.file?
+    return if linked_to?(source, destination)
+    return unless source.exist? || source.symlink?
+
+    raise AgentIdentityError, "identity #{identity.fetch('id')} already has independent state; migrate it before attaching to shared-state pool #{pool_name}"
+  end
+
+  def attach_shared_state!(identity, pool_name)
+    source = state_database_for(identity)
+    destination = shared_state_database(pool_name)
+    return if linked_to?(source, destination)
+
+    File.symlink(destination.to_s, source.to_s)
+    raise AgentIdentityError, "state database was not linked for identity #{identity.fetch('id')}" unless linked_to?(source, destination)
+  end
+
+  def ensure_shared_state_safe_for_home_removal!(state, identity, home)
+    pool_name = identity["conversation_pool"]
+    return unless pool_name
+
+    pool = state.fetch("conversation_pools")[pool_name]
+    return unless pool && shared_state_enabled?(pool)
+
+    database = shared_state_database(pool_name)
+    source = state_database_for(identity)
+    unless database.file? && linked_to?(source, database)
+      raise AgentIdentityError, "cannot remove identity home while its shared state link is unhealthy"
+    end
+    raise AgentIdentityError, "cannot verify shared rollout paths because sqlite3 is unavailable" unless command_available?("sqlite3")
+
+    home_prefix = "#{home}/"
+    remaining = sqlite_scalar(database, "SELECT count(*) FROM threads WHERE instr(rollout_path, #{sqlite_literal(home_prefix)}) = 1").to_i
+    if remaining.positive?
+      raise AgentIdentityError, "cannot remove identity home while #{remaining} shared rollout path(s) still point into it"
+    end
+  end
+
+  def shared_table_signature(database)
+    SHARED_STATE_TABLES.to_h do |table|
+      rows = sqlite_rows(database, "PRAGMA table_info(#{sqlite_identifier(table)})")
+      raise AgentIdentityError, "required state table is missing: #{table}" if rows.empty?
+
+      signature = rows.map { |row| row.values_at("name", "type", "notnull", "pk") }
+      [table, signature]
+    end
+  end
+
+  def sqlite_table_columns(database, table)
+    rows = sqlite_rows(database, "PRAGMA table_info(#{sqlite_identifier(table)})")
+    columns = rows.map { |row| row.fetch("name") }
+    raise AgentIdentityError, "required state table is missing: #{table}" if columns.empty?
+
+    columns
+  end
+
+  def sqlite_rows(database, sql)
+    output, error, status = Open3.capture3("sqlite3", "-json", database.to_s, sql)
+    raise AgentIdentityError, "sqlite operation failed: #{error.strip}" unless status.success?
+
+    output.strip.empty? ? [] : JSON.parse(output)
+  rescue Errno::ENOENT
+    raise AgentIdentityError, "sqlite3 command is unavailable"
+  end
+
+  def sqlite_scalar(database, sql)
+    output, error, status = Open3.capture3("sqlite3", "-noheader", database.to_s, sql)
+    raise AgentIdentityError, "sqlite operation failed: #{error.strip}" unless status.success?
+
+    output.lines.first.to_s.strip
+  rescue Errno::ENOENT
+    raise AgentIdentityError, "sqlite3 command is unavailable"
+  end
+
+  def sqlite_execute(database, sql)
+    _output, error, status = Open3.capture3("sqlite3", database.to_s, sql)
+    raise AgentIdentityError, "sqlite operation failed: #{error.strip}" unless status.success?
+  rescue Errno::ENOENT
+    raise AgentIdentityError, "sqlite3 command is unavailable"
+  end
+
+  def sqlite_literal(value)
+    "'#{value.to_s.gsub("'", "''")}'"
+  end
+
+  def sqlite_identifier(value)
+    raise AgentIdentityError, "unsafe SQLite identifier" unless value.to_s.match?(/\A[a-z_][a-z0-9_]*\z/)
+
+    %Q{"#{value}"}
+  end
+
+  def command_available?(name)
+    ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).any? { |directory| File.executable?(File.join(directory, name)) }
+  end
+
+  def open_database_blockers(sources)
+    paths = sources.values.flat_map { |path| [path.to_s, "#{path}-wal", "#{path}-shm"] }.select { |path| File.exist?(path) }
+    return [] if paths.empty?
+
+    output, error, status = Open3.capture3("lsof", "-Fpc", "--", *paths)
+    raise AgentIdentityError, "lsof failed: #{error.strip}" unless status.success? || status.exitstatus == 1
+
+    process = nil
+    command = nil
+    blockers = []
+    output.each_line do |line|
+      case line[0]
+      when "p" then process = line[1..].strip
+      when "c"
+        command = line[1..].strip
+        blockers << "state database is open by #{command} (pid #{process})" if process
+      end
+    end
+    blockers.uniq
+  rescue Errno::ENOENT
+    ["lsof command is unavailable"]
+  end
+
+  def write_private_json(path, payload)
+    File.open(path.to_s, "w", 0o600) { |file| file.write(JSON.pretty_generate(payload) + "\n") }
+    File.chmod(0o600, path.to_s)
+  end
+
+  def ensure_private_root!
+    root_prefix = "#{@root}#{File::SEPARATOR}"
+    if private_root.to_s == @root.to_s || private_root.to_s.start_with?(root_prefix)
+      raise AgentIdentityError, "private identity registry must stay outside the project repository"
+    end
+    FileUtils.mkdir_p(private_root.to_s, mode: 0o700)
+    File.chmod(0o700, private_root.to_s)
+  end
+
+  def ensure_isolated_home!(alias_name)
+    home = isolated_home(alias_name)
+    raise AgentIdentityError, "isolated Codex home escaped the private registry" unless home.to_s.start_with?("#{private_root}#{File::SEPARATOR}")
+
+    FileUtils.mkdir_p(home.to_s, mode: 0o700)
+    File.chmod(0o700, home.to_s)
+  end
+
+  def ensure_pool_root!(pool_name)
+    root = pool_root(pool_name)
+    raise AgentIdentityError, "conversation pool escaped the private registry" unless root.to_s.start_with?("#{private_root}#{File::SEPARATOR}")
+
+    FileUtils.mkdir_p(root.to_s, mode: 0o700)
+    File.chmod(0o700, root.to_s)
+    SHARED_CONVERSATION_DIRS.each do |name|
+      directory = root.join(name)
+      FileUtils.mkdir_p(directory.to_s, mode: 0o700)
+      File.chmod(0o700, directory.to_s)
+    end
+  end
+
+  def attach_conversation_pool!(identity, pool_name)
+    home = identity.fetch("state_kind") == "default" ? default_codex_home : isolated_home(identity.fetch("id"))
+    raise AgentIdentityError, "Codex home is unavailable for identity #{identity.fetch('id')}" unless home.directory?
+
+    SHARED_CONVERSATION_DIRS.each do |name|
+      source = home.join(name)
+      destination = pool_root(pool_name).join(name)
+      next if linked_to?(source, destination)
+
+      if source.exist? || source.symlink?
+        raise AgentIdentityError, "cannot attach non-directory conversation path: #{source}" unless source.directory?
+
+        merge_directory_contents!(source, destination, identity.fetch("id"))
+        FileUtils.rmdir(source.to_s) if source.directory? && Dir.empty?(source.to_s)
+      end
+      File.symlink(destination.to_s, source.to_s) unless source.exist? || source.symlink?
+      raise AgentIdentityError, "conversation path was not linked: #{source}" unless linked_to?(source, destination)
+    end
+  end
+
+  def merge_directory_contents!(source, destination, alias_name)
+    FileUtils.mkdir_p(destination.to_s, mode: 0o700)
+    Dir.children(source.to_s).each do |child|
+      from = source.join(child)
+      to = destination.join(child)
+      if to.exist? || to.symlink?
+        if from.directory? && !from.symlink? && to.directory? && !to.symlink?
+          merge_directory_contents!(from, to, alias_name)
+          FileUtils.rmdir(from.to_s) if from.directory? && Dir.empty?(from.to_s)
+        else
+          timestamp = Time.now.utc.strftime("%Y%m%dT%H%M%SZ")
+          FileUtils.mv(from.to_s, destination.join("#{child}.from-#{alias_name}-#{timestamp}").to_s)
+        end
+      else
+        FileUtils.mv(from.to_s, to.to_s)
+      end
+    end
+  end
+
+  def shared_skill_surface
+    if ENV["TWO_HEAD_WU_TESTING"] == "1" && !ENV["TWO_HEAD_WU_TEST_ACTIVE_SKILLS_ROOT"].to_s.empty?
+      return Pathname.new(utf8_path(ENV.fetch("TWO_HEAD_WU_TEST_ACTIVE_SKILLS_ROOT"))).expand_path.cleanpath
+    end
+
+    @root.join("skills/.active")
+  end
+
+  def attach_shared_skills!(alias_name)
+    return "unavailable" unless shared_skill_surface.directory?
+
+    destination = isolated_home(alias_name).join("skills")
+    return "linked" if linked_to_shared_skills?(destination)
+    return "existing" if destination.exist? || destination.symlink?
+
+    File.symlink(shared_skill_surface.to_s, destination.to_s)
+    "linked"
+  end
+
+  def shared_skills_status(alias_name)
+    destination = isolated_home(alias_name).join("skills")
+    return "linked" if linked_to_shared_skills?(destination)
+    return "existing" if destination.exist? || destination.symlink?
+
+    "unavailable"
+  end
+
+  def linked_to_shared_skills?(destination)
+    return false unless destination.symlink? && shared_skill_surface.directory?
+
+    File.realpath(destination.to_s) == File.realpath(shared_skill_surface.to_s)
+  rescue Errno::ENOENT, Errno::EACCES
+    false
+  end
+
+  def linked_to?(source, destination)
+    source.symlink? && destination.exist? && File.realpath(source.to_s) == File.realpath(destination.to_s)
+  rescue Errno::ENOENT, Errno::EACCES
+    false
+  end
+
+  def default_state
+    {
+      "schema_version" => 1,
+      "identities" => {},
+      "project_bindings" => {},
+      "conversation_pools" => {},
+      "channel_routes" => {},
+      "owner_auto" => default_owner_auto
+    }
+  end
+
+  def default_owner_auto
+    { "enabled" => false, "members" => OWNER_AUTO_MEMBERS, "channels" => OWNER_AUTO_CHANNELS }
+  end
+
+  def default_terminal_session_registry
+    { "schema_version" => 1, "slots" => {} }
+  end
+
+  def default_terminal_continuation_registry
+    { "schema_version" => 1, "instances" => {} }
+  end
+
+  def default_project_terminal_registry
+    { "schema_version" => 1, "terminals" => {} }
+  end
+
+  def default_thread_execution_registry
+    { "schema_version" => 1, "threads" => {} }
+  end
+
+  def default_continuation_task_registry
+    { "schema_version" => 1, "threads" => {} }
+  end
+
+  def active_terminal_instance_key
+    raw = ENV[TERMINAL_INSTANCE_ENV]
+    return nil if raw.to_s.empty?
+
+    value = raw.to_s.downcase
+    raise AgentIdentityError, "terminal instance ID must be a UUID" unless UUID_PATTERN.match?(value)
+
+    Digest::SHA256.hexdigest(value)
+  end
+
+  def terminal_continuation_binding(key)
+    read_terminal_continuation_registry.fetch("instances")[key]
+  end
+
+  def record_terminal_continuation!(key, session_id, alias_name)
+    validate_terminal_instance_key!(key)
+    session_id = validate_uuid!(session_id)
+    alias_name = validate_alias!(alias_name)
+    with_terminal_continuation_registry(write: true) do |registry|
+      instances = registry.fetch("instances")
+      instances[key] = {
+        "session_id" => session_id,
+        "identity" => alias_name,
+        "updated_at" => Time.now.utc.iso8601
+      }
+      if instances.length > TERMINAL_CONTINUATION_LIMIT
+        instances.sort_by { |_instance_key, binding| binding.fetch("updated_at") }
+                 .first(instances.length - TERMINAL_CONTINUATION_LIMIT)
+                 .each { |instance_key, _binding| instances.delete(instance_key) }
+      end
+    end
+  end
+
+  def forget_terminal_continuation!(key)
+    validate_terminal_instance_key!(key)
+    with_terminal_continuation_registry(write: true) do |registry|
+      registry.fetch("instances").delete(key)
+    end
+  end
+
+  def read_terminal_continuation_registry
+    with_terminal_continuation_registry(write: false) { |registry| registry }
+  end
+
+  def with_terminal_continuation_registry(write:)
+    ensure_private_root!
+    File.open(terminal_continuation_lock_path.to_s, File::RDWR | File::CREAT, 0o600) do |lock|
+      File.chmod(0o600, terminal_continuation_lock_path.to_s)
+      lock.flock(File::LOCK_EX)
+      registry = load_terminal_continuation_registry
+      result = yield(registry)
+      write_terminal_continuation_registry(registry) if write
+      result
+    ensure
+      lock.flock(File::LOCK_UN) rescue nil
+    end
+  end
+
+  def load_terminal_continuation_registry
+    return default_terminal_continuation_registry unless terminal_continuation_path.exist?
+
+    mode = File.stat(terminal_continuation_path.to_s).mode & 0o077
+    raise AgentIdentityError, "private terminal-continuation registry permissions are too broad" unless mode.zero?
+
+    registry = JSON.parse(File.read(terminal_continuation_path.to_s, encoding: "UTF-8"))
+    validate_terminal_continuation_registry!(registry)
+    registry
+  end
+
+  def validate_terminal_continuation_registry!(registry)
+    unless registry.is_a?(Hash) && registry["schema_version"] == 1 && registry["instances"].is_a?(Hash)
+      raise AgentIdentityError, "private terminal-continuation registry is malformed"
+    end
+    raise AgentIdentityError, "private terminal-continuation registry is too large" if registry.fetch("instances").length > TERMINAL_CONTINUATION_LIMIT
+
+    registry.fetch("instances").each do |key, binding|
+      validate_terminal_instance_key!(key)
+      unless binding.is_a?(Hash) && binding.keys.sort == %w[identity session_id updated_at]
+        raise AgentIdentityError, "private terminal-continuation binding is malformed"
+      end
+      validate_alias!(binding.fetch("identity"))
+      validate_uuid!(binding.fetch("session_id"))
+      Time.iso8601(binding.fetch("updated_at"))
+    rescue ArgumentError
+      raise AgentIdentityError, "private terminal-continuation timestamp is malformed"
+    end
+  end
+
+  def write_terminal_continuation_registry(registry)
+    validate_terminal_continuation_registry!(registry)
+    temporary = terminal_continuation_path.sub_ext(".json.tmp-#{Process.pid}-#{SecureRandom.hex(6)}")
+    File.open(temporary.to_s, "w", 0o600) { |file| file.write(JSON.pretty_generate(registry) + "\n") }
+    File.chmod(0o600, temporary.to_s)
+    File.rename(temporary.to_s, terminal_continuation_path.to_s)
+    File.chmod(0o600, terminal_continuation_path.to_s)
+  ensure
+    FileUtils.rm_f(temporary.to_s) if defined?(temporary) && temporary && File.exist?(temporary.to_s)
+  end
+
+  def fetch_project_terminal!(terminal_id)
+    terminal_id = validate_uuid!(terminal_id)
+    entry = read_project_terminal_registry.fetch("terminals")[terminal_id]
+    raise AgentIdentityError, "unknown project terminal: #{terminal_id}" unless entry
+
+    entry
+  end
+
+  def read_project_terminal_registry
+    with_project_terminal_registry(write: false) { |registry| registry }
+  end
+
+  def with_project_terminal_registry(write:)
+    ensure_private_root!
+    File.open(project_terminal_lock_path.to_s, File::RDWR | File::CREAT, 0o600) do |lock|
+      File.chmod(0o600, project_terminal_lock_path.to_s)
+      lock.flock(File::LOCK_EX)
+      registry = load_project_terminal_registry
+      result = yield(registry)
+      write_project_terminal_registry(registry) if write
+      result
+    ensure
+      lock.flock(File::LOCK_UN) rescue nil
+    end
+  end
+
+  def load_project_terminal_registry
+    return default_project_terminal_registry unless project_terminal_path.exist?
+
+    mode = File.stat(project_terminal_path.to_s).mode & 0o077
+    raise AgentIdentityError, "private project-terminal registry permissions are too broad" unless mode.zero?
+
+    registry = JSON.parse(File.read(project_terminal_path.to_s, encoding: "UTF-8"))
+    validate_project_terminal_registry!(registry)
+    registry
+  end
+
+  def validate_project_terminal_registry!(registry)
+    unless registry.is_a?(Hash) && registry["schema_version"] == 1 && registry["terminals"].is_a?(Hash)
+      raise AgentIdentityError, "private project-terminal registry is malformed"
+    end
+    if registry.fetch("terminals").length > PROJECT_TERMINAL_LIMIT
+      raise AgentIdentityError, "private project-terminal registry is too large"
+    end
+
+    expected_keys = %w[conversation_pool created_at cwd id identity last_exit_code project session_id status updated_at]
+    registry.fetch("terminals").each do |terminal_id, entry|
+      validate_uuid!(terminal_id)
+      unless entry.is_a?(Hash) && entry.keys.sort == expected_keys && entry.fetch("id") == terminal_id
+        raise AgentIdentityError, "private project-terminal entry is malformed"
+      end
+      validate_project!(entry.fetch("project"))
+      validate_uuid!(entry.fetch("session_id")) if entry["session_id"]
+      validate_alias!(entry.fetch("identity")) if entry["identity"]
+      validate_pool!(entry.fetch("conversation_pool")) if entry["conversation_pool"]
+      cwd = Pathname.new(utf8_path(entry.fetch("cwd")))
+      raise AgentIdentityError, "private project-terminal cwd is malformed" unless cwd.absolute? && cwd.cleanpath.to_s == cwd.to_s
+      unless PROJECT_TERMINAL_STATES.include?(entry.fetch("status"))
+        raise AgentIdentityError, "private project-terminal status is invalid"
+      end
+      unless entry["last_exit_code"].nil? || entry["last_exit_code"].is_a?(Integer)
+        raise AgentIdentityError, "private project-terminal exit code is malformed"
+      end
+      Time.iso8601(entry.fetch("created_at"))
+      Time.iso8601(entry.fetch("updated_at"))
+    rescue ArgumentError
+      raise AgentIdentityError, "private project-terminal timestamp is malformed"
+    end
+  end
+
+  def prune_project_terminals!(registry)
+    terminals = registry.fetch("terminals")
+    extra = terminals.length - PROJECT_TERMINAL_LIMIT
+    return if extra <= 0
+
+    disposable = terminals.select { |_id, entry| %w[user-closed inactive blocked allocated].include?(entry.fetch("status")) }
+                          .sort_by { |_id, entry| entry.fetch("updated_at") }
+    disposable.first(extra).each { |terminal_id, _entry| terminals.delete(terminal_id) }
+    raise AgentIdentityError, "project-terminal registry limit reached with active recovery entries" if terminals.length > PROJECT_TERMINAL_LIMIT
+  end
+
+  def write_project_terminal_registry(registry)
+    validate_project_terminal_registry!(registry)
+    temporary = project_terminal_path.sub_ext(".json.tmp-#{Process.pid}-#{SecureRandom.hex(6)}")
+    File.open(temporary.to_s, "w", 0o600) { |file| file.write(JSON.pretty_generate(registry) + "\n") }
+    File.chmod(0o600, temporary.to_s)
+    File.rename(temporary.to_s, project_terminal_path.to_s)
+    File.chmod(0o600, project_terminal_path.to_s)
+  ensure
+    FileUtils.rm_f(temporary.to_s) if defined?(temporary) && temporary && File.exist?(temporary.to_s)
+  end
+
+  def thread_execution_binding(thread_id)
+    read_thread_execution_registry.fetch("threads")[validate_uuid!(thread_id)]
+  end
+
+  # This is execution context, not task ownership. The exact thread remains the
+  # task key; the identity may be replaced whenever the user explicitly opens
+  # that same thread through another identity in the same conversation pool.
+  def record_thread_execution!(thread_id, alias_name, conversation_pool)
+    thread_id = validate_uuid!(thread_id)
+    alias_name = validate_alias!(alias_name)
+    validate_pool!(conversation_pool) if conversation_pool
+    with_thread_execution_registry(write: true) do |registry|
+      threads = registry.fetch("threads")
+      threads[thread_id] = {
+        "identity" => alias_name,
+        "conversation_pool" => conversation_pool,
+        "updated_at" => Time.now.utc.iso8601
+      }
+      if threads.length > THREAD_EXECUTION_LIMIT
+        threads.sort_by { |_id, binding| binding.fetch("updated_at") }
+               .first(threads.length - THREAD_EXECUTION_LIMIT)
+               .each { |id, _binding| threads.delete(id) }
+      end
+    end
+  end
+
+  def read_thread_execution_registry
+    with_thread_execution_registry(write: false) { |registry| registry }
+  end
+
+  def replace_thread_execution_identity!(old_alias, new_alias)
+    old_alias = validate_alias!(old_alias)
+    new_alias = validate_alias!(new_alias)
+    with_thread_execution_registry(write: true) do |registry|
+      registry.fetch("threads").each_value do |binding|
+        next unless binding.fetch("identity") == old_alias
+
+        binding["identity"] = new_alias
+        binding["updated_at"] = Time.now.utc.iso8601
+      end
+    end
+  end
+
+  def forget_thread_execution_identity!(alias_name)
+    alias_name = validate_alias!(alias_name)
+    with_thread_execution_registry(write: true) do |registry|
+      registry.fetch("threads").delete_if { |_thread_id, binding| binding.fetch("identity") == alias_name }
+    end
+  end
+
+  def with_thread_execution_registry(write:)
+    ensure_private_root!
+    File.open(thread_execution_lock_path.to_s, File::RDWR | File::CREAT, 0o600) do |lock|
+      File.chmod(0o600, thread_execution_lock_path.to_s)
+      lock.flock(File::LOCK_EX)
+      registry = load_thread_execution_registry
+      result = yield(registry)
+      write_thread_execution_registry(registry) if write
+      result
+    ensure
+      lock.flock(File::LOCK_UN) rescue nil
+    end
+  end
+
+  def load_thread_execution_registry
+    return default_thread_execution_registry unless thread_execution_path.exist?
+
+    mode = File.stat(thread_execution_path.to_s).mode & 0o077
+    raise AgentIdentityError, "private thread-execution registry permissions are too broad" unless mode.zero?
+
+    registry = JSON.parse(File.read(thread_execution_path.to_s, encoding: "UTF-8"))
+    validate_thread_execution_registry!(registry)
+    registry
+  end
+
+  def validate_thread_execution_registry!(registry)
+    unless registry.is_a?(Hash) && registry["schema_version"] == 1 && registry["threads"].is_a?(Hash)
+      raise AgentIdentityError, "private thread-execution registry is malformed"
+    end
+    raise AgentIdentityError, "private thread-execution registry is too large" if registry.fetch("threads").length > THREAD_EXECUTION_LIMIT
+
+    registry.fetch("threads").each do |thread_id, binding|
+      validate_uuid!(thread_id)
+      unless binding.is_a?(Hash) && binding.keys.sort == %w[conversation_pool identity updated_at]
+        raise AgentIdentityError, "private thread-execution binding is malformed"
+      end
+      validate_alias!(binding.fetch("identity"))
+      validate_pool!(binding["conversation_pool"]) if binding["conversation_pool"]
+      Time.iso8601(binding.fetch("updated_at"))
+    rescue ArgumentError
+      raise AgentIdentityError, "private thread-execution timestamp is malformed"
+    end
+  end
+
+  def write_thread_execution_registry(registry)
+    validate_thread_execution_registry!(registry)
+    temporary = thread_execution_path.sub_ext(".json.tmp-#{Process.pid}-#{SecureRandom.hex(6)}")
+    File.open(temporary.to_s, "w", 0o600) { |file| file.write(JSON.pretty_generate(registry) + "\n") }
+    File.chmod(0o600, temporary.to_s)
+    File.rename(temporary.to_s, thread_execution_path.to_s)
+    File.chmod(0o600, thread_execution_path.to_s)
+  ensure
+    FileUtils.rm_f(temporary.to_s) if defined?(temporary) && temporary && File.exist?(temporary.to_s)
+  end
+
+  def continuation_task(thread_id)
+    read_continuation_task_registry.fetch("threads")[validate_uuid!(thread_id)]
+  end
+
+  def begin_continuation_task!(thread_id, mode)
+    thread_id = validate_uuid!(thread_id)
+    raise AgentIdentityError, "continuation task mode is invalid" unless %w[one-shot until-complete].include?(mode)
+
+    task_id = SecureRandom.uuid
+    with_continuation_task_registry(write: true) do |registry|
+      registry.fetch("threads")[thread_id] = {
+        "task_id" => task_id,
+        "status" => "active",
+        "mode" => mode,
+        "created_at" => Time.now.utc.iso8601
+      }
+      prune_continuation_tasks!(registry)
+    end
+    task_id
+  end
+
+  def complete_continuation_task!(thread_id)
+    thread_id = validate_uuid!(thread_id)
+    completed = false
+    with_continuation_task_registry(write: true) do |registry|
+      task = registry.fetch("threads")[thread_id]
+      if task && task.fetch("status") == "active"
+        task["status"] = "completed"
+        task["completed_at"] = Time.now.utc.iso8601
+        completed = true
+      end
+    end
+    completed
+  end
+
+  def with_continuation_task_registry(write:)
+    ensure_private_root!
+    File.open(continuation_task_lock_path.to_s, File::RDWR | File::CREAT, 0o600) do |lock|
+      File.chmod(0o600, continuation_task_lock_path.to_s)
+      lock.flock(File::LOCK_EX)
+      registry = load_continuation_task_registry
+      result = yield(registry)
+      write_continuation_task_registry(registry) if write
+      result
+    ensure
+      lock.flock(File::LOCK_UN) rescue nil
+    end
+  end
+
+  def read_continuation_task_registry
+    with_continuation_task_registry(write: false) { |registry| registry }
+  end
+
+  def load_continuation_task_registry
+    return default_continuation_task_registry unless continuation_task_path.exist?
+
+    mode = File.stat(continuation_task_path.to_s).mode & 0o077
+    raise AgentIdentityError, "private continuation-task registry permissions are too broad" unless mode.zero?
+
+    registry = JSON.parse(File.read(continuation_task_path.to_s, encoding: "UTF-8"))
+    validate_continuation_task_registry!(registry)
+    registry
+  end
+
+  def validate_continuation_task_registry!(registry)
+    unless registry.is_a?(Hash) && registry["schema_version"] == 1 && registry["threads"].is_a?(Hash)
+      raise AgentIdentityError, "private continuation-task registry is malformed"
+    end
+    raise AgentIdentityError, "private continuation-task registry is too large" if registry.fetch("threads").length > CONTINUATION_TASK_LIMIT
+
+    registry.fetch("threads").each do |thread_id, task|
+      validate_uuid!(thread_id)
+      required = %w[created_at mode status task_id]
+      required << "completed_at" if task.is_a?(Hash) && task.key?("completed_at")
+      unless task.is_a?(Hash) && task.keys.sort == required.sort
+        raise AgentIdentityError, "private continuation-task entry is malformed"
+      end
+      validate_uuid!(task.fetch("task_id"))
+      raise AgentIdentityError, "private continuation-task status is invalid" unless %w[active completed].include?(task.fetch("status"))
+      raise AgentIdentityError, "private continuation-task mode is invalid" unless %w[one-shot until-complete].include?(task.fetch("mode"))
+      Time.iso8601(task.fetch("created_at"))
+      Time.iso8601(task.fetch("completed_at")) if task.key?("completed_at")
+    rescue ArgumentError
+      raise AgentIdentityError, "private continuation-task timestamp is malformed"
+    end
+  end
+
+  def prune_continuation_tasks!(registry)
+    threads = registry.fetch("threads")
+    return if threads.length <= CONTINUATION_TASK_LIMIT
+
+    threads.sort_by { |_id, task| task.fetch("created_at") }
+           .first(threads.length - CONTINUATION_TASK_LIMIT)
+           .each { |thread_id, _task| threads.delete(thread_id) }
+  end
+
+  def write_continuation_task_registry(registry)
+    validate_continuation_task_registry!(registry)
+    temporary = continuation_task_path.sub_ext(".json.tmp-#{Process.pid}-#{SecureRandom.hex(6)}")
+    File.open(temporary.to_s, "w", 0o600) { |file| file.write(JSON.pretty_generate(registry) + "\n") }
+    File.chmod(0o600, temporary.to_s)
+    File.rename(temporary.to_s, continuation_task_path.to_s)
+    File.chmod(0o600, continuation_task_path.to_s)
+  ensure
+    FileUtils.rm_f(temporary.to_s) if defined?(temporary) && temporary && File.exist?(temporary.to_s)
+  end
+
+  def active_terminal_slot
+    raw = ENV[TERMINAL_SLOT_ENV]
+    return nil if raw.to_s.empty?
+
+    validate_terminal_slot!(raw)
+  end
+
+  def terminal_session_binding(slot)
+    read_terminal_session_registry.fetch("slots")[slot]
+  end
+
+  def record_terminal_session!(slot, session_id, alias_name)
+    with_terminal_session_registry(write: true) do |registry|
+      registry.fetch("slots").delete_if do |other_slot, binding|
+        other_slot != slot && binding["session_id"] == session_id
+      end
+      registry.fetch("slots")[slot] = {
+        "session_id" => session_id,
+        "identity" => alias_name,
+        "updated_at" => Time.now.utc.iso8601
+      }
+    end
+  end
+
+  def read_terminal_session_registry
+    with_terminal_session_registry(write: false) { |registry| registry }
+  end
+
+  def with_terminal_session_registry(write:)
+    ensure_private_root!
+    File.open(terminal_session_lock_path.to_s, File::RDWR | File::CREAT, 0o600) do |lock|
+      File.chmod(0o600, terminal_session_lock_path.to_s)
+      lock.flock(File::LOCK_EX)
+      registry = load_terminal_session_registry
+      result = yield(registry)
+      write_terminal_session_registry(registry) if write
+      result
+    ensure
+      lock.flock(File::LOCK_UN) rescue nil
+    end
+  end
+
+  def load_terminal_session_registry
+    return default_terminal_session_registry unless terminal_session_path.exist?
+
+    mode = File.stat(terminal_session_path.to_s).mode & 0o077
+    raise AgentIdentityError, "private terminal-session registry permissions are too broad" unless mode.zero?
+
+    registry = JSON.parse(File.read(terminal_session_path.to_s, encoding: "UTF-8"))
+    validate_terminal_session_registry!(registry)
+    registry
+  end
+
+  def validate_terminal_session_registry!(registry)
+    unless registry.is_a?(Hash) && registry["schema_version"] == 1 && registry["slots"].is_a?(Hash)
+      raise AgentIdentityError, "private terminal-session registry is malformed"
+    end
+    registry.fetch("slots").each do |slot, binding|
+      validate_terminal_slot!(slot)
+      unless binding.is_a?(Hash) && binding.keys.sort == %w[identity session_id updated_at]
+        raise AgentIdentityError, "private terminal-session binding is malformed"
+      end
+      validate_alias!(binding.fetch("identity"))
+      validate_session!(binding.fetch("session_id"))
+      Time.iso8601(binding.fetch("updated_at"))
+    rescue ArgumentError
+      raise AgentIdentityError, "private terminal-session timestamp is malformed"
+    end
+  end
+
+  def write_terminal_session_registry(registry)
+    validate_terminal_session_registry!(registry)
+    temporary = terminal_session_path.sub_ext(".json.tmp-#{Process.pid}-#{SecureRandom.hex(6)}")
+    File.open(temporary.to_s, "w", 0o600) { |file| file.write(JSON.pretty_generate(registry) + "\n") }
+    File.chmod(0o600, temporary.to_s)
+    File.rename(temporary.to_s, terminal_session_path.to_s)
+    File.chmod(0o600, terminal_session_path.to_s)
+  ensure
+    FileUtils.rm_f(temporary.to_s) if defined?(temporary) && temporary && File.exist?(temporary.to_s)
+  end
+
+  def interactive_codex_arguments?(arguments)
+    subcommand = codex_subcommand(arguments)
+    subcommand.nil? || !NONINTERACTIVE_CODEX_COMMANDS.include?(subcommand)
+  end
+
+  def codex_global_options_only?(arguments)
+    kind, = codex_root_argument_boundary(arguments)
+    kind == :options_only
+  end
+
+  # Codex accepts root options before a subcommand. Consume the currently
+  # supported root option grammar so `-s read-only review`, for example, is not
+  # mistaken for an interactive prompt. Unknown options stay on the conservative
+  # interactive path instead of being guessed through.
+  def codex_subcommand(arguments)
+    kind, index = codex_root_argument_boundary(arguments)
+    return "help" if kind == :information
+    return arguments[index] if kind == :subcommand
+
+    nil
+  end
+
+  def codex_root_argument_boundary(arguments)
+    index = 0
+    while index < arguments.length
+      token = arguments[index]
+      return [:information, index] if CODEX_TOP_LEVEL_INFORMATION_OPTIONS.include?(token)
+      return [:prompt, index] if token == "--"
+      return [:subcommand, index] unless token.start_with?("-")
+
+      option_name = token.split("=", 2).first
+      if CODEX_GLOBAL_OPTIONS_WITH_VALUE.include?(option_name)
+        index += token.include?("=") ? 1 : 2
+      elsif CODEX_GLOBAL_BOOLEAN_OPTIONS.include?(token)
+        index += 1
+      elsif CODEX_GLOBAL_VARIADIC_OPTIONS.include?(option_name)
+        index += 1
+        index += 1 while index < arguments.length && !arguments[index].start_with?("-")
+      else
+        return [:unknown_option, index]
+      end
+    end
+    [:options_only, index]
+  end
+
+  def conversation_rollout_roots(identity)
+    home = codex_home_for(identity)
+    roots = [home.join("sessions"), home.join("archived_sessions")]
+    if identity["conversation_pool"]
+      pool = pool_root(identity.fetch("conversation_pool"))
+      roots.concat([pool.join("sessions"), pool.join("archived_sessions")])
+    end
+    roots
+  end
+
+  def load_state
+    ensure_private_root!
+    return default_state unless state_path.exist?
+
+    mode = File.stat(state_path.to_s).mode & 0o077
+    raise AgentIdentityError, "private identity registry permissions are too broad" unless mode.zero?
+    state = JSON.parse(File.read(state_path.to_s, encoding: "UTF-8"))
+    state["conversation_pools"] ||= {}
+    state["channel_routes"] ||= {}
+    state["owner_auto"] ||= default_owner_auto
+    validate_state!(state)
+    state
+  end
+
+  def validate_state!(state)
+    raise AgentIdentityError, "unsupported private identity registry" unless state["schema_version"] == 1
+    unless state["identities"].is_a?(Hash) && state["project_bindings"].is_a?(Hash) && state["conversation_pools"].is_a?(Hash) && state["channel_routes"].is_a?(Hash) && state["owner_auto"].is_a?(Hash)
+      raise AgentIdentityError, "private identity registry is malformed"
+    end
+
+    state.fetch("identities").each do |alias_name, item|
+      validate_alias!(alias_name)
+      raise AgentIdentityError, "identity registry is malformed" unless item.is_a?(Hash) && item.fetch("id") == alias_name
+      raise AgentIdentityError, "identity registry has an invalid state kind" unless STATE_KINDS.include?(item.fetch("state_kind"))
+      validate_mode!(item.fetch("selection_mode"))
+      usage_scope = item.fetch("usage_scope", "owner-local")
+      raise AgentIdentityError, "identity registry has an invalid usage scope" unless USAGE_SCOPES.include?(usage_scope)
+      if usage_scope == "member-remote-work"
+        unless item.fetch("state_kind") == "isolated" && item.fetch("selection_mode") == "manual" && !item.key?("conversation_pool")
+          raise AgentIdentityError, "member identity isolation policy is malformed"
+        end
+      end
+      validate_pool!(item["conversation_pool"]) if item["conversation_pool"]
+    end
+    state.fetch("project_bindings").each do |project_id, alias_name|
+      validate_project!(project_id)
+      raise AgentIdentityError, "project references an unknown identity" unless state.fetch("identities").key?(alias_name)
+      ensure_owner_local!(state.fetch("identities").fetch(alias_name), "hold a project binding")
+    end
+    state.fetch("conversation_pools").each do |pool_name, item|
+      validate_pool!(pool_name)
+      raise AgentIdentityError, "conversation pool registry is malformed" unless item.is_a?(Hash) && item.fetch("id") == pool_name
+      Array(item["identities"]).each do |alias_name|
+        raise AgentIdentityError, "conversation pool references an unknown identity" unless state.fetch("identities").key?(alias_name)
+        ensure_owner_local!(state.fetch("identities").fetch(alias_name), "belong to a conversation pool")
+      end
+      next unless item.key?("shared_state")
+
+      shared_state = item.fetch("shared_state")
+      unless shared_state.is_a?(Hash) && shared_state["enabled"] == true &&
+             shared_state["database"] == "codex-state/#{SHARED_STATE_DATABASE}" &&
+             Array(item["identities"]).include?(shared_state["base_alias"])
+        raise AgentIdentityError, "conversation pool shared state policy is malformed"
+      end
+    end
+    state.fetch("channel_routes").each do |key, alias_name|
+      channel, session = split_route_key(key)
+      validate_channel!(channel)
+      validate_session!(session)
+      raise AgentIdentityError, "channel route references an unknown identity" unless state.fetch("identities").key?(alias_name)
+      ensure_owner_local!(state.fetch("identities").fetch(alias_name), "hold a channel route")
+    end
+    owner_auto = state.fetch("owner_auto")
+    unless [true, false].include?(owner_auto["enabled"]) && owner_auto["members"] == OWNER_AUTO_MEMBERS && owner_auto["channels"] == OWNER_AUTO_CHANNELS
+      raise AgentIdentityError, "owner automatic identity policy is malformed"
+    end
+    if owner_auto["enabled"]
+      missing = OWNER_AUTO_MEMBERS.reject { |alias_name| state.fetch("identities").key?(alias_name) }
+      raise AgentIdentityError, "owner automatic identity policy references an unknown identity" unless missing.empty?
+      OWNER_AUTO_MEMBERS.each { |alias_name| ensure_owner_local!(state.fetch("identities").fetch(alias_name), "join owner automatic routing") }
+    end
+  end
+
+  def write_state(state)
+    ensure_private_root!
+    validate_state!(state)
+    temporary = state_path.sub_ext(".json.tmp-#{Process.pid}-#{SecureRandom.hex(6)}")
+    File.open(temporary.to_s, "w", 0o600) { |file| file.write(JSON.pretty_generate(state) + "\n") }
+    File.chmod(0o600, temporary.to_s)
+    File.rename(temporary.to_s, state_path.to_s)
+    File.chmod(0o600, state_path.to_s)
+  ensure
+    FileUtils.rm_f(temporary.to_s) if defined?(temporary) && temporary && File.exist?(temporary.to_s)
+  end
+
+  def identity_record(alias_name, state_kind, mode, usage_scope: "owner-local")
+    { "id" => alias_name, "state_kind" => state_kind, "selection_mode" => mode, "usage_scope" => usage_scope, "registered_at" => Time.now.utc.iso8601 }
+  end
+
+  def ensure_owner_local!(identity, action)
+    return if identity.fetch("usage_scope", "owner-local") == "owner-local"
+
+    raise AgentIdentityError, "member remote-work identity cannot #{action}"
+  end
+
+  def fetch_identity!(state, alias_name)
+    state.fetch("identities").fetch(alias_name)
+  rescue KeyError
+    raise AgentIdentityError, "unknown identity: #{alias_name}"
+  end
+
+  def selected_project_identity!(state, project_id)
+    alias_name = state.fetch("project_bindings")[project_id]
+    raise AgentIdentityError, "project is not bound to an automatic identity: #{project_id}" unless alias_name
+    identity = fetch_identity!(state, alias_name)
+    raise AgentIdentityError, "project binding is not automatic: #{project_id}" unless identity.fetch("selection_mode") == "project-auto"
+
+    alias_name
+  end
+
+  def route_key(channel, session)
+    "#{channel}:#{session}"
+  end
+
+  def split_route_key(key)
+    key.to_s.split(":", 2)
+  end
+
+  def set_route!(state, channel, session, alias_name)
+    routes = state.fetch("channel_routes")
+    canonical_session = normalize_route_session(channel, session)
+    routes.delete_if do |key, _value|
+      route_channel, route_session = split_route_key(key)
+      route_channel == channel && normalize_route_session(route_channel, route_session) == canonical_session
+    end
+    routes[route_key(channel, canonical_session)] = alias_name
+  end
+
+  def selected_route_identity(state, channel, session)
+    routes = state.fetch("channel_routes")
+    canonical_session = normalize_route_session(channel, session)
+    exact = routes[route_key(channel, canonical_session)]
+    return { "identity" => exact, "matched_session" => canonical_session } if exact
+
+    routes.each do |key, alias_name|
+      route_channel, route_session = split_route_key(key)
+      next unless route_channel == channel
+      next unless normalize_route_session(route_channel, route_session) == canonical_session
+
+      return { "identity" => alias_name, "matched_session" => route_session }
+    end
+    nil
+  end
+
+  def select_route_identity(state, channel, preferred)
+    policy = state.fetch("owner_auto")
+    applicable = policy.fetch("enabled") && policy.fetch("channels").include?(channel) &&
+                 (preferred.nil? || policy.fetch("members").include?(preferred))
+    unless applicable
+      alias_name = preferred || selected_project_identity!(state, "two-head-wu")
+      return { "identity" => alias_name, "source" => preferred ? "channel-route" : "project-binding" }
+    end
+
+    members = policy.fetch("members")
+    candidates = preferred ? [preferred, *(members - [preferred])] : members
+    candidates.each_with_index do |alias_name, index|
+      identity = fetch_identity!(state, alias_name)
+      probe = CodexQuotaProbe.new(environment: environment_for(identity)).call
+      if probe.fetch("status") == "exhausted"
+        next
+      end
+      reason = if index.zero?
+                 probe.fetch("status") == "available" ? "preferred-available" : "preferred-unverified"
+               else
+                 probe.fetch("status") == "available" ? "quota-failover" : "quota-failover-unverified"
+               end
+      return {
+        "identity" => alias_name,
+        "source" => preferred ? "owner-auto-route" : "owner-auto",
+        "selection_reason" => reason,
+        "quota_probe" => probe.fetch("status")
+      }
+    end
+    raise AgentIdentityError, "all owner automatic Codex identities have exhausted quota"
+  end
+
+  def public_owner_auto(state)
+    policy = state.fetch("owner_auto")
+    {
+      "enabled" => policy.fetch("enabled"),
+      "members" => policy.fetch("members"),
+      "channels" => policy.fetch("channels")
+    }
+  end
+
+  def normalize_route_session(channel, session)
+    normalized = session.downcase
+    return normalized unless channel == "openclaw-weixin"
+
+    parts = normalized.split(":")
+    channel_index = parts.index(channel)
+    if channel_index
+      direct_offset = parts[(channel_index + 1)..]&.index("direct")
+      direct_index = direct_offset ? channel_index + 1 + direct_offset : nil
+      peer = direct_index ? parts[direct_index + 1] : nil
+      return peer if peer && !peer.empty?
+    end
+
+    prefix = "#{channel}:"
+    normalized = normalized.delete_prefix(prefix) while normalized.start_with?(prefix)
+    normalized
+  end
+
+  def environment_for(identity)
+    return { "CODEX_HOME" => nil } if identity.fetch("state_kind") == "default"
+
+    { "CODEX_HOME" => codex_home_for(identity).to_s }
+  end
+
+  def dedicated_air_worker_registry?
+    runtime_root = ENV["WU_MEMBER_RUNTIME_ROOT"].to_s
+    runtime_uid = ENV["WU_MEMBER_RUNTIME_UID"].to_s
+    owner_uid = ENV["WU_MEMBER_OWNER_UID"].to_s
+    return false if runtime_root.empty? || runtime_uid.empty? || owner_uid.empty?
+    return false unless runtime_uid == Process.euid.to_s && owner_uid != runtime_uid
+
+    expected = Pathname.new(utf8_path(runtime_root)).expand_path.cleanpath.join("agent-identity")
+    private_root.expand_path.cleanpath == expected
+  rescue ArgumentError
+    false
+  end
+
+  def current_identity!(state)
+    raw_home = ENV["CODEX_HOME"].to_s
+    if raw_home.empty?
+      identity = state.fetch("identities").values.find { |item| item.fetch("state_kind") == "default" }
+      return identity if identity
+    end
+
+    current_home = Pathname.new(utf8_path(raw_home)).expand_path.cleanpath
+    identity = state.fetch("identities").values.find do |item|
+      codex_home_for(item).expand_path.cleanpath == current_home
+    end
+    return identity if identity
+
+    raise AgentIdentityError, "current CODEX_HOME does not match a registered identity"
+  end
+
+  def continuation_execution_identity!(state:, thread_id:, fallback_alias:, scheduled_pool: nil)
+    binding = thread_execution_binding(thread_id)
+    fallback = state.fetch("identities")[fallback_alias]
+    pool_name = if scheduled_pool == :unspecified
+                  fallback&.fetch("conversation_pool", nil) || binding&.fetch("conversation_pool", nil)
+                else
+                  scheduled_pool
+                end
+
+    if binding && binding.fetch("conversation_pool") == pool_name
+      candidate_alias = binding.fetch("identity")
+      candidate = state.fetch("identities")[candidate_alias]
+      if candidate && candidate["conversation_pool"] == pool_name
+        return {
+          "identity" => candidate,
+          "alias" => candidate_alias,
+          "source" => "thread-latest",
+          "conversation_pool" => pool_name
+        }
+      end
+    end
+
+    if fallback && fallback["conversation_pool"] == pool_name
+      return {
+        "identity" => fallback,
+        "alias" => fallback_alias,
+        "source" => "scheduled-fallback",
+        "conversation_pool" => pool_name
+      }
+    end
+
+    raise AgentIdentityError, "no valid execution identity remains for scheduled thread #{thread_id}"
+  end
+
+  def continuation_task_completed?(guard_turn:, guard_status:, current_turn:, current_status:)
+    return false unless current_status == "completed"
+
+    same_failed_guard = current_turn == guard_turn && %w[failed interrupted].include?(guard_status)
+    !same_failed_guard
+  end
+
+  def continuation_same_incomplete_guard?(guard_turn:, guard_status:, current_turn:)
+    current_turn == guard_turn && %w[failed interrupted].include?(guard_status)
+  end
+
+  def continuation_clock_now
+    if ENV["TWO_HEAD_WU_TESTING"] == "1" && ENV["TWO_HEAD_WU_TEST_NOW"]
+      return Time.iso8601(ENV.fetch("TWO_HEAD_WU_TEST_NOW"))
+    end
+
+    Time.now
+  rescue ArgumentError
+    raise AgentIdentityError, "TWO_HEAD_WU_TEST_NOW is not a valid ISO-8601 timestamp"
+  end
+
+  def next_local_clock_time(value, now)
+    match = /\A([01]?\d|2[0-3]):([0-5]\d)\z/.match(value.to_s)
+    raise AgentIdentityError, "scheduled time must use local HH:MM, for example 12:00" unless match
+
+    hour = Integer(match[1], 10)
+    minute = Integer(match[2], 10)
+    candidate = Time.local(now.year, now.month, now.day, hour, minute, 0)
+    candidate = Time.local(now.year, now.month, now.day + 1, hour, minute, 0) unless candidate > now
+    candidate
+  end
+
+  def validate_continue_message!(value)
+    valid = value.is_a?(String) && value.valid_encoding? && !value.strip.empty? &&
+            value.length <= CONTINUE_MESSAGE_MAX_LENGTH && !value.include?("\0")
+    raise AgentIdentityError, "scheduled message must contain 1-#{CONTINUE_MESSAGE_MAX_LENGTH} characters and no NUL byte" unless valid
+
+    value
+  end
+
+  def continuation_turn_marker!(environment:, codex_bin:, thread_id:)
+    probe = CodexTurnProbe.new(
+      environment: environment,
+      command: [codex_bin, "app-server", "--stdio"]
+    ).call(thread_id: thread_id)
+    unless probe.fetch("status") == "ok"
+      raise AgentIdentityError, "Codex turn status is unavailable; conditional continuation was not sent"
+    end
+
+    {
+      "id" => probe["latest_turn_id"] || "none",
+      "status" => probe["latest_turn_status"] || "none"
+    }
+  end
+
+  def continuation_run_at!(environment:, codex_bin:, now:)
+    quota = CodexQuotaProbe.new(
+      environment: environment,
+      command: [codex_bin, "app-server", "--stdio"],
+      now: now.to_i
+    ).call
+    reset_at = if quota.fetch("status") == "exhausted"
+                 quota["blocking_reset_at"]
+               elsif quota.fetch("status") == "available"
+                 quota["next_reset_at"]
+               end
+    unless reset_at
+      raise AgentIdentityError, "Codex quota reset time is unavailable; provide an explicit local time such as: codex-continue 12:00"
+    end
+
+    target = Time.at(reset_at + CONTINUE_DELAY_SECONDS).getlocal
+    raise AgentIdentityError, "the reported quota reset time is not in the future; provide an explicit local time" unless target > now
+
+    target
+  end
+
+  def register_continuation_cron!(openclaw_bin:, alias_name:, conversation_pool:, thread_id:, cwd:, message:, codex_bin:, run_at:, turn_guard:, until_complete:, task_id: nil)
+    run_arguments = [
+      adapter_path.to_s, "continue-run",
+      "--fallback-alias", alias_name,
+      "--pool", conversation_pool || "none",
+      "--thread", thread_id,
+      "--cwd", cwd.to_s,
+      "--message", message,
+      "--codex-bin", codex_bin,
+      "--json"
+    ]
+    if turn_guard
+      run_arguments.concat([
+        "--guard-turn", turn_guard.fetch("id"),
+        "--guard-status", turn_guard.fetch("status")
+      ])
+    end
+    run_arguments << "--until-complete" if until_complete
+    run_arguments.concat(["--task", task_id]) if task_id
+
+    cron_arguments = [
+      openclaw_bin, "cron", "add",
+      "--name", until_complete ? "Codex continue until complete #{thread_id[0, 8]}" : "Codex continue #{thread_id[0, 8]}",
+      "--description", if until_complete
+                         "Two-Headed-Wu continuous conditional Codex thread continuation"
+                       elsif turn_guard
+                         "Two-Headed-Wu conditional Codex thread continuation"
+                       else
+                         "Two-Headed-Wu exact Codex thread continuation"
+                       end,
+      "--at", run_at.iso8601,
+      "--command-argv", JSON.generate(run_arguments),
+      "--command-cwd", cwd.to_s,
+      "--command-env", "TWO_HEAD_WU_IDENTITY_ROOT=#{private_root}",
+      "--delete-after-run",
+      "--no-deliver",
+      "--timeout-seconds", CONTINUE_COMMAND_TIMEOUT_SECONDS.to_s,
+      "--json"
+    ]
+    if until_complete
+      cron_arguments.concat([
+        "--declaration-key", "two-head-wu.codex-continuation.#{thread_id}.#{run_at.to_i}",
+        "--display-name", "Codex continuous continuation #{thread_id[0, 8]}"
+      ])
+    end
+
+    output, error, status = Open3.capture3(*cron_arguments)
+    unless status.success?
+      detail = error.to_s.strip.lines.last || output.to_s.strip.lines.last || "unknown error"
+      raise AgentIdentityError, "OpenClaw could not register the continuation task: #{detail.strip}"
+    end
+    job = JSON.parse(output)
+    job["id"] || job.dig("job", "id")
+  rescue JSON::ParserError
+    raise AgentIdentityError, "OpenClaw returned invalid JSON while registering the continuation task"
+  end
+
+  def rearm_continuation!(result:, alias_name:, conversation_pool:, identity_source:, thread_id:, cwd:, message:, codex_bin:, environment:, turn_guard:, json:, task_id: nil)
+    run_at = continuation_run_at!(
+      environment: environment,
+      codex_bin: codex_bin,
+      now: continuation_clock_now
+    )
+    job_id = register_continuation_cron!(
+      openclaw_bin: resolve_openclaw_executable!,
+      alias_name: alias_name,
+      conversation_pool: conversation_pool,
+      thread_id: thread_id,
+      cwd: cwd,
+      message: message,
+      codex_bin: codex_bin,
+      run_at: run_at,
+      turn_guard: turn_guard,
+      until_complete: true,
+      task_id: task_id
+    )
+    payload = {
+      "result" => result,
+      "identity" => alias_name,
+      "identity_source" => identity_source,
+      "thread" => thread_id,
+      "run_at" => run_at.iso8601,
+      "mode" => "until-complete"
+    }
+    payload["job_id"] = job_id if job_id
+    emit(payload, json: json)
+    0
+  end
+
+  def adapter_path
+    @root.join("capabilities", "agent-identity", "adapters", "agent-identity")
+  end
+
+  def resolve_openclaw_executable!
+    configured = ENV["TWO_HEAD_WU_OPENCLAW_BIN"]
+    candidate = configured.to_s.empty? ? @root.parent.join("openclaw", "bin", "openclaw").to_s : configured
+    resolve_executable!(candidate, "OpenClaw")
+  end
+
+  def resolve_executable!(value, label)
+    text = value.to_s
+    candidates = if text.include?(File::SEPARATOR)
+                   [Pathname.new(utf8_path(text)).expand_path.cleanpath]
+                 else
+                   ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).map do |directory|
+                     next if directory.empty?
+
+                     Pathname.new(utf8_path(directory)).join(text).expand_path.cleanpath
+                   end.compact
+                 end
+    executable = candidates.find { |path| path.file? && path.executable? }
+    raise AgentIdentityError, "#{label} executable is unavailable: #{text}" unless executable
+
+    executable.to_s
+  end
+
+  def codex_home_for(identity)
+    identity.fetch("state_kind") == "default" ? default_codex_home : isolated_home(identity.fetch("id"))
+  end
+
+  def validate_alias!(value)
+    raise AgentIdentityError, "identity alias must use lowercase letters, digits, and hyphens" unless value.is_a?(String) && ALIAS_PATTERN.match?(value)
+
+    value
+  end
+
+  def validate_project!(value)
+    raise AgentIdentityError, "project ID must use lowercase letters, digits, and hyphens" unless value.is_a?(String) && PROJECT_PATTERN.match?(value)
+
+    value
+  end
+
+  def validate_pool!(value)
+    raise AgentIdentityError, "conversation pool name must use lowercase letters, digits, and hyphens" unless value.is_a?(String) && POOL_PATTERN.match?(value)
+
+    value
+  end
+
+  def validate_channel!(value)
+    raise AgentIdentityError, "channel name must use lowercase letters, digits, and hyphens" unless value.is_a?(String) && CHANNEL_PATTERN.match?(value)
+
+    value
+  end
+
+  def validate_session!(value)
+    raise AgentIdentityError, "session ID has unsupported characters" unless value.is_a?(String) && SESSION_PATTERN.match?(value)
+
+    value
+  end
+
+  def validate_uuid!(value)
+    text = value.to_s.downcase
+    raise AgentIdentityError, "Codex session ID must be a UUID" unless UUID_PATTERN.match?(text)
+
+    text
+  end
+
+  def validate_terminal_instance_key!(value)
+    unless value.is_a?(String) && value.match?(/\A[0-9a-f]{64}\z/)
+      raise AgentIdentityError, "terminal instance key is malformed"
+    end
+
+    value
+  end
+
+  def validate_terminal_slot!(value)
+    valid = value.is_a?(String) && value.valid_encoding? && value == value.strip &&
+            !value.empty? && value.length <= TERMINAL_SLOT_MAX_LENGTH &&
+            !value.match?(/[\u0000-\u001F\u007F]/)
+    raise AgentIdentityError, "terminal slot must be 1-#{TERMINAL_SLOT_MAX_LENGTH} visible characters without leading or trailing whitespace" unless valid
+
+    value
+  end
+
+  def validate_mode!(value)
+    raise AgentIdentityError, "mode must be one of: #{MODES.join(', ')}" unless MODES.include?(value)
+
+    value
+  end
+
+  def emit(payload, json: false)
+    if json
+      puts JSON.generate(payload)
+      return
+    end
+    payload.each do |key, value|
+      value = value.map { |item| "#{item[0]}=#{item[1]}" }.join(", ") if value.is_a?(Hash)
+      puts "#{key}: #{value}"
+    end
+  end
+
+  def utf8_path(value)
+    value.to_s.dup.force_encoding(Encoding::UTF_8)
+  end
+end
+
+exit AgentIdentity.new(ARGV).run

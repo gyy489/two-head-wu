@@ -1,0 +1,60 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "pathname"
+require_relative "../lib/change_governance"
+
+root = Pathname.new(__dir__).join("../../..").expand_path.cleanpath
+governance = TwoHeadWu::ChangeGovernance.new(root)
+arguments = ARGV.dup
+command = arguments.shift || "help"
+
+begin
+  result = case command
+           when "validate-all"
+             raise TwoHeadWu::ChangeGovernanceError, "validate-all takes no arguments" unless arguments.empty?
+             governance.validate_all!
+           when "validate"
+             if arguments == ["--help"]
+               puts "Usage: change-governance validate --change specs/<id>/change.yaml"
+               exit 0
+             end
+             raise TwoHeadWu::ChangeGovernanceError, "Usage: change-governance validate --change PATH" unless arguments.length == 2 && arguments[0] == "--change"
+             governance.validate_one!(arguments[1])
+           when "gate"
+             raise TwoHeadWu::ChangeGovernanceError, "Usage: change-governance gate --scope staged|worktree" unless arguments.length == 2 && arguments[0] == "--scope"
+             governance.gate!(arguments[1])
+           when "status"
+             raise TwoHeadWu::ChangeGovernanceError, "status takes no arguments" unless arguments.empty?
+             governance.status
+           when "help", "--help", "-h"
+             puts <<~HELP
+               Usage: change-governance COMMAND
+
+                 status                              Show active Change Capsule state
+                 validate --change PATH              Validate one Change Capsule
+                 validate-all                        Validate all capsules and the one-active rule
+                 gate --scope staged|worktree        Enforce thresholds and writable paths
+             HELP
+             exit 0
+           else
+             raise TwoHeadWu::ChangeGovernanceError, "unknown command: #{command}"
+           end
+
+  if ENV["WU_JSON"] == "1"
+    puts JSON.pretty_generate(result)
+  elsif command == "gate"
+    active = result["active_change"]
+    puts "change gate ok: #{result['changed_files']} file(s), #{result['effective_lines']} effective line(s), active=#{active ? active['id'] : 'none'}"
+  elsif command == "validate"
+    puts "Change Capsule ok: #{result['id']} (#{result['status']})"
+  else
+    active = result.fetch("active")
+    label = active.empty? ? "none" : active.map { |item| "#{item['id']}:#{item['status']}" }.join(", ")
+    puts "change governance ok: #{result['capsules']} capsule(s), active=#{label}"
+  end
+rescue TwoHeadWu::ChangeGovernanceError, KeyError => error
+  warn "ERROR: #{error.message}"
+  exit 2
+end

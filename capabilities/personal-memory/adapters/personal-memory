@@ -1,0 +1,555 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "json"
+require "open3"
+require "optparse"
+require "securerandom"
+require "time"
+
+class PersonalMemoryError < StandardError; end
+
+class PersonalMemory
+  DEFAULT_OPENCLAW = ENV.fetch("OPENCLAW_BIN", "openclaw")
+  DEFAULT_WORKSPACE = File.expand_path("../../../var/personal-memory/workspace", __dir__)
+  DEFAULT_BACKUP_DIR = File.expand_path("../../../var/personal-memory/backups", __dir__)
+  MAX_FACT_LENGTH = 2_000
+  MAX_QUERY_LENGTH = 500
+  DEFAULT_RECALL_RESULTS = 3
+  MAX_RECALL_RESULTS = 5
+  NOTEBOOK_CATEGORIES = %w[fact identity preference project decision].freeze
+  ID_PATTERN = /\Apm-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}\z/
+  MEMORY_MARKER_PATTERN = /<!--\s*\/?personal-memory:/i
+  ABSOLUTE_PATH_PATTERN = %r{(?:\A|\s)(?:/(?:Volumes|Users|home|var|tmp|opt|srv)/|[A-Za-z]:[\\/])}
+  SECRET_PATTERN = %r{
+    -----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----
+    |\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{16,}\b
+    |\b(?:password|passwd|token|api[_-]?key)\s*[:=]\s*\S+
+  }ix
+
+  def initialize(argv)
+    @argv = argv.dup
+    @openclaw = ENV.fetch("TWO_HEAD_WU_OPENCLAW_BIN", DEFAULT_OPENCLAW)
+    @workspace = File.expand_path(ENV.fetch("TWO_HEAD_WU_MEMORY_WORKSPACE", DEFAULT_WORKSPACE))
+    @agent = ENV.fetch("TWO_HEAD_WU_MEMORY_AGENT", "main")
+    @backup_dir = File.expand_path(ENV.fetch("TWO_HEAD_WU_MEMORY_BACKUP_DIR", DEFAULT_BACKUP_DIR))
+    @patch = File.expand_path(
+      ENV.fetch("TWO_HEAD_WU_MEMORY_CONFIG_PATCH", "../config/openclaw-memory.patch.json"),
+      __dir__
+    )
+  end
+
+  def run
+    command = @argv.shift
+    case command
+    when "status" then status
+    when "configure" then configure
+    when "backup" then backup
+    when "index" then index
+    when "recall", "search" then recall
+    when "remember" then remember
+    when "correct" then correct
+    when "forget" then forget
+    when "help", "--help", "-h", nil then help
+    else
+      raise PersonalMemoryError, "unknown command: #{command}"
+    end
+  rescue OptionParser::ParseError, PersonalMemoryError => error
+    warn "personal-memory: #{error.message}"
+    2
+  end
+
+  private
+
+  def help
+    puts <<~HELP
+      Usage: personal-memory COMMAND [options]
+
+      Commands:
+        status [--json]                 Show non-secret memory health and policy
+        configure [--apply]             Validate or apply config after verified backup
+        backup                          Create and verify an official OpenClaw backup
+        index                           Rebuild memory-owned indexes for the main Agent
+        recall --query TEXT             Search memory; defaults to 3 compact results
+        recall --scope notebook ...     Search only the explicit small notebook
+        remember [--text TEXT]          Add one explicit managed memory (stdin preferred)
+        correct --id ID [--text TEXT]   Replace one explicit managed memory
+        forget --id ID                  Delete one explicit managed memory
+
+      Environment overrides are available for tests and registered deployments:
+        TWO_HEAD_WU_OPENCLAW_BIN
+        TWO_HEAD_WU_MEMORY_WORKSPACE
+        TWO_HEAD_WU_MEMORY_AGENT
+        TWO_HEAD_WU_MEMORY_BACKUP_DIR
+        TWO_HEAD_WU_MEMORY_CONFIG_PATCH
+    HELP
+    0
+  end
+
+  def status
+    json = false
+    OptionParser.new { |parser| parser.on("--json") { json = true } }.parse!(@argv)
+    reject_extra_arguments!
+
+    memory_rows = parse_json(run_openclaw("memory", "status", "--json", "--agent", @agent))
+    memory = Array(memory_rows).find { |row| row["agentId"] == @agent } || Array(memory_rows).first || {}
+    state = memory.fetch("status", {})
+    scan = memory.fetch("scan", {})
+    sessions = parse_json(run_openclaw("sessions", "--agent", @agent, "--limit", "1", "--json"))
+    result = {
+      "schema" => "two-head-wu.personal-memory.status.v1",
+      "agent" => @agent,
+      "openclaw_version" => run_openclaw("--version").strip,
+      "workspace" => @workspace,
+      "files" => {
+        "user" => File.file?(File.join(@workspace, "USER.md")),
+        "long_term" => File.file?(File.join(@workspace, "MEMORY.md")),
+        "explicit" => File.file?(explicit_path),
+        "dream_diary" => File.file?(File.join(@workspace, "DREAMS.md")),
+        "memory_directory" => File.directory?(memory_dir)
+      },
+      "config" => {
+        "provider" => config_value("agents.defaults.memorySearch.provider"),
+        "sources" => config_value("agents.defaults.memorySearch.sources"),
+        "session_memory_search" => config_value("agents.defaults.memorySearch.experimental.sessionMemory"),
+        "fts_tokenizer" => config_value("agents.defaults.memorySearch.store.fts.tokenizer"),
+        "memory_flush" => config_value("agents.defaults.compaction.memoryFlush.enabled"),
+        "session_memory_hook" => config_value("hooks.internal.entries.session-memory.enabled"),
+        "dreaming" => config_value("plugins.entries.memory-core.config.dreaming.enabled"),
+        "session_visibility" => config_value("tools.sessions.visibility")
+      },
+      "memory" => {
+        "backend" => state["backend"],
+        "files" => state["files"],
+        "chunks" => state["chunks"],
+        "sources" => state["sources"],
+        "source_counts" => Array(state["sourceCounts"]).map do |item|
+          item.select { |key, _value| %w[source files chunks].include?(key) }
+        end,
+        "fts_available" => state.dig("fts", "available"),
+        "provider" => state["provider"],
+        "issues" => Array(scan["issues"])
+      },
+      "sessions" => {
+        "total_count" => sessions["totalCount"] || sessions["count"]
+      }
+    }
+
+    if json
+      puts JSON.pretty_generate(result)
+    else
+      puts "personal-memory: agent=#{@agent} provider=#{result.dig('config', 'provider') || 'default'} " \
+           "files=#{result.dig('memory', 'files') || 0} chunks=#{result.dig('memory', 'chunks') || 0} " \
+           "sessions=#{result.dig('sessions', 'total_count') || 0}"
+      Array(result.dig("memory", "issues")).each { |issue| puts "warning: #{issue}" }
+    end
+    0
+  end
+
+  def configure
+    apply = false
+    OptionParser.new { |parser| parser.on("--apply") { apply = true } }.parse!(@argv)
+    reject_extra_arguments!
+
+    unless apply
+      output = run_openclaw("config", "patch", "--file", @patch, "--dry-run", "--json")
+      puts output
+      return 0
+    end
+
+    backup_result = create_backup
+    ensure_runtime_files!
+    run_openclaw("config", "patch", "--file", @patch)
+    run_openclaw("config", "validate")
+    run_openclaw("memory", "index", "--force", "--agent", @agent)
+    puts JSON.pretty_generate(
+      "schema" => "two-head-wu.personal-memory.configure.v1",
+      "configured" => true,
+      "agent" => @agent,
+      "workspace" => @workspace,
+      "backup" => safe_backup_result(backup_result)
+    )
+    0
+  end
+
+  def backup
+    reject_extra_arguments!
+    puts JSON.pretty_generate(safe_backup_result(create_backup))
+    0
+  end
+
+  def index
+    reject_extra_arguments!
+    print run_openclaw("memory", "index", "--force", "--agent", @agent)
+    0
+  end
+
+  def recall
+    query = nil
+    scope = "all"
+    max_results = DEFAULT_RECALL_RESULTS
+    OptionParser.new do |parser|
+      parser.on("--query TEXT") { |value| query = value }
+      parser.on("--scope SCOPE") { |value| scope = value }
+      parser.on("--max-results N", Integer) { |value| max_results = value }
+    end.parse!(@argv)
+    query ||= @argv.shift
+    reject_extra_arguments!
+    query = normalize_query(query)
+    validate_recall_scope!(scope)
+    validate_recall_limit!(max_results)
+
+    if scope == "notebook"
+      raise PersonalMemoryError, "explicit notebook is not initialized; run configure --apply" unless File.file?(explicit_path)
+      puts JSON.pretty_generate(
+        "schema" => "two-head-wu.personal-memory.recall.v1",
+        "scope" => "notebook",
+        "query" => query,
+        "max_results" => max_results,
+        "results" => notebook_results(query, max_results)
+      )
+      return 0
+    end
+
+    args = ["memory", "search", "--agent", @agent, "--query", query, "--json"]
+    args.concat(["--max-results", max_results.to_s])
+    result = parse_json(run_openclaw(*args))
+    raise PersonalMemoryError, "OpenClaw search result is not an object" unless result.is_a?(Hash)
+    compact = Array(result["results"]).first(max_results).map { |row| compact_search_result(row) }
+    puts JSON.pretty_generate(
+      "schema" => "two-head-wu.personal-memory.recall.v1",
+      "scope" => "all",
+      "query" => query,
+      "max_results" => max_results,
+      "results" => compact
+    )
+    0
+  end
+
+  def remember
+    text = nil
+    category = "fact"
+    source = "explicit-user"
+    project_id = nil
+    OptionParser.new do |parser|
+      parser.on("--text TEXT") { |value| text = value }
+      parser.on("--category CATEGORY") { |value| category = value }
+      parser.on("--source SOURCE") { |value| source = value }
+      parser.on("--project-id ID") { |value| project_id = value }
+    end.parse!(@argv)
+    reject_extra_arguments!
+    text = memory_input(text)
+    validate_category!(category)
+    validate_label!(source, "source")
+    validate_project_id!(project_id) if project_id
+    validate_project_fact!(text, category)
+    ensure_memory_files!
+    memory_id = "pm-#{Time.now.utc.strftime('%Y%m%dT%H%M%S')}-#{SecureRandom.hex(4)}"
+    mutate_records do |content|
+      content.rstrip + "\n\n" + record_block(memory_id, text, category, source, project_id: project_id) + "\n"
+    end
+    reindex_after_write!
+    puts JSON.pretty_generate(
+      "schema" => "two-head-wu.personal-memory.remember.v1",
+      "id" => memory_id,
+      "stored" => true,
+      "path" => "memory/explicit.md",
+      "category" => category,
+      "project_id" => project_id
+    )
+    0
+  end
+
+  def correct
+    memory_id = nil
+    text = nil
+    OptionParser.new do |parser|
+      parser.on("--id ID") { |value| memory_id = value }
+      parser.on("--text TEXT") { |value| text = value }
+    end.parse!(@argv)
+    reject_extra_arguments!
+    validate_memory_id!(memory_id)
+    text = memory_input(text)
+    ensure_memory_files!
+    changed = false
+    mutate_records do |content|
+      replaced = content.sub(record_pattern(memory_id)) do |block|
+        category = block[/^  - category: (.+)$/, 1] || "fact"
+        project_id = block[/^  - project_id: (.+)$/, 1]
+        validate_project_fact!(text, category)
+        changed = true
+        record_block(
+          memory_id, text, category, "explicit-correction",
+          project_id: project_id, corrected: true
+        ).rstrip
+      end
+      replaced
+    end
+    raise PersonalMemoryError, "memory id not found: #{memory_id}" unless changed
+    reindex_after_write!
+    puts JSON.pretty_generate(
+      "schema" => "two-head-wu.personal-memory.correct.v1",
+      "id" => memory_id,
+      "corrected" => true,
+      "path" => "memory/explicit.md"
+    )
+    0
+  end
+
+  def forget
+    memory_id = nil
+    OptionParser.new { |parser| parser.on("--id ID") { |value| memory_id = value } }.parse!(@argv)
+    reject_extra_arguments!
+    validate_memory_id!(memory_id)
+    ensure_memory_files!
+    removed = false
+    mutate_records do |content|
+      changed = content.sub(record_pattern(memory_id)) do
+        removed = true
+        ""
+      end
+      changed.gsub(/\n{3,}/, "\n\n").rstrip + "\n"
+    end
+    raise PersonalMemoryError, "memory id not found: #{memory_id}" unless removed
+    reindex_after_write!
+    puts JSON.pretty_generate(
+      "schema" => "two-head-wu.personal-memory.forget.v1",
+      "id" => memory_id,
+      "forgotten" => true,
+      "path" => "memory/explicit.md"
+    )
+    0
+  end
+
+  def create_backup
+    FileUtils.mkdir_p(@backup_dir, mode: 0o700)
+    File.chmod(0o700, @backup_dir)
+    output = run_openclaw("backup", "create", "--output", @backup_dir, "--verify", "--json")
+    result = parse_json(output)
+    archive = result["archive"] || result["archivePath"] || result["outputPath"] || result["path"]
+    raise PersonalMemoryError, "OpenClaw backup did not return an archive path" if archive.to_s.empty?
+    raise PersonalMemoryError, "OpenClaw backup archive is missing: #{archive}" unless File.file?(archive)
+
+    File.chmod(0o600, archive)
+    result
+  end
+
+  def safe_backup_result(result)
+    {
+      "schema" => "two-head-wu.personal-memory.backup.v1",
+      "created" => true,
+      "archive" => result["archive"] || result["archivePath"] || result["outputPath"] || result["path"],
+      "verified" => result.key?("verified") ? result["verified"] : true
+    }
+  end
+
+  def ensure_runtime_files!
+    raise PersonalMemoryError, "USER.md is missing; refusing to seed an unknown workspace" unless File.file?(File.join(@workspace, "USER.md"))
+    ensure_memory_files!
+  end
+
+  def ensure_memory_files!
+    FileUtils.mkdir_p(memory_dir, mode: 0o700)
+    create_private_file(File.join(@workspace, "MEMORY.md"), <<~MARKDOWN)
+      # Long-term Memory
+
+      Durable facts, preferences, decisions, and project summaries promoted or curated by OpenClaw.
+
+      ## Owner and preferences
+
+      ## Durable decisions
+
+      ## Project references
+    MARKDOWN
+    create_private_file(explicit_path, <<~MARKDOWN)
+      # Explicit Memory
+
+      ID-addressable facts explicitly requested, corrected, or forgotten by the owner.
+      Automatic session capture and Dreaming do not write this file.
+    MARKDOWN
+  end
+
+  def create_private_file(path, content)
+    descriptor = File.open(path, File::WRONLY | File::CREAT | File::EXCL, 0o600)
+    descriptor.write(content)
+    descriptor.close
+  rescue Errno::EEXIST
+    nil
+  ensure
+    File.chmod(0o600, path) if File.file?(path)
+  end
+
+  def mutate_records
+    lock_path = File.join(memory_dir, ".personal-memory.lock")
+    File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
+      lock.flock(File::LOCK_EX)
+      content = File.read(explicit_path, encoding: "UTF-8")
+      updated = yield(content)
+      temporary = File.join(memory_dir, ".explicit.#{Process.pid}.#{SecureRandom.hex(4)}.tmp")
+      begin
+        File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) { |file| file.write(updated) }
+        File.rename(temporary, explicit_path)
+        File.chmod(0o600, explicit_path)
+      ensure
+        File.delete(temporary) if File.exist?(temporary)
+      end
+    end
+  end
+
+  def record_block(memory_id, text, category, source, project_id: nil, corrected: false)
+    timestamp_key = corrected ? "corrected_at" : "recorded_at"
+    timestamp = Time.now.utc.iso8601
+    project_line = project_id ? "  - project_id: #{project_id}\n" : ""
+    <<~MARKDOWN
+      <!-- personal-memory:#{memory_id} -->
+      - id: `#{memory_id}`
+        - category: #{category}
+      #{project_line.rstrip}
+        - #{timestamp_key}: #{timestamp}
+        - source: #{source}
+        - fact: #{text}
+      <!-- /personal-memory:#{memory_id} -->
+    MARKDOWN
+  end
+
+  def record_pattern(memory_id)
+    /<!-- personal-memory:#{Regexp.escape(memory_id)} -->.*?<!-- \/personal-memory:#{Regexp.escape(memory_id)} -->\n?/m
+  end
+
+  def memory_input(value)
+    value = $stdin.read if value.nil?
+    fact = normalize_fact(value)
+    raise PersonalMemoryError, "memory looks like a credential or private key; store only a non-secret reference" if fact.match?(SECRET_PATTERN)
+    raise PersonalMemoryError, "memory contains a reserved notebook record marker" if fact.match?(MEMORY_MARKER_PATTERN)
+    fact
+  end
+
+  def normalize_fact(value)
+    fact = value.to_s.encode("UTF-8", invalid: :replace, undef: :replace, replace: "").strip.gsub(/\s+/, " ")
+    raise PersonalMemoryError, "memory text is empty" if fact.empty?
+    raise PersonalMemoryError, "memory text exceeds #{MAX_FACT_LENGTH} characters" if fact.length > MAX_FACT_LENGTH
+    fact
+  end
+
+  def normalize_query(value)
+    query = value.to_s.encode("UTF-8", invalid: :replace, undef: :replace, replace: "").strip.gsub(/\s+/, " ")
+    raise PersonalMemoryError, "memory query is empty" if query.empty?
+    raise PersonalMemoryError, "memory query exceeds #{MAX_QUERY_LENGTH} characters" if query.length > MAX_QUERY_LENGTH
+    query
+  end
+
+  def validate_category!(value)
+    return if NOTEBOOK_CATEGORIES.include?(value)
+    raise PersonalMemoryError, "invalid category: use #{NOTEBOOK_CATEGORIES.join(', ')}"
+  end
+
+  def validate_project_id!(value)
+    validate_label!(value, "project id")
+  end
+
+  def validate_project_fact!(text, category)
+    return unless category == "project" && text.match?(ABSOLUTE_PATH_PATTERN)
+    raise PersonalMemoryError, "project memories must store a project id instead of an absolute path"
+  end
+
+  def validate_recall_scope!(scope)
+    return if %w[all notebook].include?(scope)
+    raise PersonalMemoryError, "invalid recall scope: use all or notebook"
+  end
+
+  def validate_recall_limit!(value)
+    return if value.between?(1, MAX_RECALL_RESULTS)
+    raise PersonalMemoryError, "max results must be between 1 and #{MAX_RECALL_RESULTS}"
+  end
+
+  def notebook_results(query, max_results)
+    content = File.read(explicit_path, encoding: "UTF-8")
+    records = content.scan(/<!-- personal-memory:(#{ID_PATTERN.source.delete_prefix('\\A').delete_suffix('\\z')}) -->(.*?)<!-- \/personal-memory:\1 -->/m).map do |memory_id, body|
+      notebook_record(memory_id, body)
+    end.compact
+    ranked = records.map do |record|
+      score = notebook_score(record, query)
+      score.positive? ? record.merge("score" => score) : nil
+    end.compact
+    ranked.sort do |left, right|
+      score_order = right.fetch("score") <=> left.fetch("score")
+      score_order.zero? ? right.fetch("id") <=> left.fetch("id") : score_order
+    end.first(max_results)
+  end
+
+  def notebook_record(memory_id, body)
+    fact = body[/^  - fact: (.+)$/, 1]
+    return nil unless fact
+    record = {
+      "id" => memory_id,
+      "category" => body[/^  - category: (.+)$/, 1] || "fact",
+      "fact" => fact
+    }
+    project_id = body[/^  - project_id: (.+)$/, 1]
+    record["project_id"] = project_id if project_id
+    record
+  end
+
+  def notebook_score(record, query)
+    needle = query.downcase
+    haystack = [record["id"], record["category"], record["project_id"], record["fact"]].compact.join(" ").downcase
+    score = haystack.include?(needle) ? 100 : 0
+    tokens = needle.scan(/[\p{Han}]{2,}|[[:alnum:]][[:alnum:]-]{1,}/).uniq
+    score + tokens.count { |token| haystack.include?(token) } * 10
+  end
+
+  def compact_search_result(row)
+    return {} unless row.is_a?(Hash)
+    allowed = %w[path startLine endLine lineStart lineEnd score snippet source]
+    row.select { |key, _value| allowed.include?(key) }
+  end
+
+  def validate_label!(value, label)
+    return if value.to_s.match?(/\A[a-z0-9][a-z0-9-]{0,39}\z/)
+    raise PersonalMemoryError, "invalid #{label}: use lowercase letters, digits, and hyphens"
+  end
+
+  def validate_memory_id!(memory_id)
+    raise PersonalMemoryError, "invalid or missing memory id" unless memory_id.to_s.match?(ID_PATTERN)
+  end
+
+  def reindex_after_write!
+    run_openclaw("memory", "index", "--force", "--agent", @agent)
+  end
+
+  def config_value(path)
+    output, status = Open3.capture2e(@openclaw, "config", "get", path, "--json")
+    return nil unless status.success?
+    JSON.parse(output)
+  rescue JSON::ParserError
+    output.strip
+  end
+
+  def run_openclaw(*args)
+    raise PersonalMemoryError, "OpenClaw CLI is not executable: #{@openclaw}" unless File.executable?(@openclaw)
+    output, status = Open3.capture2e(@openclaw, *args)
+    raise PersonalMemoryError, "OpenClaw #{args.join(' ')} failed: #{output.strip}" unless status.success?
+    output
+  end
+
+  def parse_json(output)
+    JSON.parse(output)
+  rescue JSON::ParserError => error
+    raise PersonalMemoryError, "OpenClaw returned invalid JSON: #{error.message}"
+  end
+
+  def reject_extra_arguments!
+    raise PersonalMemoryError, "unexpected arguments: #{@argv.join(' ')}" unless @argv.empty?
+  end
+
+  def memory_dir
+    File.join(@workspace, "memory")
+  end
+
+  def explicit_path
+    File.join(memory_dir, "explicit.md")
+  end
+end
+
+exit PersonalMemory.new(ARGV).run

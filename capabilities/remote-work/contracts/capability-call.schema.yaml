@@ -1,0 +1,43 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Two-Headed-Wu personal capability call
+type: object
+required: [schema_version, request_id, source, kind, capability_id, replay_class, input]
+properties:
+  schema_version:
+    const: 1
+  request_id:
+    type: string
+    pattern: "^call-[a-f0-9]{24}$"
+  source:
+    enum: [owner-air, wechat-owner, mac-mini-local]
+  kind:
+    enum: [tool, workflow, codex]
+  capability_id:
+    type: string
+    pattern: "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"
+  replay_class:
+    enum: [safe-read, idempotent-write, owner-confirmation-required]
+  input:
+    type: object
+  owner_confirmed:
+    type: boolean
+  requested_executor:
+    enum: [air, mac-mini]
+  project_lease:
+    type: object
+    required: [mode, base_manifest]
+    properties:
+      mode:
+        enum: [review, workspace-write, full-project]
+      base_manifest:
+        type: object
+        additionalProperties:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+    additionalProperties: false
+  artifact_ids:
+    type: array
+    items:
+      type: string
+      pattern: "^art-[a-f0-9]{24}$"
+additionalProperties: false

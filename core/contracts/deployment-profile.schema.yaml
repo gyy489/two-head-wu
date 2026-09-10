@@ -1,0 +1,50 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://two-head-wu.local/contracts/deployment-profile.schema.yaml"
+title: "Two-Headed-Wu Deployment Profile"
+type: object
+additionalProperties: false
+required:
+  - schema_version
+  - id
+  - project
+  - mode
+  - runtimes
+  - capability_packages
+  - data_bindings
+  - secret_refs
+  - approvals
+  - update_policy
+  - acceptance_tests
+properties:
+  schema_version:
+    const: 1
+  id:
+    type: string
+    pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+  project: { type: string }
+  customer: { type: [string, "null"] }
+  mode:
+    enum: [managed, customer-local, hybrid]
+  runtimes:
+    type: array
+    items: { type: string }
+  capability_packages:
+    type: array
+    items:
+      type: object
+      required: [id, version]
+      properties:
+        id: { type: string }
+        version: { type: string }
+  data_bindings: { type: array }
+  secret_refs:
+    type: array
+    items:
+      type: string
+      pattern: "^[a-z][a-z0-9+.-]*://"
+  approvals: { type: object }
+  resource_limits: { type: object }
+  update_policy: { type: object }
+  acceptance_tests:
+    type: array
+    items: { type: string }

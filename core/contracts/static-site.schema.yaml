@@ -1,0 +1,44 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://two-head-wu.local/contracts/static-site.schema.yaml"
+title: "Two-Headed-Wu Static Site Policy"
+type: object
+additionalProperties: false
+required:
+  - id
+  - capability
+  - summary
+  - public_url
+  - access
+  - content_mode
+  - lifecycle
+  - target_resource
+  - publication_policy
+  - private_ref
+properties:
+  id:
+    type: string
+    pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+  capability:
+    type: string
+    pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+  summary:
+    type: string
+  public_url:
+    type: string
+    pattern: "^https://"
+  access:
+    enum: [authenticated_private, public]
+  content_mode:
+    const: static_only
+  lifecycle:
+    const: persistent_mutable
+  expiry:
+    enum: [none]
+  target_resource:
+    type: string
+    pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+  publication_policy:
+    type: object
+  private_ref:
+    type: string
+    pattern: "^private://two-head-wu/[a-z0-9/-]+$"

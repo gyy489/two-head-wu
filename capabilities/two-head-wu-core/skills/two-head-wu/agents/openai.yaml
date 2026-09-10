@@ -1,0 +1,4 @@
+interface:
+  display_name: "两头乌"
+  short_description: "查询并调用两头乌统一管理的项目能力、工具、资源与受控工作流"
+  default_prompt: "Use $two-head-wu to resolve the capabilities allowed for this project and task."

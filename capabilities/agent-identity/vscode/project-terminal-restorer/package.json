@@ -1,0 +1,73 @@
+{
+  "name": "two-head-wu-project-terminals",
+  "displayName": "Two-Headed-Wu Project Terminals",
+  "description": "Restore explicitly managed Codex terminals by exact thread UUID and identity.",
+  "version": "0.1.0",
+  "publisher": "two-head-wu",
+  "private": true,
+  "license": "UNLICENSED",
+  "files": [
+    "extension.js",
+    "README.md"
+  ],
+  "engines": {
+    "vscode": ">=1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:twoHeadWu.projectTerminals.restoreNow",
+    "onCommand:twoHeadWu.projectTerminals.openNew"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "twoHeadWu.projectTerminals.restoreNow",
+        "title": "Two-Headed-Wu: Restore Project Codex Terminals"
+      },
+      {
+        "command": "twoHeadWu.projectTerminals.openNew",
+        "title": "Two-Headed-Wu: Open Managed Codex Terminal"
+      }
+    ],
+    "configuration": {
+      "title": "Two-Headed-Wu Project Terminals",
+      "properties": {
+        "twoHeadWu.projectTerminals.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Restore managed Codex terminals when this workspace folder opens."
+        },
+        "twoHeadWu.projectTerminals.projectId": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "pattern": "^[a-z][a-z0-9-]{0,62}$",
+          "description": "Registered Two-Headed-Wu project ID for this workspace folder."
+        },
+        "twoHeadWu.projectTerminals.adapterPath": {
+          "type": "string",
+          "default": "",
+          "scope": "window",
+          "description": "Absolute path to the trusted agent-identity adapter."
+        },
+        "twoHeadWu.projectTerminals.autoReveal": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Reveal the terminal panel when one or more managed terminals are restored."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node ../../tests/test_project_terminal_extension.js"
+  }
+}

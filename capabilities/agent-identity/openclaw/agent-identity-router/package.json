@@ -1,0 +1,20 @@
+{
+  "name": "@two-head-wu/agent-identity-router",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Owner-only WeChat commands for Two-Headed-Wu Codex identity routing.",
+  "peerDependencies": {
+    "openclaw": ">=2026.7.1"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  }
+}

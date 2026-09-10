@@ -1,0 +1,96 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Two-Headed-Wu owner remote job
+type: object
+required: [schema_version, id, request_id, kind, owner, device_id, state, identity, created_at]
+properties:
+  schema_version:
+    const: 1
+  id:
+    type: string
+    pattern: "^job-[a-z0-9-]+$"
+  request_id:
+    type: string
+    pattern: "^call-[a-f0-9]{24}$"
+  kind:
+    enum: [codex, tool, capability]
+  owner:
+    const: example-owner
+  device_id:
+    type: string
+  state:
+    enum: [queued, leased, running, waiting_user, uploading, succeeded, failed, cancelled, expired]
+  instruction:
+    type: string
+    minLength: 1
+  identity:
+    enum: [owner-auto, owner-local-catalog]
+  capsule_sha256:
+    type: string
+    pattern: "^[a-f0-9]{64}$"
+  created_at:
+    type: string
+  updated_at:
+    type: string
+  tool_id:
+    type: string
+    pattern: "^[a-z][a-z0-9-]{0,63}$"
+  capability_id:
+    type: string
+    pattern: "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"
+  executor_kind:
+    enum: [tool, workflow, codex]
+  capability_input:
+    type: object
+  requested_executor:
+    enum: [air, mac-mini]
+  project_lease_id:
+    type: string
+    pattern: "^project-[a-f0-9]{24}$"
+  project_mode:
+    enum: [review, workspace-write, full-project]
+  artifact_ids:
+    type: array
+    maxItems: 10
+    uniqueItems: true
+    items:
+      type: string
+      pattern: "^art-[a-f0-9]{24}$"
+  input_artifacts:
+    type: array
+    maxItems: 10
+    items:
+      $ref: "artifact.schema.yaml"
+  attempt:
+    type: integer
+    minimum: 0
+  max_attempts:
+    type: integer
+    minimum: 1
+allOf:
+  - if:
+      properties:
+        kind:
+          const: codex
+    then:
+      required: [instruction, capsule_sha256]
+      properties:
+        identity:
+          const: owner-auto
+  - if:
+      properties:
+        kind:
+          const: tool
+    then:
+      required: [tool_id]
+      properties:
+        identity:
+          const: owner-local-catalog
+  - if:
+      properties:
+        kind:
+          const: capability
+    then:
+      required: [capability_id, executor_kind, capability_input, requested_executor]
+      properties:
+        identity:
+          const: owner-local-catalog

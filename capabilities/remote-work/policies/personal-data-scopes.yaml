@@ -1,0 +1,23 @@
+schema_version: 1
+scope: owner-only
+
+mcp:
+  discovery: metadata-only
+  registered_servers: []
+  default_tool_access: denied
+  credentials_transfer: forbidden
+  oauth_transfer: forbidden
+  registration_requirement: explicit-server-and-tool-allowlist
+
+memory:
+  private_body_location: mac-mini-only
+  transfer_to_air: forbidden
+  remote_query: explicit-tool-allowlist-only
+  write_requires_owner_confirmation: true
+  project_shared_memory: not-configured
+
+wechat:
+  source_id: wechat-owner
+  shares_capability_contract_with_air: true
+  aliyun_round_trip_when_mini_local: optional
+  attachment_publication_without_explicit_intent: forbidden

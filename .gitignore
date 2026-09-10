@@ -9,3 +9,9 @@ var/
 logs/
 private/
 backups/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+skills/.runtime/
+skills/releases/
+contexts/

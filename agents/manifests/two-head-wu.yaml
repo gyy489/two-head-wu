@@ -1,0 +1,64 @@
+version: 1
+id: two-head-wu
+name: 两头乌
+kind: compatibility_runtime_agent
+purpose: "通过 OpenClaw 暴露确定性的两头乌基础平台，并把获准任务交给可替换的智能运行时。"
+status: public-reference
+runtime:
+  host: openclaw
+  host_status: required-for-full-runtime
+  host_cli: openclaw
+  gateway:
+    mode: local
+    bind: loopback
+    auth: token_secret_ref
+    channels: []
+  primary_brain: codex
+  primary_adapter: openclaw_codex_harness
+  fallback_brain: claude-code
+  fallback_adapter: openclaw_acpx
+storage:
+  core_interface: core/bin/wu
+  catalog_index: catalog/index.yaml
+  package_registry: catalog/packages_registry.yaml
+  project_registry: registries/projects_registry.yaml
+  capability_registry: registries/capabilities_registry.yaml
+  runtime_registry: registries/runtimes_registry.yaml
+  mcp_registry: catalog/mcp_registry.yaml
+  context_root: var/contexts/two-head-wu
+  workspace: var/workspace
+  log_root: var/logs/two-head-wu
+memory:
+  capability: personal-memory
+  provider_interface: personal-memory.recall.v1
+  host_provider: openclaw-memory-core
+  automatic_capture: openclaw-only
+  direct_runtime_access: authorized-recall-and-explicit-crud
+  cross_agent_session_visibility: denied
+capabilities:
+  skill_sets: []
+  runtime_skill_sets:
+    codex: [foundation-platform]
+    claude-code: [foundation-platform]
+    openclaw: [foundation-platform]
+  mcp_allowlist: []
+  delegation_allowlist: [codex, claude-code]
+  explicit_deny:
+    - unrestricted_secret_export
+    - unregistered_publication
+    - irreversible_deletion
+    - unapproved_payment
+    - unrestricted_device_control
+permissions:
+  default_profile: workspace_confined
+  default_network_access: controlled
+  secrets_access: explicit_per_tool
+  external_write: require_confirmation
+  destructive_action: require_confirmation
+delegation:
+  topology: hub_and_spoke
+  capability_resolution_command: "wu resolve"
+  direct_subagent_cross_calls: false
+  result_returns_to_controller: true
+  project_workspace_required: true
+  capability_resolution_required: true

@@ -1,0 +1,252 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "json"
+require "optparse"
+require "pathname"
+require "time"
+
+class SkillsDashboardError < StandardError; end
+
+# Controls the read-only local Skills-relationship dashboard: a WEBrick
+# process bound to loopback by default, started/stopped like a normal dev
+# server. It never mutates project state; the adapter only tracks a PID and
+# port under var/skills-dashboard/ so it can be found again.
+class SkillsDashboardCLI
+  DEFAULT_PORT = 8420
+  DEFAULT_BIND = "127.0.0.1"
+  DEFAULT_IDLE_TIMEOUT = 600
+
+  def initialize(arguments)
+    @arguments = arguments.dup
+    @root = Pathname.new(utf8_path(__dir__)).join("../../..").expand_path.cleanpath
+  end
+
+  def run
+    command = @arguments.shift || "help"
+    case command
+    when "help", "--help", "-h" then help
+    when "start" then start
+    when "stop" then stop
+    when "restart" then restart
+    when "status" then status
+    else raise SkillsDashboardError, "unknown command: #{command}"
+    end
+  rescue OptionParser::ParseError
+    warn "Error: invalid command options"
+    2
+  rescue SkillsDashboardError, Errno::EACCES, Errno::ENOENT => error
+    warn "Error: #{error.message}"
+    2
+  end
+
+  private
+
+  def help
+    puts <<~HELP
+      Usage: skills-dashboard COMMAND [OPTIONS]
+
+      Commands:
+        start [--port N] [--bind ADDRESS] [--idle-timeout SECONDS] [--open] [--foreground]
+        stop
+        restart [--port N] [--bind ADDRESS] [--idle-timeout SECONDS] [--open]
+        status [--json]
+
+      Read-only local dashboard for the Skills/Capabilities relationship graph.
+      Binds to 127.0.0.1:#{DEFAULT_PORT} by default. Serves only metadata already
+      present in this project's own registries; never reads credentials, never
+      accepts a request that mutates project state.
+
+      This is meant to be started on request, not left running: with no request
+      for --idle-timeout seconds (default #{DEFAULT_IDLE_TIMEOUT}; an open browser
+      tab pings itself to stay counted as active) it shuts itself down and clears
+      its own pid/port state, the same cleanup `stop` would do. Pass
+      --idle-timeout 0 to keep it running until explicitly stopped.
+    HELP
+    0
+  end
+
+  def start
+    options = parse_start_options!
+    do_start(options)
+  end
+
+  def restart
+    options = parse_start_options!
+    do_stop if running?
+    do_start(options)
+  end
+
+  def stop
+    parse_no_options!
+    pid, = read_state
+    raise SkillsDashboardError, "dashboard is not running" unless pid && process_alive?(pid)
+
+    do_stop
+    emit("result" => "stopped", "pid" => pid)
+    0
+  end
+
+  def status
+    json = parse_json_flag!
+    pid, port = read_state
+    if pid && process_alive?(pid)
+      emit({ "result" => "status", "running" => true, "pid" => pid, "port" => port, "url" => url_for(port) }, json: json)
+    else
+      emit({ "result" => "status", "running" => false }, json: json)
+    end
+    0
+  end
+
+  def do_start(options)
+    if running?
+      pid, port = read_state
+      emit("result" => "already-running", "pid" => pid, "port" => port, "url" => url_for(port))
+      return 0
+    end
+
+    port = options[:port] || DEFAULT_PORT
+    bind = options[:bind] || DEFAULT_BIND
+    idle_timeout = options[:idle_timeout] || DEFAULT_IDLE_TIMEOUT
+    ensure_var_root!
+    environment = {
+      "SKILLS_DASHBOARD_PROJECT_ROOT" => @root.to_s,
+      "SKILLS_DASHBOARD_PORT" => port.to_s,
+      "SKILLS_DASHBOARD_BIND" => bind,
+      "SKILLS_DASHBOARD_IDLE_TIMEOUT" => idle_timeout.to_s,
+      "SKILLS_DASHBOARD_STATE_PATH" => state_path.to_s
+    }
+
+    if options[:foreground]
+      exec(environment, "ruby", server_entrypoint.to_s)
+    end
+
+    log = var_root.join("server.log")
+    pid = Process.spawn(environment, "ruby", server_entrypoint.to_s, out: [log.to_s, "a"], err: [log.to_s, "a"], pgroup: true)
+    Process.detach(pid)
+    sleep 0.4
+    raise SkillsDashboardError, "server exited immediately; see #{log}" unless process_alive?(pid)
+
+    write_state(pid, port)
+    emit(
+      "result" => "started", "pid" => pid, "port" => port, "bind" => bind, "url" => url_for(port),
+      "idle_timeout" => idle_timeout, "log" => log.to_s
+    )
+    system("open", url_for(port)) if options[:open] && darwin?
+    0
+  end
+
+  def do_stop
+    pid, = read_state
+    return unless pid && process_alive?(pid)
+
+    Process.kill("TERM", pid)
+    10.times do
+      break unless process_alive?(pid)
+
+      sleep 0.2
+    end
+    Process.kill("KILL", pid) if process_alive?(pid)
+    clear_state!
+  end
+
+  def running?
+    pid, = read_state
+    !pid.nil? && process_alive?(pid)
+  end
+
+  def read_state
+    return [nil, nil] unless state_path.exist?
+
+    data = JSON.parse(state_path.read(encoding: "UTF-8"))
+    [data["pid"], data["port"]]
+  rescue JSON::ParserError, Errno::ENOENT
+    [nil, nil]
+  end
+
+  def write_state(pid, port)
+    ensure_var_root!
+    state_path.write(JSON.generate({ "pid" => pid, "port" => port, "started_at" => Time.now.utc.iso8601 }))
+  end
+
+  def clear_state!
+    FileUtils.rm_f(state_path.to_s)
+  end
+
+  def process_alive?(pid)
+    Process.kill(0, pid)
+    true
+  rescue Errno::ESRCH, Errno::EPERM
+    false
+  end
+
+  def var_root
+    @root.join("var/skills-dashboard")
+  end
+
+  def state_path
+    var_root.join("server.json")
+  end
+
+  def ensure_var_root!
+    FileUtils.mkdir_p(var_root.to_s)
+  end
+
+  def server_entrypoint
+    @root.join("capabilities/skills-dashboard/server/app.rb")
+  end
+
+  def url_for(port)
+    "http://127.0.0.1:#{port}/"
+  end
+
+  def darwin?
+    RUBY_PLATFORM.include?("darwin")
+  end
+
+  def parse_start_options!
+    options = { port: nil, bind: nil, idle_timeout: nil, open: false, foreground: false }
+    parser = OptionParser.new do |item|
+      item.on("--port N", Integer) { |value| options[:port] = value }
+      item.on("--bind ADDRESS") { |value| options[:bind] = value }
+      item.on("--idle-timeout SECONDS", Integer) { |value| options[:idle_timeout] = value }
+      item.on("--open") { options[:open] = true }
+      item.on("--foreground") { options[:foreground] = true }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options
+  end
+
+  def parse_json_flag!
+    options = { json: false }
+    parser = OptionParser.new { |item| item.on("--json") { options[:json] = true } }
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    options.fetch(:json)
+  end
+
+  def parse_no_options!
+    OptionParser.new.parse!(@arguments)
+    ensure_no_arguments!
+  end
+
+  def ensure_no_arguments!
+    raise SkillsDashboardError, "unexpected arguments: #{@arguments.join(' ')}" unless @arguments.empty?
+  end
+
+  def emit(payload, json: false)
+    if json
+      puts JSON.generate(payload)
+      return
+    end
+    payload.each { |key, value| puts "#{key}: #{value}" }
+  end
+
+  def utf8_path(value)
+    value.to_s.dup.force_encoding(Encoding::UTF_8)
+  end
+end
+
+exit SkillsDashboardCLI.new(ARGV).run

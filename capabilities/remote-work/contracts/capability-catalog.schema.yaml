@@ -1,0 +1,87 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Two-Headed-Wu signed owner capability catalog
+type: object
+required: [schema_version, catalog_version, generated_at, capabilities, public_key_sha256, signature_base64]
+properties:
+  schema_version:
+    const: 1
+  catalog_version:
+    type: string
+    pattern: "^[a-f0-9]{16}$"
+  generated_at:
+    type: string
+    format: date-time
+  public_key_sha256:
+    type: string
+    pattern: "^[a-f0-9]{64}$"
+  signature_base64:
+    type: string
+    minLength: 32
+  capabilities:
+    type: array
+    maxItems: 256
+    items:
+      type: object
+      required: [id, kind, location, exposure, status, invocation_policy, side_effect, queueable, runtime_requires, summary]
+      properties:
+        id:
+          type: string
+          pattern: "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 160
+        kind:
+          enum: [artifact, capability, codex-task, database-query, mcp-tool, memory, model-catalog, skill, tool, workflow]
+        location:
+          enum: [air, mac-mini, aliyun]
+        exposure:
+          enum: [callable, metadata-only]
+        status:
+          enum: [active, disabled]
+        invocation_policy:
+          enum: [auto, queue, confirm, manual, unavailable]
+        side_effect:
+          enum: [read-only, local-write, isolated-write, external-write, destructive, metadata-only]
+        queueable:
+          type: boolean
+        runtime_requires:
+          type: array
+          maxItems: 32
+          items:
+            type: string
+            pattern: "^[a-z][a-z0-9-]{0,63}$"
+        command:
+          type: string
+        tool_id:
+          type: string
+          pattern: "^[a-z][a-z0-9-]{0,63}$"
+        data_location:
+          type: string
+        input_schema:
+          type: object
+        output_schema:
+          type: string
+        executor_kind:
+          enum: [tool, workflow, codex]
+        adapter:
+          type: string
+          pattern: "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"
+        capability_version:
+          type: integer
+          minimum: 1
+        replay_class:
+          enum: [safe-read, idempotent-write, owner-confirmation-required]
+        approval_policy:
+          enum: [auto, owner-confirmation, manual]
+        audience:
+          enum: [all-air, owner-air, owner-step-up]
+        confirmation:
+          enum: [none, owner-password]
+        executor:
+          enum: [air-worker, protected-adapter]
+        summary:
+          type: string
+          minLength: 1
+      additionalProperties: false
+additionalProperties: false

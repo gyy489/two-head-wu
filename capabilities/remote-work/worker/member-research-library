@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Read-only research index provider for the low-privilege member Worker."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import uuid
+from pathlib import Path
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "research-library"
+sys.path.insert(0, str(PACKAGE_ROOT / "lib"))
+
+from research_library.library import Library
+from research_library.model import CAPABILITY_VERSION, LibraryError
+
+
+def envelope(operation: str, *, data=None, error: LibraryError | None = None) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "ok": error is None,
+        "operation": operation,
+        "request_id": str(uuid.uuid4()),
+        "provenance": {
+            "capability_id": "research-library-member-index",
+            "capability_version": CAPABILITY_VERSION,
+            "executor": os.environ.get("TWO_HEAD_WU_EXECUTOR", "mini-member"),
+        },
+    }
+    if error:
+        payload["error"] = {
+            "code": error.code,
+            "message": str(error),
+            "recoverable": error.recoverable,
+        }
+    else:
+        payload["data"] = data or {}
+    return payload
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="member-research-library")
+    root.add_argument("--data-root", required=True)
+    commands = root.add_subparsers(dest="command", required=True)
+    commands.add_parser("status")
+    search = commands.add_parser("search")
+    search.add_argument("--query", required=True)
+    search.add_argument("--type")
+    search.add_argument("--limit", type=int, default=30)
+    document = commands.add_parser("get")
+    document.add_argument("--work-id", required=True)
+    document.add_argument("--version", default="latest")
+    document.add_argument("--artifact", default="original")
+    return root
+
+
+def status(library: Library) -> dict[str, object]:
+    library.store.require_initialized()
+    with library.store.connect(readonly=True) as database:
+        integrity = database.execute("PRAGMA integrity_check").fetchone()[0]
+        counts = {
+            table: database.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            for table in ("works", "versions", "artifacts", "entities")
+        }
+    return {
+        "healthy": integrity == "ok",
+        "integrity": integrity,
+        "schema_version": library.store.database_schema_version(),
+        "member_index_snapshot": True,
+        "counts": counts,
+    }
+
+
+def get_metadata(library: Library, work_id: str, version: str, artifact: str) -> dict[str, object]:
+    try:
+        work_id = str(uuid.UUID(work_id))
+    except (ValueError, AttributeError) as error:
+        raise LibraryError("INVALID_WORK_ID", "The requested work identity is invalid.") from error
+    if version != "latest":
+        try:
+            version = str(uuid.UUID(version))
+        except (ValueError, AttributeError) as error:
+            raise LibraryError("INVALID_VERSION_ID", "The requested version identity is invalid.") from error
+    if artifact != "original":
+        raise LibraryError("ARTIFACT_NOT_FOUND", "Only original metadata is available in the member index.")
+
+    with library.store.connect(readonly=True) as database:
+        version_row = library._version(database, work_id, version)
+        row = database.execute(
+            """SELECT a.*,w.canonical_title,w.kind,v.publication_date,v.version_kind,v.doi,v.publisher,
+                      v.journal,v.volume,v.issue,v.pages
+               FROM artifacts a JOIN versions v ON v.id=a.version_id JOIN works w ON w.id=v.work_id
+               WHERE a.version_id=? AND a.role='original'
+               ORDER BY a.authoritative DESC,a.created_at DESC LIMIT 1""",
+            (version_row["id"],),
+        ).fetchone()
+        if not row:
+            raise LibraryError("ARTIFACT_NOT_FOUND", "The requested document metadata is unavailable.")
+        result = dict(row)
+        result.pop("relative_path", None)
+        result["work_id"] = work_id
+        result["version_id"] = version_row["id"]
+        result["creators"] = library._creators(database, work_id)
+        return result
+
+
+def dispatch(arguments: argparse.Namespace) -> dict[str, object]:
+    root = Path(arguments.data_root)
+    library = Library(root)
+    if arguments.command == "status":
+        return status(library)
+    if arguments.command == "search":
+        return library.search(arguments.query, kind=arguments.type, limit=arguments.limit)
+    if arguments.command == "get":
+        return get_metadata(library, arguments.work_id, arguments.version, arguments.artifact)
+    raise LibraryError("UNKNOWN_OPERATION", "The member research operation is unavailable.")
+
+
+def main() -> int:
+    raw = [item for item in sys.argv[1:] if item != "--json"]
+    operation = next((item for item in raw if not item.startswith("-")), "unknown")
+    try:
+        arguments = parser().parse_args(raw)
+        operation = arguments.command
+        print(json.dumps(envelope(operation, data=dispatch(arguments)), ensure_ascii=False, sort_keys=True))
+        return 0
+    except LibraryError as error:
+        print(json.dumps(envelope(operation, error=error), ensure_ascii=False, sort_keys=True))
+        return 2
+    except SystemExit:
+        raise
+    except Exception:
+        error = LibraryError(
+            "MEMBER_INDEX_UNAVAILABLE",
+            "The read-only member research index is unavailable.",
+            True,
+        )
+        print(json.dumps(envelope(operation, error=error), ensure_ascii=False, sort_keys=True))
+        return 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

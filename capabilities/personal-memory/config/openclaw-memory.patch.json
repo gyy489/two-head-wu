@@ -1,0 +1,52 @@
+{
+  "agents": {
+    "defaults": {
+      "memorySearch": {
+        "provider": "none",
+        "sources": ["memory", "sessions"],
+        "experimental": {
+          "sessionMemory": true
+        },
+        "store": {
+          "fts": {
+            "tokenizer": "trigram"
+          }
+        }
+      },
+      "compaction": {
+        "memoryFlush": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "hooks": {
+    "internal": {
+      "enabled": true,
+      "entries": {
+        "session-memory": {
+          "enabled": true,
+          "messages": 15,
+          "llmSlug": false
+        }
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "memory-core": {
+        "config": {
+          "dreaming": {
+            "enabled": true,
+            "frequency": "0 3 * * *"
+          }
+        }
+      }
+    }
+  },
+  "tools": {
+    "sessions": {
+      "visibility": "agent"
+    }
+  }
+}

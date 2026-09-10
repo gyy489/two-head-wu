@@ -1,0 +1,155 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "optparse"
+require "pathname"
+require_relative "../lib/capability_release_manager"
+
+class CapabilityReleaseCLI
+  def initialize(arguments)
+    @arguments = arguments.dup
+    @package_root = Pathname.new(__dir__).join("..").expand_path.cleanpath
+    @default_root = @package_root.join("../..").cleanpath
+  end
+
+  def run
+    command = @arguments.shift || "help"
+    return help if %w[help --help -h].include?(command)
+
+    options = common_options
+    case command
+    when "status", "resolve", "update"
+      parse_common!(options, update: command == "update")
+      require_option!(options, "project")
+      manager = manager_for(options)
+      result = if command == "status"
+                 { "bindings" => manager.status(project_id: options.fetch("project"), capability_id: options["capability"]) }
+               elsif command == "resolve"
+                 { "releases" => manager.resolve(project_id: options.fetch("project"), capability_id: options["capability"]) }
+               else
+                 manager.update(
+                   project_id: options.fetch("project"), capability_id: options["capability"],
+                   automatic: options.fetch("automatic"), apply: options.fetch("apply"), version: options["to"]
+                 )
+               end
+      print_result(result, options.fetch("json"))
+    when "rollback"
+      parse_rollback!(options)
+      %w[project capability to].each { |key| require_option!(options, key) }
+      result = manager_for(options).rollback(
+        project_id: options.fetch("project"), capability_id: options.fetch("capability"),
+        version: options.fetch("to"), apply: options.fetch("apply")
+      )
+      print_result(result, options.fetch("json"))
+    when "invoke"
+      capability = @arguments.shift
+      raise TwoHeadWu::CapabilityReleaseManager::Error, "invoke requires a Capability ID" unless capability
+      options["capability"] = capability
+      invocation_arguments = parse_invoke!(options)
+      %w[project runtime interface].each { |key| require_option!(options, key) }
+      return manager_for(options).invoke(
+        project_id: options.fetch("project"), capability_id: capability,
+        runtime_id: options.fetch("runtime"), interface_id: options.fetch("interface"),
+        arguments: invocation_arguments
+      )
+    else
+      raise TwoHeadWu::CapabilityReleaseManager::Error, "unknown release-manager command: #{command}"
+    end
+    0
+  rescue TwoHeadWu::CapabilityReleaseManager::Error, OptionParser::ParseError, KeyError => error
+    warn "Error: #{error.message}"
+    2
+  end
+
+  private
+
+  def common_options
+    {
+      "root" => @default_root.to_s,
+      "state_root" => ENV["WU_CAPABILITY_RELEASE_HOME"],
+      "json" => false,
+      "automatic" => false,
+      "apply" => false
+    }
+  end
+
+  def common_parser(options)
+    OptionParser.new do |parser|
+      parser.on("--project ID") { |value| options["project"] = value }
+      parser.on("--capability ID") { |value| options["capability"] = value }
+      parser.on("--root PATH") { |value| options["root"] = value }
+      parser.on("--state-root PATH") { |value| options["state_root"] = value }
+      parser.on("--json") { options["json"] = true }
+    end
+  end
+
+  def parse_common!(options, update:)
+    parser = common_parser(options)
+    if update
+      parser.on("--automatic") { options["automatic"] = true }
+      parser.on("--apply") { options["apply"] = true }
+      parser.on("--to VERSION") { |value| options["to"] = value }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+  end
+
+  def parse_rollback!(options)
+    parser = common_parser(options)
+    parser.on("--to VERSION") { |value| options["to"] = value }
+    parser.on("--apply") { options["apply"] = true }
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+  end
+
+  def parse_invoke!(options)
+    separator = @arguments.index("--")
+    invocation = separator ? @arguments.slice!(separator + 1, @arguments.length) : []
+    @arguments.delete_at(separator) if separator
+    parser = common_parser(options)
+    parser.on("--runtime ID") { |value| options["runtime"] = value }
+    parser.on("--interface ID") { |value| options["interface"] = value }
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    invocation
+  end
+
+  def manager_for(options)
+    TwoHeadWu::CapabilityReleaseManager.new(root: options.fetch("root"), state_root: options["state_root"])
+  end
+
+  def require_option!(options, key)
+    raise TwoHeadWu::CapabilityReleaseManager::Error, "--#{key.tr('_', '-')} is required" if options[key].to_s.empty?
+  end
+
+  def ensure_no_arguments!
+    raise OptionParser::ParseError, "unexpected arguments: #{@arguments.join(' ')}" unless @arguments.empty?
+  end
+
+  def print_result(result, json)
+    if json
+      puts JSON.pretty_generate(result)
+    else
+      puts YAML.dump(result)
+    end
+  end
+
+  def help
+    puts <<~HELP
+      Usage: capability-release-manager COMMAND [OPTIONS]
+
+        status   --project ID [--capability ID] [--json]
+        resolve  --project ID [--capability ID] [--json]
+        update   --project ID [--capability ID] [--to VERSION] [--automatic] [--apply] [--json]
+        rollback --project ID --capability ID --to VERSION --apply [--json]
+        invoke CAPABILITY --project ID --runtime ID --interface ID -- [ARGS...]
+
+      Update is dry-run unless --apply is supplied. --automatic selects only explicitly automatic,
+      non-pinned bindings. Runtime state defaults to var/capability-releases/.
+    HELP
+    0
+  end
+end
+
+exit CapabilityReleaseCLI.new(ARGV).run if $PROGRAM_NAME == __FILE__

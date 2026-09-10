@@ -1,4 +1,4 @@
-name: Public reference checks
+name: Foundation platform checks
 
 on:
   push:
@@ -8,16 +8,55 @@ permissions:
   contents: read
 
 jobs:
-  validate:
+  platform:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.3"
-      - name: Validate capability manifests
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Audit the public 9+1 package surface
+        run: ruby tools/audit-foundation-platform
+      - name: Resolve the public platform
+        run: |
+          core/tests/test_wu.sh
+      - name: Validate the authoring example
         run: |
           ruby tools/validate-capability examples/capability.yaml
           ruby tools/validate-capability examples/hello-capability/capability.yaml
-      - name: Run capability acceptance test
-        run: examples/hello-capability/tests/test_hello.sh
+          examples/hello-capability/tests/test_hello.sh
+      - name: Run portable infrastructure tests
+        run: |
+          ruby capabilities/capability-release-management/tests/test_capability_release_manager.rb
+          ruby capabilities/spec-kit-governance/tests/test_change_governance.rb
+          capabilities/skills-dashboard/tests/test_skills_dashboard.sh
+          capabilities/server-operations/tests/test_server_operations.sh
+          capabilities/remote-work-bootstrap/tests/test_remote_work_bootstrap.sh
+          ruby scripts/tests/test_skill_policy.rb
+          python3 scripts/tests/test_skills_manager.py
+
+  remote-work-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Validate remote-work contracts and isolation
+        run: |
+          python3 capabilities/remote-work/tests/test_control_plane.py
+          python3 capabilities/remote-work/tests/test_multi_user_contracts.py
+          python3 capabilities/remote-work/tests/test_member_control_plane.py
+          python3 capabilities/remote-work/tests/test_member_auth.py
+          ruby capabilities/remote-work/tests/test_protected_owner_notebook.rb
+          cd capabilities/remote-work/native/member-air
+          go test ./...

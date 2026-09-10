@@ -1,0 +1,52 @@
+version: 3
+updated_at: "2026-09-10"
+id: server-operations
+purpose: "脱敏资源查询和两个固定示例静态站点的受保护发布策略。"
+
+personal_site_publisher:
+  allowed_sites: [private-site, public-site]
+  allowed_operations: [redacted-resource-query, static-artifact-preflight, restricted-static-site-publish]
+  private_configuration:
+    required: true
+    source: "protected executor service account outside the project repository"
+    owner: "separate protected local IPC executor service"
+    credential_method: "executor-owned dedicated deployment identity"
+    repository_access: forbidden
+    ordinary_agent_account_access: forbidden
+  executor:
+    required: true
+    type: protected-local-ipc-service
+    client_input: publication-id-only
+    public_cli_input: publication-id-only
+    protected_ipc_input: untrusted-request-plus-regular-tar-fd
+    fixed_sites_only: true
+    project_workspace_and_site_allowlist: required
+    privileged_workspace_traversal: forbidden
+    installation: operator-managed-once
+  approval:
+    preflight_required: true
+    frozen_snapshot_required: true
+    installation_time_persistent_local_publication_authorization: required
+    direct_user_request_is_skill_level_scope_selection: true
+    natural_language_intent_is_not_runtime_attested: true
+    per_publication_confirmation: not_required
+    automatic_retry_and_verification: required
+    retry_mode: synchronous-bounded-4-attempts-5-seconds
+  local_audit_write: [var/server-ops/preflights, var/server-ops/publish-requests, var/server-ops/publish-staging]
+  denied_operations:
+    - reveal-secret
+    - reveal-private-record
+    - remote-shell
+    - arbitrary-remote-target
+    - arbitrary-remote-command
+    - database-operation
+    - dns-change
+    - firewall-change
+    - wake-standby-node
+    - modify-private-services
+    - direct-ssh-or-rsync-from-public-skill
+
+audit:
+  root: "var/server-ops"
+  record_fields: [preflight-id, artifact-digest, site-id, timestamp]
+  forbidden_content: [secret-values, full-command-lines, environment-values, raw-configurations, remote-addresses, private-filesystem-paths]

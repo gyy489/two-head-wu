@@ -1,0 +1,62 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "cgi"
+require "optparse"
+require "pathname"
+
+options = { ruby_bin: "/usr/bin/ruby", private_canaries: [] }
+parser = OptionParser.new do |item|
+  item.banner = "Usage: render-member-worker-launchd OPTIONS"
+  item.on("--runtime-user USER") { |value| options[:runtime_user] = value }
+  item.on("--runtime-uid UID") { |value| options[:runtime_uid] = value }
+  item.on("--owner-uid UID") { |value| options[:owner_uid] = value }
+  item.on("--runtime-root PATH") { |value| options[:runtime_root] = value }
+  item.on("--release-root PATH") { |value| options[:release_root] = value }
+  item.on("--codex-bin PATH") { |value| options[:codex_bin] = value }
+  item.on("--research-root PATH") { |value| options[:research_root] = value }
+  item.on("--ruby-bin PATH") { |value| options[:ruby_bin] = value }
+  item.on("--private-canary PATH") { |value| options[:private_canaries] << value }
+end
+parser.parse!
+abort parser.to_s unless ARGV.empty?
+
+user = options[:runtime_user].to_s
+abort "runtime user is invalid" unless user.match?(/\A_?[a-z][a-z0-9_-]{0,62}\z/)
+
+%i[runtime_uid owner_uid].each do |key|
+  text = options[key].to_s
+  abort "#{key.to_s.tr('_', ' ')} is invalid" unless text.match?(/\A(?:0|[1-9][0-9]{0,9})\z/)
+end
+abort "runtime uid must be non-root and different from owner uid" if options[:runtime_uid] == "0" || options[:runtime_uid] == options[:owner_uid]
+
+def clean_absolute(value, label)
+  path = Pathname.new(value.to_s)
+  abort "#{label} must be an absolute clean path" unless path.absolute? && path.cleanpath == path
+  abort "#{label} contains control characters" if path.to_s.match?(/[\x00-\x1f\x7f]/)
+  path.to_s
+end
+
+paths = {}
+%i[runtime_root release_root codex_bin research_root ruby_bin].each do |key|
+  paths[key] = clean_absolute(options[key], key.to_s.tr("_", " "))
+end
+canaries = options.fetch(:private_canaries).map { |value| clean_absolute(value, "private canary") }.uniq
+abort "at least one owner private canary is required" if canaries.empty?
+
+template_path = Pathname.new(__dir__).join("com.twoheadwu.member-worker.plist.in")
+template = template_path.read(encoding: "UTF-8")
+replacements = {
+  "@@MEMBER_RUNTIME_USER@@" => user,
+  "@@MEMBER_RUNTIME_UID@@" => options.fetch(:runtime_uid),
+  "@@OWNER_UID@@" => options.fetch(:owner_uid),
+  "@@RUNTIME_ROOT@@" => paths.fetch(:runtime_root),
+  "@@RELEASE_ROOT@@" => paths.fetch(:release_root),
+  "@@CODEX_BIN@@" => paths.fetch(:codex_bin),
+  "@@RESEARCH_ROOT@@" => paths.fetch(:research_root),
+  "@@RUBY_BIN@@" => paths.fetch(:ruby_bin),
+  "@@PRIVATE_CANARIES@@" => canaries.join(File::PATH_SEPARATOR)
+}
+replacements.each { |placeholder, value| template.gsub!(placeholder, CGI.escapeHTML(value)) }
+abort "launchd template has unresolved placeholders" if template.match?(/@@[A-Z_]+@@/)
+$stdout.write(template)

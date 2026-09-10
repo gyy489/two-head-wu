@@ -1,0 +1,79 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "optparse"
+require_relative "lib/private_site_publisher_client"
+
+class PrivateSitePublisherCommand
+  def initialize(arguments)
+    @arguments = arguments.dup
+  end
+
+  def run
+    command = @arguments.shift || "help"
+    client = PrivateSitePublisherClient.new
+    case command
+    when "help", "--help", "-h"
+      help
+    when "ready"
+      ensure_no_arguments!
+      raise PrivateSitePublisherClientError, "publication did not complete" unless client.ready?
+
+      puts "private-site-publisher ready"
+    when "publish"
+      release_id = parse_release_option!
+      print_result(client.publish(release_id))
+    when "status"
+      release_id = parse_release_option!
+      print_result(client.status(release_id))
+    else
+      raise PrivateSitePublisherClientError, "publication did not complete"
+    end
+    0
+  rescue OptionParser::ParseError, PrivateSitePublisherClientError
+    warn "Error: private site publication did not complete"
+    2
+  end
+
+  private
+
+  def help
+    puts <<~HELP
+      Usage: private-site-publisher COMMAND [OPTIONS]
+
+      Commands:
+        ready
+        publish --release RELEASE_ID
+        status --release RELEASE_ID
+
+      This is a client for a fixed protected local service. It accepts only a
+      release ID and never accepts hosts, paths, SSH arguments, credentials,
+      configuration locations, or source directories.
+    HELP
+  end
+
+  def parse_release_option!
+    options = {}
+    parser = OptionParser.new do |item|
+      item.on("--release ID") { |value| options[:release] = value }
+    end
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    raise PrivateSitePublisherClientError, "publication did not complete" unless options[:release]
+
+    options.fetch(:release)
+  end
+
+  def ensure_no_arguments!
+    raise PrivateSitePublisherClientError, "publication did not complete" unless @arguments.empty?
+  end
+
+  def print_result(result)
+    %w[publication_id site_id artifact_digest source_artifact_digest attempts state result verified_at failed_at failure].each do |key|
+      value = result[key]
+      puts "#{key}: #{value}" unless value.nil?
+    end
+  end
+end
+
+exit PrivateSitePublisherCommand.new(ARGV).run

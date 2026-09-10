@@ -1,0 +1,155 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "pathname"
+
+AUTO_UPDATE_SKIP_ENV = "WU_REMOTE_SKIP_ON_USE_UPDATE"
+
+def active_managed_release?(root)
+  stable_entry = Pathname.new(File.join(Dir.home, ".local", "bin", "wu"))
+  release_entry = root.join("bin", "wu")
+  root.join("RELEASE_ID").file? && stable_entry.symlink? && release_entry.file? &&
+    stable_entry.realpath == release_entry.realpath
+rescue Errno::ENOENT
+  false
+end
+
+def update_management_command?(arguments)
+  return true if %w[同步两头乌Air 同步两头乌air 同步Air].include?(arguments[0])
+
+  %w[remote 多端].include?(arguments[0]) && %w[update health enroll sync].include?(arguments[1])
+end
+
+def configured_client?
+  configured_home = ENV["WU_REMOTE_HOME"].to_s
+  config_root = if configured_home.empty?
+                  Pathname.new(File.join(Dir.home, ".config", "two-head-wu", "remote-work"))
+                else
+                  Pathname.new(configured_home).expand_path
+                end
+  config_root.join("config.json").file?
+end
+
+def auto_update_before_use(root, client, original_arguments)
+  return if ENV[AUTO_UPDATE_SKIP_ENV] == "1"
+  return unless active_managed_release?(root) && configured_client?
+  return if update_management_command?(original_arguments)
+
+  system(
+    { AUTO_UPDATE_SKIP_ENV => "1" }, client, "update", "auto",
+    out: File::NULL, err: File::NULL
+  )
+
+  stable_entry = Pathname.new(File.join(Dir.home, ".local", "bin", "wu"))
+  return unless stable_entry.symlink?
+  return if stable_entry.realpath == Pathname.new(__FILE__).realpath
+
+  exec({ AUTO_UPDATE_SKIP_ENV => "1" }, stable_entry.to_s, *original_arguments)
+rescue Errno::ENOENT, Errno::EACCES, SystemCallError
+  # The on-use updater is fail-open: the current signed release remains usable.
+  nil
+end
+
+original_arguments = ARGV.dup
+arguments = original_arguments.dup
+command = arguments.shift || "help"
+root = Pathname.new(__dir__).join("..").expand_path.cleanpath
+client = root.join("adapters/remote-work").to_s
+cwd = Pathname.pwd.expand_path.cleanpath.to_s
+
+auto_update_before_use(root, client, original_arguments)
+
+mapped = case command
+         when "remote", "多端" then arguments
+         when "同步两头乌Air", "同步两头乌air", "同步Air" then ["sync", "air", *arguments]
+         when "能做什么", "查看能力" then ["abilities", "list", *arguments]
+         when "本地能力" then ["abilities", "local", *arguments]
+         when "远端能力" then ["abilities", "remote", *arguments]
+         when "同步能力" then ["abilities", "sync", *arguments]
+         when "调用能力" then ["invoke", *arguments]
+         when "同步项目" then ["projects", "sync", *arguments]
+         when "查看项目桥" then ["projects", "status", *arguments]
+         when "安装能力桥" then ["bridge", "install", *arguments]
+         when "查看能力桥" then ["bridge", "status", *arguments]
+         when "查看交互伴侣" then ["companion", "status", *arguments]
+         when "查看模块" then ["modules", "list", *arguments]
+         when "查看本机" then ["modules", "status", *arguments]
+         when "查看模型" then ["models", "list", *arguments]
+         when "查看工具" then ["tools", "list", *arguments]
+         when "查看设备" then ["devices", "list", *arguments]
+         when "查看附件" then ["artifacts", "list", *arguments]
+         when "上传附件" then ["artifacts", "upload", *arguments]
+         when "下载附件" then ["artifacts", "fetch", *arguments]
+         when "删除附件" then ["artifacts", "remove", *arguments]
+         when "恢复附件" then ["artifacts", "recover", *arguments]
+         when "查看额度", "codex-status" then ["tools", "invoke", "codex-status", *arguments]
+         when "查看账号" then ["tools", "invoke", "identity-catalog", *arguments]
+         when "查看资源"
+           resource_id, *extra = arguments
+           unless extra.empty?
+             warn "用法：wu 查看资源 [RESOURCE_ID]"
+             exit 2
+           end
+           input = resource_id ? { "id" => resource_id } : {}
+           ["invoke", "tool:resource-catalog", "--input-json", JSON.generate(input), "--wait"]
+         when "查OpenAI文档"
+           query = arguments.join(" ").strip
+           if query.empty?
+             warn "用法：wu 查OpenAI文档 查询内容"
+             exit 2
+           end
+           input = { "action" => "search", "query" => query, "limit" => 5 }
+           ["invoke", "mcp-tool:openai-docs", "--input-json", JSON.generate(input), "--wait"]
+         when "运行工作流"
+           workflow_id, *options = arguments
+           unless workflow_id&.match?(/\A[a-z][a-z0-9-]{0,62}\z/)
+             warn "用法：wu 运行工作流 WORKFLOW_ID [--confirm]"
+             exit 2
+           end
+           ["invoke", "workflow:#{workflow_id}", *options]
+         when "拉取模块" then ["modules", "pull", *arguments]
+         when "自动更新" then ["policy", "set", *arguments, "auto-update"]
+         when "按需模块" then ["policy", "set", *arguments, "on-demand"]
+         when "固定模块" then ["policy", "set", *arguments, "pinned"]
+         when "停用模块" then ["policy", "set", *arguments, "off"]
+         when "更新模块" then ["modules", "update", *arguments]
+         when "查看版本" then ["modules", "versions", *arguments]
+         when "回滚模块" then ["modules", "rollback", *arguments]
+         when "远程任务" then ["jobs", "submit", "--project", cwd, "--", *arguments]
+         when "附件任务"
+           artifact_id, *instruction = arguments
+           unless artifact_id && !instruction.empty?
+             warn "用法：wu 附件任务 ARTIFACT_ID 任务说明"
+             exit 2
+           end
+           ["jobs", "submit", "--project", cwd, "--artifact", artifact_id, "--", *instruction]
+         when "查看任务" then ["jobs", "status", *arguments]
+         when "待处理" then ["jobs", "interactions", *arguments]
+         when "回复任务"
+           job_id, interaction_id, decision, *extra = arguments
+           unless job_id && interaction_id && decision && extra.empty?
+             warn "用法：wu 回复任务 JOB_ID INTERACTION_ID 接受|本次会话|拒绝|取消"
+             exit 2
+           end
+           ["jobs", "reply", job_id, interaction_id, "--decision", decision]
+         when "回答任务"
+           job_id, interaction_id, *answers = arguments
+           if !job_id || !interaction_id || answers.empty? || answers.any? { |value| !value.include?("=") }
+             warn "用法：wu 回答任务 JOB_ID INTERACTION_ID 问题ID=回答 [问题ID=回答...]"
+             exit 2
+           end
+           ["jobs", "reply", job_id, interaction_id, *answers.flat_map { |value| ["--answer", value] }]
+         when "接收结果" then ["jobs", "fetch", *arguments]
+         when "取消任务" then ["jobs", "cancel", *arguments]
+         when "重试任务" then ["jobs", "retry", *arguments]
+         when "恢复提交" then ["jobs", "recover", *arguments]
+         when "诊断" then ["diagnose", *arguments]
+         when "help", "帮助", "--help", "-h" then ["help"]
+         else
+           warn "错误：Air 客户端未知命令：#{command}"
+           warn "可用入口：同步两头乌Air、能做什么、本地能力、远端能力、同步能力、调用能力、查看账号、查看资源、查OpenAI文档、运行工作流、同步项目、查看项目桥、安装能力桥、查看能力桥、查看交互伴侣、查看模块、查看本机、查看模型、查看工具、查看设备、查看额度、查看附件、上传附件、下载附件、删除附件、恢复附件、拉取模块、自动更新、按需模块、固定模块、停用模块、更新模块、查看版本、回滚模块、远程任务、附件任务、查看任务、待处理、回复任务、回答任务、接收结果、取消任务、重试任务、恢复提交、诊断"
+           exit 2
+         end
+
+exec(client, *mapped)

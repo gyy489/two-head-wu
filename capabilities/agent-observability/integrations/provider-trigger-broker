@@ -1,0 +1,79 @@
+#!/usr/bin/ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "optparse"
+require "pathname"
+require "socket"
+
+options = {}
+OptionParser.new do |parser|
+  parser.on("--project-root PATH") { |value| options[:project_root] = value }
+  parser.on("--data-root PATH") { |value| options[:data_root] = value }
+  parser.on("--package-root PATH") { |value| options[:package_root] = value }
+end.parse!(ARGV)
+%i[project_root data_root package_root].each do |key|
+  raise OptionParser::MissingArgument, "--#{key.to_s.tr('_', '-')}" if options[key].to_s.empty?
+end
+
+state_root = Pathname.new(Dir.home).join(".local/state/two-head-wu/agent-observability")
+FileUtils.mkdir_p(state_root, mode: 0o700)
+lock = File.open(state_root.join("provider-trigger.lock"), File::WRONLY | File::CREAT, 0o600)
+exit 0 unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+
+socket_path = state_root.join("provider-trigger.sock")
+FileUtils.rm_f(socket_path)
+client = nil
+begin
+  server = UNIXServer.new(socket_path.to_s)
+  FileUtils.chmod(0o600, socket_path)
+  parent_pid = Process.ppid
+  loop do
+    ready = IO.select([server], nil, nil, 1)
+    exit 0 unless Process.ppid == parent_pid
+    next unless ready
+
+    client = server.accept
+    signal = +""
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 1
+    until signal.include?("\n") || signal.bytesize >= 16
+      remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      break unless remaining.positive? && IO.select([client], nil, nil, remaining)
+
+      chunk = client.read_nonblock(16 - signal.bytesize, exception: false)
+      break if chunk.nil?
+      next if chunk == :wait_readable
+
+      signal << chunk
+    end
+    if signal == "ping\n"
+      client.write("ok\n") rescue nil
+      client.close
+      client = nil
+      next
+    end
+    unless signal == "start\n"
+      client.close
+      client = nil
+      next
+    end
+    break
+  end
+
+  bootstrap = Pathname.new(__dir__).join("provider-bootstrap").realpath
+  client.close
+  client = nil
+  server.close
+  server = nil
+  FileUtils.rm_f(socket_path)
+  exec(
+    bootstrap.to_s,
+    "--project-root", options.fetch(:project_root),
+    "--data-root", options.fetch(:data_root),
+    "--package-root", options.fetch(:package_root)
+  )
+ensure
+  client&.close
+  server&.close
+  FileUtils.rm_f(socket_path) if socket_path
+end

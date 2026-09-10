@@ -1,0 +1,1264 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "date"
+require "fileutils"
+require "find"
+require "json"
+require "open3"
+require "optparse"
+require "pathname"
+require "set"
+require "time"
+require "yaml"
+
+require_relative "../core/lib/skill_policy"
+
+class CapabilityManager
+  ALLOWED_COMPATIBILITY = %w[native compatible needs-review denied].freeze
+  EXPOSED_COMPATIBILITY = %w[native compatible].freeze
+  GENERATED_MARKER = ".managed-by-two-head-wu"
+
+  attr_reader :errors, :warnings, :infos
+
+  def initialize(root)
+    @root = Pathname.new(root).expand_path.cleanpath
+    @isolated = @root.join("MIRROR_COMMIT").file?
+    @errors = []
+    @warnings = []
+    @infos = []
+    @capabilities = load_yaml("registries/capabilities_registry.yaml")
+    @runtimes_data = load_yaml(@capabilities.fetch("runtime_registry"))
+    @skills_data = load_yaml(@capabilities.fetch("skill_registry"))
+    @mcp_data = load_yaml(@capabilities.fetch("mcp_registry"))
+    @agents_data = load_yaml(@capabilities.fetch("agent_registry"))
+    @skill_sets = @capabilities.fetch("skill_sets")
+    @runtimes = index_by(@runtimes_data.fetch("runtimes"), "id")
+    @skills = index_by(@skills_data.fetch("skills"), "name")
+    @mcp_servers = index_by(@mcp_data.fetch("servers"), "id")
+    @agents = index_by(@agents_data.fetch("agents"), "id")
+    @skill_policy = TwoHeadWu::SkillPolicy.new(@root)
+  end
+
+  def status
+    puts "project: #{@root}"
+    puts "policy:  default deny; registry-approved exposure only"
+    puts
+    @runtimes.each_value do |runtime|
+      executable = executable_for(runtime)
+      version = runtime_version(runtime, executable)
+      surface = surface_path(runtime)
+      desired = desired_skills(runtime.fetch("id"))
+      actual = surface_skill_names(surface)
+      puts "#{runtime.fetch('id')}:"
+      puts "  declared:   #{runtime.fetch('status')}"
+      puts "  executable: #{executable || 'missing'}"
+      puts "  version:    #{version || 'unavailable'}"
+      puts "  surface:    #{relative_or_absolute(surface)}"
+      puts "  profile:    #{@skill_policy.global_profile_id(runtime.fetch('id'))}"
+      puts "  skills:     desired=#{desired.length}, actual=#{actual.length}"
+      puts "  link:       #{external_link_status(runtime)}"
+    end
+    puts
+    puts "project profile bindings:"
+    @skill_policy.profile_data.fetch("bindings").each do |binding|
+      puts "  #{binding.fetch('project')} + #{binding.fetch('agent')} + #{binding.fetch('runtime')} -> #{binding.fetch('profile')}"
+    end
+    puts
+    puts "registered MCP servers: #{@mcp_servers.length}"
+    puts "registered agents:      #{@agents.length}"
+  end
+
+  def sync_skills(apply: false, isolated: false)
+    isolated ||= @isolated
+    if isolated
+      @runtimes.each_value do |runtime|
+        runtime_id = runtime.fetch("id")
+        desired = desired_skills(runtime_id)
+        missing = desired.reject { |name| @skills[name]&.fetch("status", nil) == "active" }
+        missing.each { |name| add_error("#{runtime_id} isolated registry references unavailable Skill: #{name}") }
+        puts "#{runtime_id}: isolated committed registry desired=#{desired.length}"
+      end
+      puts apply ? "isolated registered Skill sets verified; external runtime surfaces unchanged" :
+                   "isolated dry run; external runtime surfaces unchanged"
+      print_findings
+      return exit_code
+    end
+
+    @runtimes.each_value do |runtime|
+      runtime_id = runtime.fetch("id")
+      surface_config = runtime.fetch("skill_surface")
+      surface = surface_path(runtime)
+      desired = desired_skill_sources(runtime_id, apply: apply)
+
+      if surface_config.fetch("mode") == "generated"
+        current = surface_skill_names(surface)
+        added = desired.keys - current
+        removed = current - desired.keys
+        changed = desired.keys.select do |name|
+          target = surface.join(name)
+          !target.symlink? || Pathname.new(File.realpath(target)) != desired.fetch(name).realpath
+        rescue Errno::ENOENT
+          true
+        end
+        puts "#{runtime_id}: generated surface #{relative_or_absolute(surface)}"
+        puts "  desired=#{desired.length} add=#{added.length} remove=#{removed.length} relink=#{changed.length}"
+        replace_generated_surface(surface, desired) if apply
+      else
+        current = surface_skill_names(surface)
+        missing = desired.keys - current
+        extra = current - desired.keys
+        puts "#{runtime_id}: direct surface #{relative_or_absolute(surface)}"
+        puts "  desired=#{desired.length} missing=#{missing.length} unapproved=#{extra.length}"
+        @errors << "#{runtime_id} direct surface is missing: #{missing.join(', ')}" unless missing.empty?
+        @warnings << "#{runtime_id} direct surface has unapproved entries: #{extra.join(', ')}" unless extra.empty?
+      end
+
+      sync_external_link(runtime, surface, apply: apply)
+    end
+
+    sync_project_profiles(apply: apply)
+    if apply
+      index_path = @skill_policy.catalog_index!
+      puts "cold Skill Catalog indexed: #{relative_or_absolute(index_path)}"
+    end
+
+    if apply
+      puts "skill surfaces synchronized"
+    else
+      puts "dry run only; pass --apply to write generated surfaces and runtime links"
+    end
+    print_findings
+    exit_code
+  end
+
+  def resolve(agent_id, runtime_id: nil)
+    agent_entry = @agents[agent_id]
+    add_error("unknown agent: #{agent_id}") unless agent_entry
+    return finish_findings unless agent_entry
+
+    manifest_path = agent_entry["manifest"]
+    add_error("agent has no manifest: #{agent_id}") unless manifest_path
+    return finish_findings unless manifest_path
+
+    manifest = load_yaml(manifest_path)
+    runtime_id ||= manifest.dig("runtime", "primary_brain")
+    add_error("runtime is not specified for agent #{agent_id}") unless runtime_id
+    runtime = @runtimes[runtime_id]
+    add_error("unknown runtime for agent #{agent_id}: #{runtime_id}") unless runtime
+    return finish_findings unless runtime
+
+    capabilities = manifest.fetch("capabilities", {})
+    set_names = Array(capabilities["skill_sets"])
+    set_names.concat(Array(capabilities.dig("runtime_skill_sets", runtime_id)))
+    runtime_sets = Array(runtime.dig("skill_surface", "skill_sets"))
+    unavailable_sets = set_names - runtime_sets
+    add_error("#{agent_id} requests sets not exposed to #{runtime_id}: #{unavailable_sets.join(', ')}") unless unavailable_sets.empty?
+
+    profile_id = @skill_policy.global_profile_id(runtime_id)
+    skill_names = @skill_policy.global_hot_skills(runtime_id)
+    catalog_names = @skill_policy.eligible_catalog_skills(nil, agent_id, runtime_id)
+    mcp_ids = Array(capabilities["mcp_allowlist"])
+    delegation_ids = Array(capabilities["delegation_allowlist"])
+
+    puts "agent:   #{agent_id}"
+    puts "runtime: #{runtime_id}"
+    puts "legacy skill sets: #{set_names.join(', ')}"
+    puts "Skill profile: #{profile_id}"
+    puts
+    puts "Skills (#{skill_names.length})"
+    skill_names.each { |name| puts "- #{name}" }
+    puts
+    puts "Cold Catalog (#{catalog_names.length} eligible)"
+    catalog_names.each { |name| puts "- #{name}" }
+    puts
+    puts "MCP (#{mcp_ids.length})"
+    mcp_ids.each do |id|
+      server = @mcp_servers[id]
+      if server
+        state = server.fetch("clients", {}).fetch(runtime_id, "not_declared")
+        puts "- #{id}: #{state}, risk=#{server.fetch('risk_level', 'unknown')}"
+      else
+        add_error("unknown MCP in #{agent_id}: #{id}")
+      end
+    end
+    puts
+    puts "Delegation targets (#{delegation_ids.length})"
+    delegation_ids.each do |id|
+      target = @runtimes[id]
+      puts "- #{id}: #{target ? target.fetch('status') : 'unknown'}"
+      add_error("unknown delegation target in #{agent_id}: #{id}") unless target
+    end
+    finish_findings
+  end
+
+  def inventory(write: false)
+    generated_at = Time.now.utc.iso8601
+    runtime_rows = []
+    discovery_rows = []
+    pending = []
+    mcp_rows = []
+
+    @runtimes.each_value do |runtime|
+      executable = executable_for(runtime)
+      runtime_rows << {
+        "id" => runtime.fetch("id"),
+        "declared_status" => runtime.fetch("status"),
+        "executable" => executable&.to_s,
+        "version" => runtime_version(runtime, executable),
+        "surface" => relative_or_absolute(surface_path(runtime)),
+        "desired_skills" => desired_skills(runtime.fetch("id")).length,
+        "visible_skills" => surface_skill_names(surface_path(runtime)).length
+      }
+
+      Array(runtime["discovery_roots"]).each do |root_config|
+        root_path = expand_path(root_config.fetch("path"))
+        names = discover_skill_names(root_path)
+        unregistered = names - @skills.keys
+        if root_config["track_unregistered"]
+          unregistered.each do |name|
+            pending << {
+              "runtime" => runtime.fetch("id"),
+              "root" => root_config.fetch("id"),
+              "skill" => name
+            }
+          end
+        end
+        discovery_rows << {
+          "runtime" => runtime.fetch("id"),
+          "root" => root_config.fetch("id"),
+          "path" => root_path.to_s,
+          "exists" => root_path.exist? || root_path.symlink?,
+          "skills" => names.length,
+          "unregistered" => unregistered.length,
+          "tracked" => !!root_config["track_unregistered"]
+        }
+      end
+
+      mcp_names = discover_mcp_names(runtime)
+      mcp_rows << {
+        "runtime" => runtime.fetch("id"),
+        "configured" => mcp_names
+      }
+    end
+
+    state = {
+      "generated_at" => generated_at,
+      "project_root" => @root.to_s,
+      "runtimes" => runtime_rows,
+      "discovery_roots" => discovery_rows,
+      "pending_capabilities" => pending.uniq,
+      "mcp_clients" => mcp_rows
+    }
+    report = inventory_markdown(state)
+    puts report
+
+    if write
+      inventory_path = @root.join("inventories/capabilities_inventory.md")
+      state_path = @root.join("contexts/capabilities/last-inventory.json")
+      log_path = @root.join("logs/capabilities-manager/audit.log")
+      FileUtils.mkdir_p(inventory_path.dirname)
+      FileUtils.mkdir_p(state_path.dirname)
+      FileUtils.mkdir_p(log_path.dirname)
+      inventory_path.write(report, encoding: "UTF-8")
+      state_path.write(JSON.pretty_generate(state) + "\n", encoding: "UTF-8")
+      File.open(log_path, "a") do |log|
+        log.puts("#{generated_at}\tpending=#{pending.uniq.length}\truntimes=#{runtime_rows.length}")
+      end
+      puts "wrote #{relative_or_absolute(inventory_path)}"
+      puts "wrote #{relative_or_absolute(state_path)}"
+    end
+    0
+  end
+
+  def catalog_index
+    path = @skill_policy.catalog_index!
+    puts "indexed cold Skill Catalog: #{relative_or_absolute(path)}"
+    0
+  end
+
+  def catalog_search(query, project_id:, runtime_id:, agent_id:, top_k:, json:)
+    results = @skill_policy.catalog_search(
+      query,
+      project_id: project_id,
+      agent_id: agent_id,
+      runtime_id: runtime_id,
+      top_k: top_k
+    )
+    payload = {
+      "query" => query,
+      "project" => project_id,
+      "agent" => agent_id,
+      "runtime" => runtime_id,
+      "results" => results
+    }
+    if json
+      puts JSON.pretty_generate(payload)
+    elsif results.empty?
+      puts "No allowed Skill Catalog result for: #{query}"
+    else
+      results.each do |item|
+        state = item.fetch("hot") ? "hot" : "cold"
+        puts "#{item.fetch('skill_id')}\t#{state}\t#{item.fetch('digest')}\t#{item.fetch('purpose')}"
+      end
+    end
+    0
+  end
+
+  def catalog_load(skill_id, project_id:, runtime_id:, agent_id:, digest:, json:)
+    result = @skill_policy.catalog_load(
+      skill_id,
+      project_id: project_id,
+      agent_id: agent_id,
+      runtime_id: runtime_id,
+      digest: digest
+    )
+    if json
+      puts JSON.pretty_generate(result)
+    else
+      puts "Skill: #{result.fetch('skill_id')}"
+      puts "Digest: #{result.fetch('digest')}"
+      puts "Scripts authorized: false"
+      puts
+      puts result.fetch("content")
+    end
+    0
+  end
+
+  def catalog_read(skill_id, resource, project_id:, runtime_id:, agent_id:, digest:, json:)
+    result = @skill_policy.catalog_read(
+      skill_id,
+      resource,
+      project_id: project_id,
+      agent_id: agent_id,
+      runtime_id: runtime_id,
+      digest: digest
+    )
+    if json
+      puts JSON.pretty_generate(result)
+    else
+      puts "Skill: #{result.fetch('skill_id')}"
+      puts "Digest: #{result.fetch('digest')}"
+      puts "Resource: #{result.fetch('path')}"
+      puts "Scripts authorized: false"
+      puts
+      puts result.fetch("content")
+    end
+    0
+  end
+
+  def visibility_budget(project_id:, runtime_id:, agent_id:, json:)
+    result = @skill_policy.visibility_budget(project_id, agent_id, runtime_id)
+    if json
+      puts JSON.pretty_generate(result)
+    else
+      puts "project/runtime: #{project_id}/#{runtime_id}"
+      puts "managed:        #{result.fetch('managed')}"
+      puts "runtime built-in: #{result.fetch('runtime_builtin')}"
+      puts "user global:    #{result.fetch('user_global')}"
+      puts "project native: #{result.fetch('project_native')}"
+      puts "plugin:         #{result.fetch('plugin')}"
+      puts "total:          #{result.fetch('total')} / #{result.fetch('max_total')}"
+      puts "description:    #{result.fetch('description_characters')} / #{result.fetch('max_description_characters')} chars"
+    end
+    0
+  end
+
+  def doctor(strict: false)
+    validate_registries
+    validate_runtime_installations
+    validate_surfaces
+    validate_agents
+    validate_mcp
+    validate_discovered_capabilities
+    print_findings
+    code = exit_code
+    code = 2 if strict && !@warnings.empty?
+    puts "doctor ok" if code.zero?
+    code
+  end
+
+  private
+
+  def load_yaml(path)
+    full_path = expand_path(path)
+    raise "registry missing: #{full_path}" unless full_path.file?
+
+    data = YAML.safe_load(
+      full_path.read(encoding: "UTF-8"),
+      permitted_classes: [Date, Time],
+      aliases: false
+    )
+    raise "registry is not a mapping: #{full_path}" unless data.is_a?(Hash)
+
+    data
+  rescue Psych::Exception => error
+    raise "invalid YAML #{full_path}: #{error.message}"
+  end
+
+  def index_by(items, key)
+    items.each_with_object({}) do |item, index|
+      value = item.fetch(key)
+      raise "duplicate #{key}: #{value}" if index.key?(value)
+
+      index[value] = item
+    end
+  end
+
+  def expand_path(path)
+    candidate = Pathname.new(path.to_s).expand_path
+    candidate.absolute? ? candidate.cleanpath : @root.join(candidate).cleanpath
+  end
+
+  def relative_or_absolute(path)
+    path.relative_path_from(@root).to_s
+  rescue ArgumentError
+    path.to_s
+  end
+
+  def surface_path(runtime)
+    expand_path(runtime.fetch("skill_surface").fetch("managed_path"))
+  end
+
+  def executable_for(runtime)
+    config = runtime.fetch("executable", {})
+    command = config["command"]
+    if command && command.include?(File::SEPARATOR)
+      path = expand_path(command)
+      return path if path.executable?
+    elsif command
+      found = which(command)
+      return found if found
+    end
+
+    Array(config["fallback_paths"]).each do |path|
+      candidate = expand_path(path)
+      return candidate if candidate.executable?
+    end
+    Array(config["fallback_globs"]).each do |pattern|
+      matches = Dir.glob(File.expand_path(pattern)).map { |path| Pathname.new(path) }.select(&:executable?)
+      return matches.max_by { |path| path.mtime.to_f } unless matches.empty?
+    end
+    nil
+  end
+
+  def which(command)
+    ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).each do |directory|
+      candidate = Pathname.new(directory).join(command)
+      return candidate if candidate.file? && candidate.executable?
+    end
+    nil
+  end
+
+  def runtime_version(runtime, executable)
+    return nil unless executable
+
+    args = Array(runtime.dig("executable", "version_args"))
+    stdout, stderr, status = Open3.capture3(executable.to_s, *args)
+    return nil unless status.success?
+
+    text = stdout.strip
+    text = stderr.strip if text.empty?
+    text.lines.first&.strip
+  rescue StandardError
+    nil
+  end
+
+  def desired_skills(runtime_id)
+    @skill_policy.global_hot_skills(runtime_id)
+  end
+
+  def skills_for_sets(set_names, runtime_id)
+    set_names.flat_map do |set_name|
+      skill_set = @skill_sets[set_name]
+      next [] unless skill_set
+
+      state = skill_set.fetch("compatibility", {}).fetch(runtime_id, "needs-review")
+      EXPOSED_COMPATIBILITY.include?(state) ? Array(skill_set["skills"]) : []
+    end.uniq.sort
+  end
+
+  def desired_skill_sources(runtime_id, apply: false)
+    desired_skills(runtime_id).each_with_object({}) do |name, sources|
+      source = @skill_policy.release_source(name, runtime_id, apply: apply)
+      if source
+        sources[name] = source
+      else
+        add_error("registered Skill source missing: #{name}")
+      end
+    rescue TwoHeadWu::SkillPolicy::Error => error
+      add_error(error.message)
+    end
+  end
+
+  def sync_project_profiles(apply:)
+    @runtimes.each_key do |runtime_id|
+      @skill_policy.bindings_for_runtime(runtime_id).each do |binding|
+        project_id = binding.fetch("project")
+        agent_id = binding.fetch("agent")
+        discovery_root = @skill_policy.project_discovery_root_path(project_id, runtime_id)
+        manifest = @skill_policy.project_overlay_manifest_path(project_id, runtime_id)
+        legacy_mount = @skill_policy.legacy_project_mount_path(project_id, runtime_id)
+
+        names = @skill_policy.project_hot_skills(project_id, agent_id, runtime_id)
+        desired = names.each_with_object({}) do |name, sources|
+          sources[name] = @skill_policy.release_source(name, runtime_id, apply: apply)
+        rescue TwoHeadWu::SkillPolicy::Error => error
+          add_error(error.message)
+        end
+        surface = @skill_policy.project_surface_path(project_id, runtime_id)
+        current = surface_skill_names(surface)
+        added = desired.keys - current
+        removed = current - desired.keys
+        changed = desired.keys.select do |name|
+          target = surface.join(name)
+          !target.symlink? || Pathname.new(File.realpath(target)) != desired.fetch(name).realpath
+        rescue Errno::ENOENT
+          true
+        end
+        puts "#{project_id}/#{runtime_id}: project profile #{binding.fetch('profile')}"
+        puts "  surface=#{relative_or_absolute(surface)} desired=#{desired.length} add=#{added.length} remove=#{removed.length} relink=#{changed.length}"
+        replace_generated_surface(surface, desired) if apply
+        remove_legacy_project_mount(legacy_mount, surface, apply: apply) if legacy_mount
+        if discovery_root && manifest
+          status = overlay_status(discovery_root, surface, desired.keys, manifest)
+          puts "  project overlay: #{discovery_root} [#{status}]"
+          sync_overlay(discovery_root, surface, desired.keys, manifest, "#{project_id}/#{runtime_id}") if apply && status != "ok"
+        end
+      rescue TwoHeadWu::SkillPolicy::Error => error
+        add_error(error.message)
+      end
+    end
+  end
+
+  def remove_legacy_project_mount(mount, surface, apply:)
+    return unless mount.exist? || mount.symlink?
+
+    status = exact_link_status(mount, surface)
+    puts "  legacy project mount: #{mount} [#{status}]"
+    return unless apply
+    unless status == "ok"
+      add_error("refusing to remove unrecognized legacy project Skill mount: #{mount} [#{status}]")
+      return
+    end
+
+    mount.unlink
+    puts "  removed legacy project mount #{mount}"
+  rescue Errno::ENOENT => error
+    add_error("failed to remove legacy project Skill mount at #{mount}: #{error.message}")
+  end
+
+  def exact_link_status(path, expected)
+    return "missing" unless path.exist? || path.symlink?
+    return "exists-not-symlink" unless path.symlink?
+
+    actual = Pathname.new(File.realpath(path))
+    expected_real = expected.exist? ? expected.realpath : expected
+    actual == expected_real ? "ok" : "wrong-target -> #{actual}"
+  rescue Errno::ENOENT
+    "broken"
+  end
+
+  def skill_source(name)
+    skill = @skills[name]
+    return nil unless skill
+
+    candidates = [skill["active_path"], skill["path"]].compact
+    candidates.each do |candidate|
+      path = expand_path(candidate)
+      return path if path.join("SKILL.md").file?
+    end
+    nil
+  end
+
+  def surface_skill_names(surface)
+    return [] unless surface.exist? || surface.symlink?
+
+    root = Pathname.new(File.realpath(surface))
+    names = []
+    root.children.each do |entry|
+      if entry.basename.to_s.start_with?(".")
+        next
+      elsif entry.join("SKILL.md").file?
+        names << entry.basename.to_s
+      end
+    end
+    names.uniq.sort
+  rescue Errno::ENOENT
+    []
+  end
+
+  def replace_generated_surface(surface, desired)
+    parent = surface.dirname
+    FileUtils.mkdir_p(parent)
+    stage = parent.join(".#{surface.basename}.new-#{Process.pid}")
+    backup = parent.join(".#{surface.basename}.old-#{Process.pid}")
+    FileUtils.rm_rf(stage)
+    FileUtils.rm_rf(backup)
+    FileUtils.mkdir_p(stage)
+    stage.join(GENERATED_MARKER).write(
+      "Generated by scripts/capabilities-manager. Do not edit.\n",
+      encoding: "UTF-8"
+    )
+    desired.sort.each do |name, source|
+      stage.join(name).make_symlink(source.realpath)
+    end
+
+    if surface.exist? || surface.symlink?
+      unless surface.join(GENERATED_MARKER).file?
+        FileUtils.rm_rf(stage)
+        add_error("refusing to replace unmanaged generated surface: #{surface}")
+        return
+      end
+      File.rename(surface, backup)
+    end
+    File.rename(stage, surface)
+    FileUtils.rm_rf(backup)
+  rescue StandardError => error
+    FileUtils.rm_rf(stage) if stage
+    File.rename(backup, surface) if backup&.exist? && !surface.exist?
+    add_error("failed to replace #{surface}: #{error.message}")
+  end
+
+  def sync_external_link(runtime, surface, apply:)
+    config = runtime.fetch("skill_surface")
+    return unless config["manage_external_link"]
+
+    external_value = config["external_path"]
+    return unless external_value
+
+    external = expand_path(external_value)
+    status = external_link_status(runtime)
+    puts "  external link: #{status}"
+    return if status == "ok" || !apply
+
+    if config.fetch("external_mode", "exclusive_link") == "overlay"
+      manifest_name = config.fetch("external_manifest", ".two-head-wu-#{runtime.fetch('id')}-global.json")
+      sync_overlay(external, surface, desired_skills(runtime.fetch("id")), external.join(manifest_name), runtime.fetch("id"))
+      return
+    end
+
+    if external.exist? && !external.symlink?
+      add_error("refusing to replace non-symlink runtime directory: #{external}")
+      return
+    end
+    FileUtils.mkdir_p(external.dirname)
+    external.unlink if external.symlink?
+    external.make_symlink(surface.realpath)
+    puts "  linked #{external} -> #{surface}"
+  end
+
+  def external_link_status(runtime)
+    config = runtime.fetch("skill_surface")
+    external_value = config["external_path"]
+    return "not-managed" unless config["manage_external_link"] && external_value
+
+    external = expand_path(external_value)
+    expected = surface_path(runtime)
+    if config.fetch("external_mode", "exclusive_link") == "overlay"
+      manifest_name = config.fetch("external_manifest", ".two-head-wu-#{runtime.fetch('id')}-global.json")
+      return overlay_status(external, expected, desired_skills(runtime.fetch("id")), external.join(manifest_name))
+    end
+
+    return "missing" unless external.exist? || external.symlink?
+    return "exists-not-symlink" unless external.symlink?
+
+    actual = Pathname.new(File.realpath(external))
+    expected_real = expected.exist? ? expected.realpath : expected
+    actual == expected_real ? "ok" : "wrong-target -> #{actual}"
+  rescue Errno::ENOENT
+    "broken"
+  end
+
+  def overlay_status(root, surface, desired_names, manifest)
+    if root.symlink?
+      return exact_link_status(root, surface) == "ok" ? "legacy-exclusive-link" : "wrong-root-link"
+    end
+    return "missing-root" unless root.directory?
+    return "missing-manifest" unless manifest.file?
+
+    data = JSON.parse(manifest.read(encoding: "UTF-8"))
+    recorded = Array(data["skills"]).map(&:to_s).sort
+    desired = desired_names.map(&:to_s).sort
+    return "manifest-drift" unless recorded == desired
+
+    desired.each do |name|
+      link = root.join(name)
+      return "missing:#{name}" unless link.symlink?
+      return "wrong-target:#{name}" unless exact_link_status(link, surface.join(name)) == "ok"
+    end
+    "ok"
+  rescue JSON::ParserError
+    "invalid-manifest"
+  rescue Errno::ENOENT
+    "broken"
+  end
+
+  def sync_overlay(root, surface, desired_names, manifest, owner)
+    if root.symlink?
+      status = exact_link_status(root, surface)
+      unless status == "ok"
+        add_error("refusing to migrate unrecognized Skill root link: #{root} [#{status}]")
+        return
+      end
+      root.unlink
+    elsif root.exist? && !root.directory?
+      add_error("refusing to replace non-directory Skill root: #{root}")
+      return
+    end
+
+    FileUtils.mkdir_p(root)
+    previous = if manifest.file?
+                 JSON.parse(manifest.read(encoding: "UTF-8")).fetch("skills", [])
+               else
+                 []
+               end
+    desired = desired_names.map(&:to_s).sort
+    error_count = @errors.length
+
+    (previous.map(&:to_s) - desired).each do |name|
+      link = root.join(name)
+      next unless link.exist? || link.symlink?
+      if link.symlink?
+        link.unlink
+      else
+        add_error("refusing to remove non-symlink overlay entry: #{link}")
+      end
+    end
+
+    desired.each do |name|
+      expected = surface.join(name)
+      unless expected.join("SKILL.md").file?
+        add_error("overlay source is missing: #{expected}")
+        next
+      end
+      link = root.join(name)
+      if link.exist? || link.symlink?
+        next if link.symlink? && exact_link_status(link, expected) == "ok"
+        if previous.map(&:to_s).include?(name) && link.symlink?
+          link.unlink
+        else
+          add_error("refusing to replace unowned Skill overlay entry: #{link}")
+          next
+        end
+      end
+      link.make_symlink(expected)
+    end
+
+    return unless @errors.length == error_count
+
+    payload = {
+      "schema_version" => 1,
+      "owner" => owner,
+      "surface" => surface.to_s,
+      "skills" => desired
+    }
+    stage = manifest.dirname.join(".#{manifest.basename}.new-#{Process.pid}")
+    stage.write(JSON.pretty_generate(payload) + "\n", encoding: "UTF-8")
+    File.rename(stage, manifest)
+    puts "  overlaid #{desired.length} Skills into #{root}"
+  rescue JSON::ParserError => error
+    add_error("invalid Skill overlay manifest #{manifest}: #{error.message}")
+  rescue StandardError => error
+    add_error("failed to synchronize Skill overlay #{root}: #{error.message}")
+  ensure
+    stage.unlink if defined?(stage) && stage&.exist?
+  end
+
+  def discover_skill_names(root)
+    return [] unless root.exist? || root.symlink?
+
+    real_root = Pathname.new(File.realpath(root))
+    names = []
+    Find.find(real_root.to_s) do |entry|
+      path = Pathname.new(entry)
+      if path.symlink? && path.directory?
+        skill_md = path.join("SKILL.md")
+        names << skill_name(skill_md) if skill_md.file?
+        Find.prune
+        next
+      end
+      if path.directory? && %w[.git node_modules __pycache__].include?(path.basename.to_s)
+        Find.prune
+        next
+      end
+      next unless path.basename.to_s == "SKILL.md" && path.file?
+
+      names << skill_name(path)
+    end
+    names.compact.uniq.sort
+  rescue Errno::ENOENT, Errno::EACCES, Errno::EPERM
+    []
+  end
+
+  def skill_name(skill_md)
+    head = File.open(skill_md.to_s, "r:BOM|UTF-8", &:read).lines.first(80).join
+    match = head.match(/\A---\s*\n(.*?)\n---\s*\n/m)
+    return skill_md.dirname.basename.to_s unless match
+
+    name_line = match[1].lines.find { |line| line.match?(/\A\s*name\s*:/) }
+    return skill_md.dirname.basename.to_s unless name_line
+
+    name_line.split(":", 2).last.strip.delete_prefix('"').delete_suffix('"').delete_prefix("'").delete_suffix("'")
+  rescue StandardError
+    skill_md.dirname.basename.to_s
+  end
+
+  def discover_mcp_names(runtime)
+    config = runtime["mcp_discovery"]
+    executable = executable_for(runtime)
+    return [] unless config && executable
+
+    command = if config["command"]
+                Array(config["command"])
+              else
+                [executable.to_s] + Array(config["args"])
+              end
+    command[0] = executable.to_s if command.first == runtime.dig("executable", "command")
+    stdout, stderr, status = Open3.capture3(*command)
+    return [] unless status.success?
+
+    begin
+      parsed = JSON.parse(stdout)
+      names = case parsed
+              when Hash
+                parsed.keys
+              when Array
+                parsed.each_with_object([]) do |entry, found|
+                  next unless entry.is_a?(Hash)
+
+                  name = entry["name"] || entry["id"]
+                  found << name if name
+                end
+              else
+                []
+              end
+      return names.grep(/\A[a-zA-Z0-9][a-zA-Z0-9._-]*\z/).uniq.sort unless names.empty?
+    rescue JSON::ParserError
+      # Older clients expose a human-readable table or bullet list.
+    end
+
+    output = [stdout, stderr].join("\n")
+    output.lines.each_with_object([]) do |line, names|
+      stripped = line.strip
+      next if stripped.empty?
+      next if stripped.start_with?("Name ", "No MCP", "Checking MCP", "OpenClaw-managed MCP servers", "Note:")
+      next if stripped.match?(/\sdisabled\s/)
+      next if stripped.match?(/\A[-=]+\z/)
+
+      stripped = stripped.sub(/\A-\s+/, "")
+      candidate = stripped.split(/\s+/).first
+      names << candidate if candidate&.match?(/\A[a-zA-Z0-9][a-zA-Z0-9._-]*\z/)
+    end.uniq.sort
+  rescue StandardError
+    []
+  end
+
+  def inventory_markdown(state)
+    lines = [
+      "# Capabilities Inventory",
+      "",
+      "Generated: `#{state.fetch('generated_at')}`",
+      "",
+      "This report inventories visible capabilities. Discovery does not grant access;",
+      "only `registries/capabilities_registry.yaml` and Agent allowlists do.",
+      "",
+      "## Runtime Status",
+      "",
+      "| Runtime | Declared | Executable | Version | Surface | Desired | Visible |",
+      "|---|---|---|---|---|---:|---:|"
+    ]
+    state.fetch("runtimes").each do |row|
+      lines << "| `#{row.fetch('id')}` | `#{row.fetch('declared_status')}` | `#{row['executable'] || 'missing'}` | #{row['version'] || 'unavailable'} | `#{row.fetch('surface')}` | #{row.fetch('desired_skills')} | #{row.fetch('visible_skills')} |"
+    end
+    lines.concat([
+      "",
+      "## Discovery Roots",
+      "",
+      "| Runtime | Root | Exists | Skills | Unregistered | Tracked | Path |",
+      "|---|---|---|---:|---:|---|---|"
+    ])
+    state.fetch("discovery_roots").each do |row|
+      lines << "| `#{row.fetch('runtime')}` | `#{row.fetch('root')}` | #{row.fetch('exists')} | #{row.fetch('skills')} | #{row.fetch('unregistered')} | #{row.fetch('tracked')} | `#{row.fetch('path')}` |"
+    end
+    lines.concat(["", "## Pending Review", ""])
+    pending = state.fetch("pending_capabilities")
+    if pending.empty?
+      lines << "No unregistered Skills were found in tracked active roots."
+    else
+      pending.each do |item|
+        lines << "- `#{item.fetch('skill')}` from `#{item.fetch('runtime')}:#{item.fetch('root')}`"
+      end
+    end
+    lines.concat(["", "## MCP Client Discovery", ""])
+    state.fetch("mcp_clients").each do |row|
+      names = row.fetch("configured")
+      lines << "- `#{row.fetch('runtime')}`: #{names.empty? ? 'none detected' : names.map { |name| "`#{name}`" }.join(', ')}"
+    end
+    lines.join("\n") + "\n"
+  end
+
+  def validate_registries
+    allowed_states = Array(@capabilities.dig("policy", "compatibility_states"))
+    add_error("compatibility state policy differs from manager") unless allowed_states.sort == ALLOWED_COMPATIBILITY.sort
+
+    used_skills = Set.new
+    @skill_sets.each do |set_name, skill_set|
+      Array(skill_set["skills"]).each do |skill_name|
+        add_error("#{set_name} references unknown Skill: #{skill_name}") unless @skills.key?(skill_name)
+        used_skills << skill_name
+        skill = @skills[skill_name]
+        add_error("#{set_name} exposes non-active Skill: #{skill_name}") if skill && skill["status"] != "active"
+        add_error("Skill source missing: #{skill_name}") unless skill_source(skill_name)
+      end
+      compatibility = skill_set.fetch("compatibility", {})
+      @runtimes.each_key do |runtime_id|
+        state = compatibility[runtime_id]
+        add_error("#{set_name} has no compatibility for #{runtime_id}") unless state
+        add_error("#{set_name} has invalid compatibility for #{runtime_id}: #{state}") if state && !ALLOWED_COMPATIBILITY.include?(state)
+      end
+    end
+
+    active_names = @skills.values.select { |skill| skill["status"] == "active" }.map { |skill| skill.fetch("name") }
+    unassigned = active_names - used_skills.to_a
+    add_warning("active Skills not assigned to a capability set: #{unassigned.join(', ')}") unless unassigned.empty?
+
+    @runtimes.each do |runtime_id, runtime|
+      Array(runtime.dig("skill_surface", "skill_sets")).each do |set_name|
+        add_error("#{runtime_id} references unknown Skill set: #{set_name}") unless @skill_sets.key?(set_name)
+      end
+    end
+
+    profile_errors, profile_warnings = @skill_policy.validate
+    profile_errors.each { |message| add_error(message) }
+    profile_warnings.each { |message| add_warning(message) }
+  end
+
+  def validate_runtime_installations
+    @runtimes.each do |runtime_id, runtime|
+      executable = executable_for(runtime)
+      if runtime.fetch("status").start_with?("installed") && !executable
+        add_error("#{runtime_id} is declared installed but executable is missing")
+      elsif runtime.fetch("status") == "not_installed" && executable
+        add_warning("#{runtime_id} executable exists but registry says not_installed")
+      end
+    end
+  end
+
+  def validate_surfaces
+    @runtimes.each do |runtime_id, runtime|
+      surface = surface_path(runtime)
+      desired = desired_skills(runtime_id)
+      actual = surface_skill_names(surface)
+      if runtime.dig("skill_surface", "mode") == "generated" && !surface.join(GENERATED_MARKER).file?
+        add_error("#{runtime_id} generated surface is missing or unmanaged: #{relative_or_absolute(surface)}")
+      end
+      missing = desired - actual
+      extra = actual - desired
+      add_error("#{runtime_id} surface missing Skills: #{missing.join(', ')}") unless missing.empty?
+      add_error("#{runtime_id} surface contains unapproved Skills: #{extra.join(', ')}") unless extra.empty?
+      actual.each do |skill_id|
+        projection = Pathname.new(File.realpath(surface.join(skill_id)))
+        nested = Dir.glob(projection.join("**/SKILL.md").to_s, File::FNM_DOTMATCH)
+        nested.reject! { |path| Pathname.new(path) == projection.join("SKILL.md") }
+        add_error("#{runtime_id}/#{skill_id} projection exposes nested SKILL.md") unless nested.empty?
+      rescue Errno::ENOENT
+        add_error("#{runtime_id}/#{skill_id} projection is broken")
+      end
+
+      next if @isolated || !runtime.dig("skill_surface", "link_required")
+
+      status = external_link_status(runtime)
+      add_error("#{runtime_id} runtime link is #{status}") unless status == "ok"
+    end
+
+    @skill_policy.profile_data.fetch("bindings").each do |binding|
+      runtime_id = binding.fetch("runtime")
+      project_id = binding.fetch("project")
+      agent_id = binding.fetch("agent")
+      discovery_root = @skill_policy.project_discovery_root_path(project_id, runtime_id)
+      manifest = @skill_policy.project_overlay_manifest_path(project_id, runtime_id)
+      legacy_mount = @skill_policy.legacy_project_mount_path(project_id, runtime_id)
+
+      surface = @skill_policy.project_surface_path(project_id, runtime_id)
+      desired = @skill_policy.project_hot_skills(project_id, agent_id, runtime_id)
+      actual = surface_skill_names(surface)
+      unless surface.join(GENERATED_MARKER).file?
+        add_error("#{project_id}/#{runtime_id} project surface is missing or unmanaged: #{relative_or_absolute(surface)}")
+      end
+      missing = desired - actual
+      extra = actual - desired
+      add_error("#{project_id}/#{runtime_id} project surface missing Skills: #{missing.join(', ')}") unless missing.empty?
+      add_error("#{project_id}/#{runtime_id} project surface contains unapproved Skills: #{extra.join(', ')}") unless extra.empty?
+      if discovery_root && manifest
+        status = overlay_status(discovery_root, surface, desired, manifest)
+        add_error("#{project_id}/#{runtime_id} project overlay is #{status}") unless status == "ok"
+      end
+      if legacy_mount && (legacy_mount.exist? || legacy_mount.symlink?)
+        add_error("#{project_id}/#{runtime_id} legacy project mount still exists: #{legacy_mount}")
+      end
+
+      actual.each do |skill_id|
+        projection = Pathname.new(File.realpath(surface.join(skill_id)))
+        nested = Dir.glob(projection.join("**/SKILL.md").to_s, File::FNM_DOTMATCH)
+        nested.reject! { |path| Pathname.new(path) == projection.join("SKILL.md") }
+        add_error("#{project_id}/#{runtime_id}/#{skill_id} projection exposes nested SKILL.md") unless nested.empty?
+      rescue Errno::ENOENT
+        add_error("#{project_id}/#{runtime_id}/#{skill_id} projection is broken")
+      end
+    rescue TwoHeadWu::SkillPolicy::Error => error
+      add_error(error.message)
+    end
+  end
+
+  def validate_agents
+    @agents.each do |agent_id, entry|
+      manifest_path = entry["manifest"]
+      next unless manifest_path
+      unless expand_path(manifest_path).file?
+        add_error("#{agent_id} manifest missing: #{manifest_path}")
+        next
+      end
+      manifest = load_yaml(manifest_path)
+      capabilities = manifest["capabilities"]
+      next unless capabilities
+
+      all_sets = Array(capabilities["skill_sets"])
+      runtime_sets = capabilities.fetch("runtime_skill_sets", {}).values.flatten
+      (all_sets + runtime_sets).uniq.each do |set_name|
+        add_error("#{agent_id} references unknown Skill set: #{set_name}") unless @skill_sets.key?(set_name)
+      end
+      Array(capabilities["mcp_allowlist"]).each do |mcp_id|
+        add_error("#{agent_id} references unknown MCP: #{mcp_id}") unless @mcp_servers.key?(mcp_id)
+      end
+      Array(capabilities["delegation_allowlist"]).each do |runtime_id|
+        add_error("#{agent_id} references unknown delegation runtime: #{runtime_id}") unless @runtimes.key?(runtime_id)
+      end
+    end
+  end
+
+  def validate_mcp
+    provider_kinds = %w[capability runtime-native plugin external-service]
+    package_ids = index_by(load_yaml("catalog/packages_registry.yaml").fetch("packages"), "id").keys
+    add_error("MCP registry version must be 2") unless @mcp_data["version"] == 2
+
+    discovered_by_runtime = @runtimes.each_with_object({}) do |(runtime_id, runtime), discovered|
+      discovered[runtime_id] = discover_mcp_names(runtime)
+    end
+    expected_by_runtime = Hash.new { |hash, key| hash[key] = [] }
+
+    @mcp_servers.each do |mcp_id, server|
+      provider = server["provider"]
+      unless provider.is_a?(Hash) && provider["kind"] && provider["id"]
+        add_error("#{mcp_id} has no complete MCP provider ownership")
+      else
+        kind = provider.fetch("kind")
+        provider_id = provider.fetch("id")
+        add_error("#{mcp_id} has invalid MCP provider kind: #{kind}") unless provider_kinds.include?(kind)
+        if kind == "capability" && !package_ids.include?(provider_id)
+          add_error("#{mcp_id} references unknown provider capability: #{provider_id}")
+        end
+      end
+      clients = server.fetch("clients", {})
+      clients.each do |runtime_id, state|
+        add_error("#{mcp_id} references unknown MCP client: #{runtime_id}") unless @runtimes.key?(runtime_id)
+        discovery_states = %w[configured configured_mcp configured_enabled configured_disabled]
+        next unless discovery_states.include?(state.to_s) && @runtimes.key?(runtime_id)
+
+        client_name = server.fetch("client_names", {}).fetch(runtime_id, mcp_id)
+        expected_by_runtime[runtime_id] << client_name
+        unless discovered_by_runtime.fetch(runtime_id, []).include?(client_name)
+          add_error("#{mcp_id} is declared configured for #{runtime_id} but #{client_name} was not discovered")
+        end
+      end
+      authentication = server.fetch("authentication", {})
+      forbidden_keys = authentication.keys.grep(/token|secret|password|value/i) - ["env_var"]
+      add_error("#{mcp_id} registry contains credential-like fields: #{forbidden_keys.join(', ')}") unless forbidden_keys.empty?
+      Array(server["allowed_agents"]).each do |agent_id|
+        add_error("#{mcp_id} allows unknown agent: #{agent_id}") unless @agents.key?(agent_id)
+      end
+    end
+
+    discovered_by_runtime.each do |runtime_id, names|
+      unregistered = names - expected_by_runtime.fetch(runtime_id, [])
+      add_warning("#{runtime_id} has unregistered configured MCP servers: #{unregistered.join(', ')}") unless unregistered.empty?
+    end
+  end
+
+  def validate_discovered_capabilities
+    @runtimes.each_value do |runtime|
+      Array(runtime["discovery_roots"]).each do |root_config|
+        next unless root_config["track_unregistered"]
+
+        root = expand_path(root_config.fetch("path"))
+        next unless root.exist? || root.symlink?
+
+        unregistered = discover_skill_names(root) - @skills.keys
+        unless unregistered.empty?
+          add_warning("#{runtime.fetch('id')}:#{root_config.fetch('id')} has unregistered Skills: #{unregistered.join(', ')}")
+        end
+      end
+    end
+  end
+
+  def add_error(message)
+    @errors << message unless @errors.include?(message)
+  end
+
+  def add_warning(message)
+    @warnings << message unless @warnings.include?(message)
+  end
+
+  def print_findings
+    @errors.each { |message| warn "ERROR: #{message}" }
+    @warnings.each { |message| warn "WARNING: #{message}" }
+    @infos.each { |message| puts "INFO: #{message}" }
+    puts "findings: errors=#{@errors.length}, warnings=#{@warnings.length}"
+  end
+
+  def finish_findings
+    print_findings
+    exit_code
+  end
+
+  def exit_code
+    @errors.empty? ? 0 : 2
+  end
+end
+
+def extract_root!(arguments)
+  default = Pathname.new(__dir__).parent
+  index = arguments.index("--root")
+  return default unless index
+
+  value = arguments[index + 1]
+  abort("Error: --root requires a path") unless value
+  arguments.slice!(index, 2)
+  Pathname.new(value)
+end
+
+def parse_catalog_options!(arguments, allow_top_k: false, allow_digest: false)
+  options = { agent: "two-head-wu", json: false }
+  OptionParser.new do |parser|
+    parser.on("--agent ID") { |value| options[:agent] = value }
+    parser.on("--runtime ID") { |value| options[:runtime] = value }
+    parser.on("--project ID") { |value| options[:project] = value }
+    parser.on("--json") { options[:json] = true }
+    parser.on("--top-k N", Integer) { |value| options[:top_k] = value } if allow_top_k
+    parser.on("--digest SHA256") { |value| options[:digest] = value } if allow_digest
+  end.parse!(arguments)
+  %i[project runtime].each do |key|
+    abort("Error: command requires --#{key}") unless options[key]
+  end
+  options
+end
+
+arguments = ARGV.dup
+root = extract_root!(arguments)
+command = arguments.shift
+
+unless command
+  warn <<~HELP
+    Usage: scripts/capabilities-manager [--root PATH] COMMAND [OPTIONS]
+
+    Commands:
+      status
+      sync-skills [--apply] [--isolated]
+      resolve --agent ID [--runtime ID]
+      inventory [--write]
+      audit-updates [--write]
+      catalog-index
+      catalog-search QUERY --project ID --runtime ID [--agent ID] [--top-k N] [--json]
+      catalog-load SKILL --project ID --runtime ID [--agent ID] [--digest SHA256] [--json]
+      catalog-read SKILL PATH --project ID --runtime ID [--agent ID] [--digest SHA256] [--json]
+      visibility-budget --project ID --runtime ID [--agent ID] [--json]
+      doctor [--strict]
+  HELP
+  exit 1
+end
+
+begin
+  manager = CapabilityManager.new(root)
+  code = case command
+         when "status"
+           manager.status
+           0
+         when "sync-skills"
+           apply = arguments.delete("--apply")
+           isolated = arguments.delete("--isolated")
+           abort("Unknown options: #{arguments.join(' ')}") unless arguments.empty?
+           manager.sync_skills(apply: !!apply, isolated: !!isolated)
+         when "resolve"
+           options = {}
+           OptionParser.new do |parser|
+             parser.on("--agent ID") { |value| options[:agent] = value }
+             parser.on("--runtime ID") { |value| options[:runtime] = value }
+           end.parse!(arguments)
+           abort("Error: resolve requires --agent ID") unless options[:agent]
+           manager.resolve(options[:agent], runtime_id: options[:runtime])
+         when "inventory", "audit-updates"
+           write = arguments.delete("--write")
+           abort("Unknown options: #{arguments.join(' ')}") unless arguments.empty?
+           manager.inventory(write: !!write)
+         when "catalog-index"
+           abort("Unknown options: #{arguments.join(' ')}") unless arguments.empty?
+           manager.catalog_index
+         when "catalog-search"
+           options = parse_catalog_options!(arguments, allow_top_k: true)
+           query = arguments.join(" ").strip
+           abort("Error: catalog-search requires a query") if query.empty?
+           manager.catalog_search(
+             query,
+             project_id: options.fetch(:project),
+             runtime_id: options.fetch(:runtime),
+             agent_id: options.fetch(:agent),
+             top_k: options[:top_k],
+             json: options.fetch(:json)
+           )
+         when "catalog-load"
+           options = parse_catalog_options!(arguments, allow_digest: true)
+           skill_id = arguments.shift
+           abort("Error: catalog-load requires exactly one Skill ID") unless skill_id && arguments.empty?
+           manager.catalog_load(
+             skill_id,
+             project_id: options.fetch(:project),
+             runtime_id: options.fetch(:runtime),
+             agent_id: options.fetch(:agent),
+             digest: options[:digest],
+             json: options.fetch(:json)
+           )
+         when "catalog-read"
+           options = parse_catalog_options!(arguments, allow_digest: true)
+           skill_id = arguments.shift
+           resource = arguments.shift
+           abort("Error: catalog-read requires a Skill ID and relative resource path") unless skill_id && resource && arguments.empty?
+           manager.catalog_read(
+             skill_id,
+             resource,
+             project_id: options.fetch(:project),
+             runtime_id: options.fetch(:runtime),
+             agent_id: options.fetch(:agent),
+             digest: options[:digest],
+             json: options.fetch(:json)
+           )
+         when "visibility-budget"
+           options = parse_catalog_options!(arguments)
+           abort("Unknown options: #{arguments.join(' ')}") unless arguments.empty?
+           manager.visibility_budget(
+             project_id: options.fetch(:project),
+             runtime_id: options.fetch(:runtime),
+             agent_id: options.fetch(:agent),
+             json: options.fetch(:json)
+           )
+         when "doctor"
+           strict = arguments.delete("--strict")
+           abort("Unknown options: #{arguments.join(' ')}") unless arguments.empty?
+           manager.doctor(strict: !!strict)
+         else
+           abort("Error: unknown command: #{command}")
+         end
+  exit(code || 0)
+rescue KeyError, RuntimeError, TwoHeadWu::SkillPolicy::Error => error
+  warn "Error: #{error.message}"
+  exit 2
+end

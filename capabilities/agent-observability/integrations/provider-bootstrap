@@ -1,0 +1,44 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "optparse"
+require "pathname"
+require_relative "../lib/agent_observability"
+
+options = {}
+parser = OptionParser.new do |item|
+  item.on("--project-root PATH") { |value| options[:project_root] = value }
+  item.on("--data-root PATH") { |value| options[:data_root] = value }
+  item.on("--package-root PATH") { |value| options[:package_root] = value }
+end
+parser.parse!(ARGV)
+raise OptionParser::MissingArgument, "--project-root" if options[:project_root].to_s.empty?
+raise OptionParser::MissingArgument, "--data-root" if options[:data_root].to_s.empty?
+raise OptionParser::MissingArgument, "--package-root" if options[:package_root].to_s.empty?
+
+state_root = Pathname.new(Dir.home).join(".local/state/two-head-wu/agent-observability")
+FileUtils.mkdir_p(state_root, mode: 0o700)
+lock = File.open(state_root.join("provider-bootstrap.lock"), File::WRONLY | File::CREAT, 0o600)
+exit 0 unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+
+validator = TwoHeadWu::AgentObservability.new(
+  project_root: options.fetch(:project_root),
+  data_root: options.fetch(:data_root),
+  package_root: Pathname.new(__dir__).join("..").realpath
+)
+begin
+  package_root = validator.send(:provider_bootstrap_package_root)
+  unless package_root == Pathname.new(options.fetch(:package_root)).expand_path.cleanpath.realpath
+    raise TwoHeadWu::AgentObservability::Error, "provider package does not match the installed prelaunch contract"
+  end
+  observability = TwoHeadWu::AgentObservability.new(
+    project_root: options.fetch(:project_root),
+    data_root: options.fetch(:data_root),
+    package_root: package_root
+  )
+  observability.start(wait_seconds: 300, pull: false)
+rescue StandardError => error
+  validator.record_coverage_gap("provider-start-failed")
+  warn "provider bootstrap failed: #{error.message.to_s.lines.last.to_s.strip[0, 500]}"
+  exit 1
+end

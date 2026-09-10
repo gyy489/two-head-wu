@@ -1,0 +1,8 @@
+schema_version: 1
+updated_at: "2026-09-10"
+policy:
+  opt_in: true
+  default_update_policy: pinned
+  automatic_update_requires_explicit_binding: true
+  discovery_does_not_grant_authorization: true
+bindings: []

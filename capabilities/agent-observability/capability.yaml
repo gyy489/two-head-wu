@@ -1,0 +1,113 @@
+schema_version: 1
+id: agent-observability
+version: "0.3.11"
+status: experimental
+summary: "Trace-only monitoring for all registered owner-local Codex identities and projects, with launchd socket-activated OpenLIT startup and private project attribution."
+
+documentation:
+  overview: "capabilities/agent-observability/README.md"
+  skill_docs: []
+  references:
+    - "capabilities/agent-observability/deploy/PROVENANCE.md"
+  generated: []
+
+installation:
+  source_owner: two-head-wu
+  runtime_mode: source-and-external-service
+  managed_copy: true
+  large_artifacts: external-volume-required
+
+interfaces:
+  - id: agent-observability-adapter
+    type: adapter
+    entrypoint: "adapters/agent-observability"
+  - id: agent-observability.configure.v1
+    type: adapter
+    entrypoint: "adapters/agent-observability"
+  - id: agent-observability.start.v1
+    type: adapter
+    entrypoint: "adapters/agent-observability"
+  - id: agent-observability.stop.v1
+    type: adapter
+    entrypoint: "adapters/agent-observability"
+  - id: agent-observability.status.v1
+    type: adapter
+    entrypoint: "adapters/agent-observability"
+  - id: agent-observability.coverage.v1
+    type: adapter
+    entrypoint: "adapters/agent-observability"
+  - id: agent-observability.query.v1
+    type: adapter
+    entrypoint: "adapters/agent-observability"
+  - id: agent-observability.launch.v1
+    type: adapter
+    entrypoint: "adapters/agent-observability"
+  - id: agent-observability.install.v1
+    type: adapter
+    entrypoint: "adapters/agent-observability"
+  - id: agent-observability.uninstall.v1
+    type: adapter
+    entrypoint: "adapters/agent-observability"
+  - id: agent-observability.verify.v1
+    type: adapter
+    entrypoint: "adapters/agent-observability"
+
+components:
+  skills: []
+  agents: []
+  adapters:
+    - "adapters/agent-observability"
+    - "adapters/codex-observed"
+    - "integrations/codex-prelaunch"
+    - "integrations/lazy-otlp-proxy"
+    - "integrations/provider-bootstrap"
+    - "integrations/provider-trigger-broker"
+  workflows: []
+
+compatibility:
+  codex: native
+  claude-code: denied
+  openclaw: denied
+
+permissions:
+  risk_level: medium
+  network: "loopback-only OpenLIT UI on 127.0.0.1:3000, launchd OTLP frontend on 127.0.0.1:4318, and private collector backend on 127.0.0.1:4319; provider image installation may access registered public container registries"
+  secrets: "generate and read only the private external ClickHouse password needed for provider lifecycle/query; never read, copy, parse, emit, or store Codex credentials, account aliases, emails, account IDs, prompts, commands, source, diffs, tool arguments, or tool outputs"
+  filesystem:
+    read:
+      - "registered project metadata, aggregate agent-identity status, registered Codex config paths without credentials, the existing local Codex PATH wrapper and VS Code user CLI setting, validated cwd supplied by Codex notify, tracked provider configuration, and private integration/runtime metadata beneath the dedicated external .ltw-ao data root; never open rollout conversation files"
+    write:
+      - "managed trace-only OTel and notify blocks in registered local Codex config.toml files; a reversible prelaunch block in the existing local Codex PATH wrapper; the VS Code application-level Codex CLI setting with its prior value retained; one user LaunchAgent plist; private project map, bounded broker socket/state, commissioning/production coverage gaps, local verification marker, OpenLIT, ClickHouse, provider configuration, and dedicated Colima state beneath the external .ltw-ao root"
+
+dependencies:
+  - id: two-head-wu-core
+    version: ">=0.5.0 <1.0.0"
+    purpose: "Project authorization, stable release invocation, and generated discovery."
+  - id: agent-identity
+    version: ">=0.10.0 <1.0.0"
+    purpose: "Resolve all configured owner-local Codex homes while keeping their aliases and account data out of telemetry."
+  - id: capability-release-management
+    version: ">=0.1.1 <1.0.0"
+    purpose: "Install and invoke the immutable Capability release through project-bound Interfaces."
+  - id: openlit
+    version: "=2.0.0"
+    purpose: "Replaceable OTLP collector, ClickHouse integration, and loopback user interface."
+  - id: clickhouse
+    version: "=24.4.1"
+    purpose: "Provider-owned private trace storage with a 90-day detailed TTL."
+  - id: colima
+    version: "homebrew"
+    purpose: "Dedicated macOS container runtime whose state uses a registered short external path required by the Unix socket limit."
+  - id: docker-compose
+    version: "v2"
+    purpose: "Pinned three-service provider lifecycle."
+
+recovery:
+  source_of_truth: "Tracked Capability contract, provider configuration, immutable image digests, Catalog release/project binding, and external runtime manifest."
+  private_material: "ClickHouse password, OpenLIT SQLite state, ClickHouse data, provider runtime metadata, and dedicated Colima state under the external volume's registered .ltw-ao path outside the IDE workspace."
+  rebuild_command: "capabilities/agent-observability/adapters/agent-observability configure && capabilities/agent-observability/adapters/agent-observability install"
+  rollback: "Run uninstall to preflight and restore all managed OTel/notify blocks, the prior PATH wrapper content, and the prior VS Code CLI setting, then unload the LaunchAgent; any drift/failure retains recovery state and provider data. Capability release rollback is handled independently by wu packages rollback."
+
+tests:
+  - "capabilities/agent-observability/tests/test_agent_observability.sh"
+  - "ruby capabilities/agent-observability/tests/test_agent_observability.rb"

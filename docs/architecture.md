@@ -129,7 +129,8 @@ These constraints make packages independently testable, releasable, replaceable,
 
 ## What this public edition proves
 
-The repository exposes the architecture, schemas, authoring workflow, a deterministic manifest
-validator, and a runnable package. It demonstrates the contract and development loop. It does not
-claim to reproduce the private catalog, complete resolver, OpenClaw installation, or owner-specific
-runtime.
+The repository ships the sanitized deterministic core, public catalog and registries, ten real
+capability packages, schemas, tests, and the authoring workflow. It makes the platform structure
+and implementation reviewable while deliberately excluding owner identities, credentials, private
+data, production bindings, mutable state, and private development records. OpenClaw is still
+required for persistent channels, schedules, and the complete personal-agent runtime.

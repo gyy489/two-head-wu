@@ -1,0 +1,69 @@
+schema_version: 1
+id: capability-release-management
+version: "0.1.1"
+status: active
+summary: "Deterministic project Capability release resolution, verified installation, atomic activation, stable invocation, and rollback."
+
+documentation:
+  overview: "capabilities/capability-release-management/README.md"
+  skill_docs: []
+  references:
+    - "catalog/capability_releases.yaml"
+    - "catalog/project_capability_bindings.yaml"
+    - "core/contracts/capability-release-registry.schema.yaml"
+    - "core/contracts/project-capability-bindings.schema.yaml"
+  generated: []
+
+installation:
+  source_owner: two-head-wu
+  runtime_mode: source-and-external-state
+  managed_copy: true
+  large_artifacts: none
+
+interfaces:
+  - id: capability-release-manager
+    type: adapter
+    entrypoint: "capabilities/capability-release-management/adapters/capability-release-manager"
+  - id: capability-stable-invoke
+    type: cli
+    entrypoint: "core/bin/wu"
+
+components:
+  skills: []
+  agents: []
+  adapters:
+    - "capabilities/capability-release-management/adapters/capability-release-manager"
+  workflows: []
+
+compatibility:
+  codex: native
+  claude-code: compatible
+  openclaw: denied
+
+permissions:
+  risk_level: medium
+  network: none
+  secrets: none
+  filesystem:
+    read:
+      - "catalog/**"
+      - "registries/projects_registry.yaml"
+      - "capabilities/**"
+      - ".git/**"
+    write:
+      - "var/capability-releases/**"
+
+dependencies:
+  - id: two-head-wu-core
+    version: ">=0.5.0 <1.0.0"
+    purpose: "Core provides the stable wu routing surface and project authorization facts."
+
+recovery:
+  source_of_truth: "Git-tracked package source plus Catalog release and binding registries."
+  private_material: "None. Runtime slots contain only registered package source and validation metadata."
+  rebuild_command: "core/bin/wu packages update --project <project> --apply"
+  rollback: "Switch to an already installed version with wu packages rollback, or remove the Core routes and package registration."
+
+tests:
+  - "ruby capabilities/capability-release-management/tests/test_capability_release_manager.rb"
+  - "capabilities/capability-release-management/tests/test_capability_release_management.sh"

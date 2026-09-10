@@ -1,0 +1,547 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "digest"
+require "fileutils"
+require "find"
+require "json"
+require "open3"
+require "optparse"
+require "pathname"
+require "securerandom"
+require "time"
+require "tmpdir"
+require "uri"
+require "yaml"
+
+require_relative "../lib/remote_work"
+require_relative "../../../core/lib/function_catalog"
+
+class RemoteWorkAdmin
+  ENROLLMENT_ENV = "TWO_HEAD_WU_ENROLLMENT_TOKEN"
+  SIGNING_KEY_SERVICE = "com.twoheadwu.remote-work.release-signing"
+  SIGNING_KEY_ACCOUNT = "example-owner"
+
+  def initialize(arguments)
+    @arguments = arguments.dup
+    @root = Pathname.new(__dir__).join("../../..").expand_path.cleanpath
+  end
+
+  def run
+    command = @arguments.shift || "help"
+    case command
+    when "help", "--help", "-h" then help
+    when "health" then health
+    when "build" then build
+    when "sync-source" then sync_source
+    when "render-installer" then render_installer
+    else raise RemoteWork::Error, "unknown admin command: #{command}"
+    end
+  rescue RemoteWork::Error, TwoHeadWu::FunctionCatalog::Error, KeyError, Psych::Exception, Errno::EACCES, Errno::ENOENT => error
+    warn "Error: #{error.message}"
+    2
+  end
+
+  private
+
+  def help
+    puts <<~HELP
+      Usage: remote-work-admin COMMAND
+
+      Commands:
+        health
+        build [--channel stable|dev]
+        sync-source       # publish the committed repository to the fixed internal Mini workflow mirror
+        render-installer   # reads #{ENROLLMENT_ENV}; writes one ignored owner-only installer
+
+      Build output is fixed at var/remote-work/build/current.
+      Generated installer is fixed under var/remote-work/installer and is never committed.
+    HELP
+    0
+  end
+
+  def health
+    ensure_no_arguments!
+    policy = owner_policy
+    raise RemoteWork::Error, "public endpoint must use HTTPS" unless policy.dig("transport", "public_endpoint").start_with?("https://")
+    entries = Array(policy.dig("modules", "entries"))
+    raise RemoteWork::Error, "module policy is empty" if entries.empty?
+    capabilities = Array(policy.dig("capability_directory", "entries"))
+    raise RemoteWork::Error, "capability directory policy is empty" if capabilities.empty?
+    air_entries = Array(air_policy["entries"])
+    raise RemoteWork::Error, "Air capability directory policy is empty" if air_entries.empty?
+    raise RemoteWork::Error, "Air capability directory must default deny" unless air_policy["default"] == "deny"
+    raise RemoteWork::Error, "Air capability directory visibility drifted" unless air_policy["visibility"] == "air"
+    raise RemoteWork::Error, "owner-only default identity drift" unless policy.dig("jobs", "default_identity") == "owner-auto"
+    raise RemoteWork::Error, "owner automatic identity membership drift" unless policy.dig("jobs", "automatic_identity_members") == %w[owner-primary owner-secondary]
+    puts "remote-work-admin health ok"
+    puts "modules: #{entries.count { |entry| entry.fetch('classification') != 'forbidden' }} visible"
+    puts "capabilities: #{capabilities.length} visible"
+    puts "Air capabilities: #{air_entries.length} allowlisted"
+    puts "endpoint: registered HTTPS path"
+    0
+  end
+
+  def sync_source
+    ensure_no_arguments!
+    if @root.join("MIRROR_COMMIT").file?
+      puts JSON.pretty_generate({
+        "result" => "current",
+        "source" => "managed-internal-mirror",
+        "commit" => @root.join("MIRROR_COMMIT").read(encoding: "UTF-8").strip
+      })
+      return 0
+    end
+
+    commit_out, _commit_err, commit_status = Open3.capture3("git", "rev-parse", "HEAD", chdir: @root.to_s)
+    raise RemoteWork::Error, "cannot resolve committed Two-Headed-Wu source" unless commit_status.success?
+    commit = commit_out.strip
+    raise RemoteWork::Error, "committed source identity is invalid" unless commit.match?(/\A[a-f0-9]{40}\z/)
+
+    mirror_root = Pathname.new(
+      ENV.fetch("WU_REMOTE_SOURCE_MIRROR_ROOT", File.join(Dir.home, ".local", "share", "two-head-wu", "managed-source"))
+    ).expand_path.cleanpath
+    releases = mirror_root.join("releases")
+    release = releases.join(commit)
+    FileUtils.mkdir_p(releases.to_s, mode: 0o700)
+    unless release.directory?
+      stage = Pathname.new(Dir.mktmpdir("source-stage-", releases.to_s))
+      archive = stage.dirname.join("source-#{Process.pid}-#{SecureRandom.hex(3)}.tar")
+      File.open(archive.to_s, "wb", 0o600) do |output|
+        ok = system("git", "archive", "--format=tar", "HEAD", chdir: @root.to_s, out: output)
+        raise RemoteWork::Error, "cannot archive committed Two-Headed-Wu source" unless ok
+      end
+      ok = system("tar", "-xf", archive.to_s, "-C", stage.to_s)
+      raise RemoteWork::Error, "cannot materialize committed Two-Headed-Wu source" unless ok
+      stage.join("MIRROR_COMMIT").write(commit + "\n", encoding: "UTF-8")
+      isolated_manager = stage.join("scripts/capabilities-manager")
+      _surface_stdout, _surface_stderr, surface_status = Open3.capture3(
+        isolated_manager.to_s, "sync-skills", "--apply", "--isolated", chdir: stage.to_s
+      )
+      unless surface_status.success?
+        raise RemoteWork::Error, "cannot validate registered Skill sets in the Mini source mirror"
+      end
+      initialize_mirror_git(stage)
+      File.rename(stage.to_s, release.to_s)
+    end
+    activate_source_mirror(mirror_root, release)
+    puts JSON.pretty_generate({
+      "result" => "synchronized",
+      "source" => "committed-git-head",
+      "commit" => commit,
+      "mirror" => "managed-internal"
+    })
+    0
+  ensure
+    FileUtils.rm_f(archive.to_s) if defined?(archive) && archive
+    FileUtils.rm_rf(stage.to_s) if defined?(stage) && stage&.exist?
+  end
+
+  def initialize_mirror_git(root)
+    commands = [
+      %w[git init -q],
+      ["git", "config", "user.name", "Two-Headed-Wu Mirror"],
+      %w[git config user.email mirror@localhost.invalid],
+      %w[git add -A],
+      ["git", "commit", "-q", "--allow-empty", "-m", "managed source baseline"]
+    ]
+    commands.each do |command|
+      raise RemoteWork::Error, "cannot initialize managed Mini source mirror" unless system(*command, chdir: root.to_s)
+    end
+  end
+
+  def activate_source_mirror(mirror_root, release)
+    current = mirror_root.join("current")
+    temporary = mirror_root.join(".current.#{Process.pid}.#{SecureRandom.hex(3)}")
+    File.symlink(release.relative_path_from(mirror_root).to_s, temporary.to_s)
+    File.rename(temporary.to_s, current.to_s)
+  ensure
+    FileUtils.rm_f(temporary.to_s) if defined?(temporary) && temporary
+  end
+
+  def build
+    options = { channel: "stable" }
+    parser = OptionParser.new { |item| item.on("--channel CHANNEL") { |value| options[:channel] = value } }
+    parser.parse!(@arguments)
+    ensure_no_arguments!
+    raise RemoteWork::Error, "release channel must be stable or dev" unless %w[stable dev].include?(options.fetch(:channel))
+    build_root = build_output_root
+    FileUtils.mkdir_p(build_root.to_s, mode: 0o700)
+    components = build_root.join("components")
+    capabilities = build_root.join("capabilities")
+    releases = build_root.join("releases")
+    FileUtils.mkdir_p(components.to_s, mode: 0o700)
+    FileUtils.mkdir_p(capabilities.to_s, mode: 0o700)
+    FileUtils.mkdir_p(releases.to_s, mode: 0o700)
+    previous_manifest = if components.join("manifest.json").file?
+                          JSON.parse(components.join("manifest.json").read(encoding: "UTF-8"))
+                        else
+                          { "modules" => [] }
+                        end
+    manifest = build_modules(components, previous_manifest)
+    RemoteWork::Atomic.json(components.join("manifest.json"), manifest, mode: 0o640)
+    air_module_manifest = build_air_modules(manifest, role: "member")
+    owner_air_module_manifest = build_air_modules(manifest, role: "owner")
+    RemoteWork::Atomic.json(components.join("air-manifest.json"), air_module_manifest, mode: 0o640)
+    RemoteWork::Atomic.json(components.join("owner-air-manifest.json"), owner_air_module_manifest, mode: 0o640)
+    capability_manifest = build_capability_catalog
+    RemoteWork::Atomic.json(capabilities.join("manifest.json"), capability_manifest, mode: 0o640)
+    air_capability_manifest = build_air_capability_catalog(capability_manifest, role: "member")
+    owner_air_capability_manifest = build_air_capability_catalog(capability_manifest, role: "owner")
+    RemoteWork::Atomic.json(capabilities.join("air-manifest.json"), air_capability_manifest, mode: 0o640)
+    RemoteWork::Atomic.json(capabilities.join("owner-air-manifest.json"), owner_air_capability_manifest, mode: 0o640)
+    inventory_manifest = build_capability_inventory(manifest)
+    RemoteWork::Atomic.json(capabilities.join("inventory.json"), inventory_manifest, mode: 0o640)
+    release = build_release(releases, options.fetch(:channel))
+    puts JSON.pretty_generate({
+      "result" => "built",
+      "modules" => manifest.fetch("modules").length,
+      "air_modules" => air_module_manifest.fetch("modules").length,
+      "owner_air_modules" => owner_air_module_manifest.fetch("modules").length,
+      "capabilities" => capability_manifest.fetch("capabilities").length,
+      "air_capabilities" => air_capability_manifest.fetch("capabilities").length,
+      "owner_air_capabilities" => owner_air_capability_manifest.fetch("capabilities").length,
+      "inventory_entries" => inventory_manifest.fetch("entries").length,
+      "release" => release
+    })
+    0
+  end
+
+  def build_modules(output, previous_manifest)
+    previous_by_id = Array(previous_manifest["modules"]).each_with_object({}) { |item, index| index[item["id"]] = item }
+    modules = []
+    Array(owner_policy.dig("modules", "entries")).each do |entry|
+      classification = entry.fetch("classification")
+      next if classification == "forbidden"
+      record = {
+        "id" => entry.fetch("id"),
+        "classification" => classification,
+        "status" => entry.fetch("status"),
+        "summary" => entry.fetch("summary"),
+        "default_mode" => entry.fetch("default_mode")
+      }
+      if classification == "portable"
+        source = safe_source(entry.fetch("source"))
+        version = content_digest(source)[0, 16]
+        archive_name = "#{entry.fetch('id').tr(':', '-')}-#{version}.tar.gz"
+        archive = output.join(archive_name)
+        RemoteWork::Archive.pack_directory(source, archive) unless archive.file?
+        record.merge!(
+          "version" => version,
+          "archive" => archive_name,
+          "sha256" => Digest::SHA256.file(archive.to_s).hexdigest,
+          "size" => archive.size
+        )
+        history = Array(previous_by_id.dig(entry.fetch("id"), "versions"))
+        previous = previous_by_id[entry.fetch("id")]
+        if previous && previous["version"] && previous["archive"]
+          history.unshift(previous.slice("version", "archive", "sha256", "size"))
+        end
+        current = record.slice("version", "archive", "sha256", "size")
+        record["versions"] = ([current] + history).uniq { |item| item["version"] }.select do |item|
+          item["archive"] && output.join(item["archive"]).file?
+        end.take(5)
+      end
+      modules << record
+    end
+    public_key = OpenSSL::PKey::RSA.new(release_public_key_path.read)
+    manifest = {
+      "schema_version" => 2,
+      "generated_at" => Time.now.utc.iso8601,
+      "modules" => modules,
+      "public_key_sha256" => Digest::SHA256.hexdigest(public_key.public_key.to_der)
+    }
+    manifest["signature_base64"] = RemoteWork::ModuleSignature.sign(manifest, release_private_key)
+    RemoteWork::ModuleSignature.verify!(manifest, release_public_key_path.read)
+    manifest
+  end
+
+  def build_air_modules(owner_manifest, role:)
+    owner_by_id = owner_manifest.fetch("modules").to_h { |item| [item.fetch("id"), item] }
+    forbidden = Array(air_policy["forbidden_modules"])
+    entries = Array(air_policy.fetch("modules")).select { |entry| audience_visible?(entry.fetch("audience"), role) }
+    ids = entries.map { |item| item.fetch("id") }
+    raise RemoteWork::Error, "Air module policy contains duplicate ids" unless ids.uniq.length == ids.length
+    raise RemoteWork::Error, "Air module policy overlaps its forbidden ids" unless (ids & forbidden).empty?
+    modules = entries.map do |policy_entry|
+      source = owner_by_id[policy_entry.fetch("id")]
+      unless source && source["classification"] == "portable"
+        raise RemoteWork::Error, "Air module is not an owner-published portable module: #{policy_entry.fetch('id')}"
+      end
+      source.merge(
+        "audience" => policy_entry.fetch("audience"),
+        "status" => policy_entry.fetch("status"),
+        "summary" => policy_entry.fetch("summary")
+      )
+    end
+    public_key = OpenSSL::PKey::RSA.new(release_public_key_path.read)
+    manifest = {
+      "schema_version" => 2,
+      "generated_at" => Time.now.utc.iso8601,
+      "modules" => modules,
+      "public_key_sha256" => Digest::SHA256.hexdigest(public_key.public_key.to_der)
+    }
+    manifest["signature_base64"] = RemoteWork::ModuleSignature.sign(manifest, release_private_key)
+    RemoteWork::ModuleSignature.verify!(manifest, release_public_key_path.read)
+    manifest
+  end
+
+  def build_capability_catalog
+    capabilities = function_catalog.remote_execution_entries
+    capabilities.each { |record| RemoteWork::CapabilityCatalogSignature.validate_entry!(record) }
+    public_key = OpenSSL::PKey::RSA.new(release_public_key_path.read)
+    manifest = {
+      "schema_version" => 1,
+      "catalog_version" => Digest::SHA256.hexdigest(JSON.generate(capabilities))[0, 16],
+      "generated_at" => Time.now.utc.iso8601,
+      "capabilities" => capabilities,
+      "public_key_sha256" => Digest::SHA256.hexdigest(public_key.public_key.to_der)
+    }
+    manifest["signature_base64"] = RemoteWork::CapabilityCatalogSignature.sign(manifest, release_private_key)
+    RemoteWork::CapabilityCatalogSignature.verify!(manifest, release_public_key_path.read)
+    manifest
+  end
+
+  def build_air_capability_catalog(owner_manifest, role:)
+    owner_by_id = owner_manifest.fetch("capabilities").to_h { |item| [item.fetch("id"), item] }
+    forbidden = Array(air_policy["forbidden_ids"])
+    entries = Array(air_policy.fetch("entries")).select { |entry| audience_visible?(entry.fetch("audience"), role) }
+    ids = entries.map { |item| item.fetch("id") }
+    raise RemoteWork::Error, "Air capability policy contains duplicate ids" unless ids.uniq.length == ids.length
+    raise RemoteWork::Error, "Air capability policy overlaps its forbidden ids" unless (ids & forbidden).empty?
+    capabilities = entries.map do |policy_entry|
+      source = owner_by_id[policy_entry.fetch("id")]
+      raise RemoteWork::Error, "Air capability is absent from the source catalog: #{policy_entry.fetch('id')}" unless source
+      source.merge(
+        "audience" => policy_entry.fetch("audience"),
+        "confirmation" => policy_entry.fetch("confirmation"),
+        "executor" => policy_entry.fetch("executor"),
+        "status" => policy_entry.fetch("status"),
+        "summary" => policy_entry.fetch("summary")
+      ).reject { |key, _value| key == "command" }
+    end
+    capabilities.each { |record| RemoteWork::CapabilityCatalogSignature.validate_entry!(record) }
+    public_key = OpenSSL::PKey::RSA.new(release_public_key_path.read)
+    manifest = {
+      "schema_version" => 1,
+      "catalog_version" => Digest::SHA256.hexdigest(JSON.generate(capabilities))[0, 16],
+      "generated_at" => Time.now.utc.iso8601,
+      "capabilities" => capabilities,
+      "public_key_sha256" => Digest::SHA256.hexdigest(public_key.public_key.to_der)
+    }
+    manifest["signature_base64"] = RemoteWork::CapabilityCatalogSignature.sign(manifest, release_private_key)
+    RemoteWork::CapabilityCatalogSignature.verify!(manifest, release_public_key_path.read)
+    manifest
+  end
+
+  def audience_visible?(audience, role)
+    return true if audience == "all-air"
+    role == "owner" && %w[owner-air owner-step-up].include?(audience)
+  end
+
+  def build_capability_inventory(_module_manifest)
+    policy = owner_policy.fetch("capability_inventory")
+    raise RemoteWork::Error, "Mini capability inventory must be owner-Air only" unless policy["visibility"] == "owner-air"
+    entries = function_catalog.remote_inventory_entries
+    entries.each { |record| RemoteWork::CapabilityInventorySignature.validate_entry!(record) }
+    public_key = OpenSSL::PKey::RSA.new(release_public_key_path.read)
+    manifest = {
+      "schema_version" => 1,
+      "inventory_version" => Digest::SHA256.hexdigest(JSON.generate(entries))[0, 16],
+      "generated_at" => Time.now.utc.iso8601,
+      "source_device" => "mac-mini",
+      "entries" => entries,
+      "public_key_sha256" => Digest::SHA256.hexdigest(public_key.public_key.to_der)
+    }
+    manifest["signature_base64"] = RemoteWork::CapabilityInventorySignature.sign(manifest, release_private_key)
+    RemoteWork::CapabilityInventorySignature.verify!(manifest, release_public_key_path.read)
+    manifest
+  end
+
+  def function_catalog
+    @function_catalog ||= TwoHeadWu::FunctionCatalog.new(@root)
+  end
+
+  def build_release(output, channel)
+    version = RemoteWork::VERSION
+    stage = @root.join("var/remote-work/build/stage-#{Process.pid}-#{SecureRandom.hex(3)}")
+    FileUtils.mkdir_p(stage.join("bin").to_s, mode: 0o700)
+    FileUtils.mkdir_p(stage.join("adapters").to_s, mode: 0o700)
+    FileUtils.mkdir_p(stage.join("lib").to_s, mode: 0o700)
+    FileUtils.mkdir_p(stage.join("skills").to_s, mode: 0o700)
+    FileUtils.mkdir_p(stage.join("share").to_s, mode: 0o700)
+    copy_file(@root.join("capabilities/remote-work/installer/air-wu"), stage.join("bin/wu"), 0o755)
+    copy_file(@root.join("capabilities/remote-work/installer/wu-codex-status"), stage.join("bin/wu-codex-status"), 0o755)
+    copy_file(@root.join("capabilities/remote-work/installer/two-head-wu-mcp"), stage.join("bin/two-head-wu-mcp"), 0o755)
+    copy_file(@root.join("capabilities/remote-work/adapters/remote-work"), stage.join("adapters/remote-work"), 0o755)
+    copy_file(@root.join("capabilities/remote-work/lib/remote_work.rb"), stage.join("lib/remote_work.rb"), 0o644)
+    FileUtils.cp_r(@root.join("capabilities/remote-work/skills/remote-work").to_s, stage.join("skills/remote-work").to_s)
+    copy_file(release_public_key_path, stage.join("share/release-signing-public.pub"), 0o644)
+    stage.join("VERSION").write(version + "\n", encoding: "UTF-8")
+    test_variant = ENV["WU_REMOTE_TEST_BUILD_VARIANT"]
+    if test_variant && !test_variant.empty?
+      raise RemoteWork::Error, "invalid test build variant" unless test_variant.match?(/\A[a-z0-9-]{1,64}\z/)
+      stage.join("BUILD_VARIANT").write(test_variant + "\n", encoding: "UTF-8")
+    end
+    release_id = "v#{version}-#{content_digest(stage)[0, 12]}"
+    stage.join("RELEASE_ID").write(release_id + "\n", encoding: "UTF-8")
+    archives = output.join("archives")
+    manifests = output.join("manifests")
+    release_manifests = manifests.join("releases")
+    FileUtils.mkdir_p(archives.to_s, mode: 0o700)
+    FileUtils.mkdir_p(manifests.to_s, mode: 0o700)
+    FileUtils.mkdir_p(release_manifests.to_s, mode: 0o700)
+    archive = archives.join("#{release_id}.tar.gz")
+    metadata = RemoteWork::Archive.pack_directory(stage, archive) unless archive.file?
+    metadata ||= { "sha256" => Digest::SHA256.file(archive.to_s).hexdigest, "size" => archive.size }
+    public_key = OpenSSL::PKey::RSA.new(release_public_key_path.read)
+    manifest = {
+      "schema_version" => 2,
+      "release_id" => release_id,
+      "version" => version,
+      "channel" => channel,
+      "sha256" => metadata.fetch("sha256"),
+      "size" => metadata.fetch("size"),
+      "generated_at" => Time.now.utc.iso8601,
+      "public_key_sha256" => Digest::SHA256.hexdigest(public_key.public_key.to_der)
+    }
+    manifest["signature_base64"] = RemoteWork::ReleaseSignature.sign(manifest, release_private_key)
+    RemoteWork::ReleaseSignature.verify!(manifest, release_public_key_path.read)
+    RemoteWork::Atomic.json(manifests.join("#{channel}.json"), manifest, mode: 0o640)
+    RemoteWork::Atomic.json(release_manifests.join("#{release_id}.json"), manifest, mode: 0o640)
+    if channel == "stable"
+      FileUtils.cp(archive.to_s, output.join("current.tar.gz").to_s)
+      File.chmod(0o640, output.join("current.tar.gz").to_s)
+      RemoteWork::Atomic.json(output.join("current.json"), manifest, mode: 0o640)
+    end
+    manifest
+  ensure
+    FileUtils.rm_rf(stage.to_s) if defined?(stage) && stage
+  end
+
+  def render_installer
+    ensure_no_arguments!
+    token = ENV.fetch(ENROLLMENT_ENV, "")
+    raise RemoteWork::Error, "#{ENROLLMENT_ENV} is not installed" if token.empty?
+    raise RemoteWork::Error, "enrollment token shape is invalid" unless token.match?(/\A[A-Za-z0-9_-]{32,256}\z/)
+    template = @root.join("capabilities/remote-work/installer/install-air.command.in").read(encoding: "UTF-8")
+    endpoint = ENV.fetch("WU_REMOTE_INSTALLER_ENDPOINT_OVERRIDE", owner_policy.dig("transport", "public_endpoint"))
+    if endpoint.start_with?("http://")
+      uri = URI(endpoint)
+      allowed = ENV["WU_REMOTE_ALLOW_HTTP"] == "1" && %w[127.0.0.1 localhost ::1].include?(uri.host)
+      raise RemoteWork::Error, "HTTP installer endpoint is test-only and must be loopback" unless allowed
+    else
+      raise RemoteWork::Error, "installer endpoint must use HTTPS" unless endpoint.start_with?("https://")
+    end
+    public_key_base64 = Base64.strict_encode64(release_public_key_path.binread)
+    rendered = template.gsub("@@ENDPOINT@@", endpoint)
+                       .gsub("@@ENROLLMENT_TOKEN@@", token)
+                       .gsub("@@RELEASE_PUBLIC_KEY_BASE64@@", public_key_base64)
+    output = @root.join("var/remote-work/installer/安装两头乌.command")
+    RemoteWork::Atomic.write(output, rendered, mode: 0o700)
+    puts output
+    0
+  end
+
+  def safe_source(relative)
+    candidate = @root.join(relative).expand_path
+    raise RemoteWork::Error, "portable module source is unavailable: #{relative}" unless candidate.directory?
+    candidate.realpath
+  end
+
+  def build_output_root
+    override = ENV["WU_REMOTE_TEST_BUILD_ROOT"]
+    return @root.join("var/remote-work/build/current") if override.to_s.empty?
+
+    raise RemoteWork::Error, "test build root requires an explicit test signing key" if ENV["WU_REMOTE_RELEASE_SIGNING_KEY_FILE"].to_s.empty?
+    path = Pathname.new(override).expand_path.cleanpath
+    allowed = path.to_s.start_with?("/tmp/") || path.to_s.start_with?("/private/tmp/")
+    raise RemoteWork::Error, "test build root must stay under the system temporary directory" unless allowed
+    path
+  end
+
+  def release_public_key_path
+    override = ENV["WU_REMOTE_RELEASE_PUBLIC_KEY_FILE"]
+    path = Pathname.new(override.to_s.empty? ? @root.join("capabilities/remote-work/keys/release-signing-public.pub") : override).expand_path
+    raise RemoteWork::Error, "release signing public key is unavailable" unless path.file?
+    path
+  end
+
+  def release_private_key
+    override = ENV["WU_REMOTE_RELEASE_SIGNING_KEY_FILE"]
+    if override && !override.empty?
+      path = Pathname.new(override).expand_path
+      raise RemoteWork::Error, "test release signing key is unavailable" unless path.file?
+      return path.read
+    end
+
+    stdout, _stderr, status = Open3.capture3(
+      "security", "find-generic-password", "-a", SIGNING_KEY_ACCOUNT, "-s", SIGNING_KEY_SERVICE, "-w"
+    )
+    raise RemoteWork::Error, "release signing key is not installed in macOS Keychain" unless status.success?
+    value = stdout.strip
+    value.start_with?("-----BEGIN") ? value : Base64.strict_decode64(value)
+  rescue ArgumentError
+    raise RemoteWork::Error, "release signing key in macOS Keychain is invalid"
+  rescue Errno::ENOENT
+    raise RemoteWork::Error, "macOS Keychain is unavailable"
+  end
+
+  def content_digest(source)
+    digest = Digest::SHA256.new
+    root = source.realpath
+    paths = []
+    Find.find(root.to_s) do |raw|
+      path = Pathname.new(raw)
+      next if path == root || path.symlink?
+      relative = path.relative_path_from(root).to_s
+      basename = path.basename.to_s
+      if RemoteWork::Archive::DEFAULT_EXCLUDED_NAMES.include?(basename) ||
+         RemoteWork::Archive::DEFAULT_EXCLUDED_SUFFIXES.any? { |suffix| basename.end_with?(suffix) } ||
+         RemoteWork::Archive.credential_shaped?(basename)
+        Find.prune if path.directory?
+        next
+      end
+      paths << path
+    end
+    paths.sort_by { |path| path.relative_path_from(root).to_s }.each do |path|
+      relative = path.relative_path_from(root).to_s
+      stat = path.stat
+      digest.update(relative)
+      digest.update(format("%o", stat.mode & 0o755))
+      if stat.file?
+        File.open(path.to_s, "rb") do |file|
+          while (chunk = file.read(1_048_576))
+            digest.update(chunk)
+          end
+        end
+      end
+    end
+    digest.hexdigest
+  end
+
+  def copy_file(source, destination, mode)
+    FileUtils.cp(source.to_s, destination.to_s)
+    File.chmod(mode, destination.to_s)
+  end
+
+  def owner_policy
+    @owner_policy ||= YAML.safe_load(
+      @root.join("capabilities/remote-work/policies/owner-only.yaml").read(encoding: "UTF-8"),
+      permitted_classes: [], aliases: false
+    )
+  end
+
+  def air_policy
+    @air_policy ||= YAML.safe_load(
+      @root.join("capabilities/remote-work/policies/member-capabilities.yaml").read(encoding: "UTF-8"),
+      permitted_classes: [], aliases: false
+    )
+  end
+
+  def ensure_no_arguments!
+    raise RemoteWork::Error, "unexpected arguments" unless @arguments.empty?
+  end
+end
+
+exit RemoteWorkAdmin.new(ARGV).run

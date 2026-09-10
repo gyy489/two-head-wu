@@ -1,0 +1,93 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://two-head-wu.local/contracts/change-capsule.schema.yaml"
+title: "Two-Headed-Wu Change Capsule"
+type: object
+additionalProperties: false
+required:
+  - schema_version
+  - id
+  - status
+  - goal
+  - spec
+  - plan
+  - tasks
+  - affected_modules
+  - writable_paths
+  - forbidden_paths
+  - invariants
+  - dependencies
+  - implementation_order
+  - acceptance_commands
+  - documentation_impact
+  - migration
+  - rollback
+  - delivery
+  - review
+properties:
+  schema_version: { const: 1 }
+  id: { type: string, pattern: "^[0-9]{3}-[a-z0-9]+(?:-[a-z0-9]+)*$" }
+  status: { enum: [planned, in-progress, review, completed, cancelled] }
+  goal: { type: string, minLength: 1 }
+  spec: { type: string }
+  plan: { type: string }
+  tasks: { type: string }
+  affected_modules: { type: array, minItems: 1, uniqueItems: true, items: { type: string } }
+  writable_paths: { type: array, minItems: 1, uniqueItems: true, items: { type: string } }
+  forbidden_paths: { type: array, uniqueItems: true, items: { type: string } }
+  invariants: { type: array, minItems: 1, items: { type: string } }
+  dependencies:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required: [from, to, purpose]
+      properties:
+        from: { type: string }
+        to: { type: string }
+        purpose: { type: string }
+  implementation_order: { type: array, minItems: 1, uniqueItems: true, items: { type: string } }
+  acceptance_commands: { type: array, minItems: 1, items: { type: string } }
+  documentation_impact:
+    type: object
+    additionalProperties: false
+    required: [required, modules, update_command]
+    properties:
+      required: { type: boolean }
+      modules: { type: array, items: { type: string } }
+      update_command: { type: string }
+  migration:
+    type: object
+    required: [required, plan]
+    properties:
+      required: { type: boolean }
+      plan: { type: string }
+  rollback:
+    type: object
+    required: [strategy]
+    properties:
+      strategy: { type: string }
+      preserves: { type: array, items: { type: string } }
+  delivery:
+    type: object
+    additionalProperties: false
+    required: [max_files_without_spec, max_effective_lines_per_commit, commits]
+    properties:
+      max_files_without_spec: { const: 10 }
+      max_effective_lines_per_commit: { const: 800 }
+      commits:
+        type: array
+        minItems: 1
+        items:
+          type: object
+          required: [id, scope]
+          properties:
+            id: { type: string }
+            scope: { type: string }
+  review:
+    type: object
+    additionalProperties: false
+    required: [mode, shared_inputs, original_chat_shared]
+    properties:
+      mode: { const: fresh-context }
+      shared_inputs: { type: array, minItems: 1, uniqueItems: true, items: { type: string } }
+      original_chat_shared: { const: false }

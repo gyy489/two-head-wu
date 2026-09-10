@@ -1,0 +1,58 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://two-head-wu.local/contracts/mcp-registry.schema.yaml"
+title: "Two-Headed-Wu MCP Discovery Registry"
+type: object
+additionalProperties: false
+required: [version, updated_at, project_root, policy, servers]
+properties:
+  version:
+    const: 2
+  updated_at:
+    type: string
+  project_root:
+    type: string
+  policy:
+    type: object
+    required:
+      - default_access
+      - credentials_in_registry
+      - client_configuration_is_independent
+      - agent_access_requires_allowlist
+      - destructive_or_external_write_tools_require_approval
+      - capability_owns_repository_implementation
+  servers:
+    type: array
+    items:
+      type: object
+      required:
+        - id
+        - name
+        - provider
+        - status
+        - transport
+        - authentication
+        - clients
+        - risk_level
+        - approval_profile
+        - allowed_agents
+      properties:
+        id: { type: string, pattern: "^[a-z0-9]+(?:[-_][a-z0-9]+)*$" }
+        name: { type: string }
+        provider:
+          type: object
+          additionalProperties: false
+          required: [kind, id]
+          properties:
+            kind: { enum: [capability, runtime-native, plugin, external-service] }
+            id: { type: string }
+        status: { type: string }
+        transport: { type: string }
+        command: {}
+        endpoint: {}
+        authentication: { type: object }
+        clients: { type: object }
+        client_names: { type: object }
+        risk_level: { enum: [low, medium, high, critical] }
+        approval_profile: { type: string }
+        allowed_agents: { type: array, items: { type: string } }
+        notes: { type: string }

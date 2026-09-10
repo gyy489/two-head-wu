@@ -1,0 +1,42 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: Two-Headed-Wu worker runtime compatibility catalog
+type: object
+required: [schema_version, protocol_min, protocol_max, runtimes]
+properties:
+  schema_version:
+    const: 1
+  protocol_min:
+    type: integer
+    minimum: 1
+  protocol_max:
+    type: integer
+    minimum: 1
+  runtimes:
+    type: array
+    maxItems: 64
+    items:
+      type: object
+      required: [runtime_kind, runtime_version, native_schema_hash, adapter_version, health, supported_features]
+      properties:
+        runtime_kind:
+          pattern: "^[a-z][a-z0-9-]{0,63}$"
+        runtime_version:
+          type: string
+          maxLength: 128
+        native_schema_hash:
+          pattern: "^[a-f0-9]{64}$"
+        adapter_version:
+          type: string
+          maxLength: 64
+        health:
+          enum: [compatible, testing, incompatible, unavailable]
+        supported_features:
+          type: array
+          maxItems: 64
+          items:
+            pattern: "^[a-z][a-z0-9-]{0,63}$"
+        diagnostic:
+          type: string
+          maxLength: 500
+      additionalProperties: false
+additionalProperties: false

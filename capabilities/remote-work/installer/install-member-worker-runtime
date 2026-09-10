@@ -1,0 +1,922 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "digest"
+require "etc"
+require "fileutils"
+require "find"
+require "json"
+require "open3"
+require "optparse"
+require "pathname"
+require "securerandom"
+require "time"
+
+require_relative "../lib/member_runtime_release"
+
+class MemberWorkerInstaller
+  DEFAULT_USER = "_twoheadwumember"
+  SYSTEM_ID_RANGE = (350..394).freeze
+  SYSTEM_ROOT = Pathname.new("/Library/TwoHeadedWu/member-worker")
+  RUNTIME_ROOT = SYSTEM_ROOT.join("runtime")
+  PLIST = Pathname.new("/Library/LaunchDaemons/com.twoheadwu.member-worker.plist")
+  CANARY = Pathname.new("/Library/TwoHeadedWu/private/member-worker-owner-canary")
+  RESEARCH_SNAPSHOT_ROOT = SYSTEM_ROOT.join("research-snapshots")
+  PROTECTED_OWNER_ROOT = Pathname.new("/Library/TwoHeadedWu/private/owner-adapters")
+  PROTECTED_NOTEBOOK_HELPER = PROTECTED_OWNER_ROOT.join("owner-notebook-adapter")
+  PROTECTED_NOTEBOOK_PROVIDER = PROTECTED_OWNER_ROOT.join("personal-memory-adapter")
+  PROTECTED_NOTEBOOK_CONFIG = PROTECTED_OWNER_ROOT.join("notebook.json")
+  PROTECTED_NOTEBOOK_SUDOERS = Pathname.new("/etc/sudoers.d/two-head-wu-air-notebook")
+  SERVICE_LABEL = "com.twoheadwu.member-worker"
+  DEFAULT_OPENCLAW = Pathname.new("/usr/local/bin/openclaw")
+  DEFAULT_MEMORY_WORKSPACE = Pathname.new("/var/lib/two-head-wu/personal-memory/workspace")
+  OWNER_WORKSPACE_DENY_PERMISSIONS = %w[
+    list add_file search delete add_subdirectory delete_child
+    readattr writeattr readextattr writeextattr readsecurity writesecurity chown
+    file_inherit directory_inherit
+  ].freeze
+  MEMBER_ENDPOINT = "https://relay.example/two-head-wu/v1"
+  MEMBER_ENROLLMENT_ENV = "TWO_HEAD_WU_MEMBER_WORKER_ENROLLMENT"
+  RESEARCH_SANITIZE_SQL = <<~SQL.freeze
+    PRAGMA foreign_keys=OFF;
+    BEGIN IMMEDIATE;
+    DELETE FROM collection_items;
+    DELETE FROM collections;
+    DELETE FROM translations;
+    DELETE FROM metadata_attempts;
+    DELETE FROM sources;
+    DELETE FROM rejections;
+    UPDATE artifacts SET relative_path='member-index/' || id;
+    COMMIT;
+    PRAGMA journal_mode=DELETE;
+    VACUUM;
+    PRAGMA integrity_check;
+  SQL
+
+  def initialize(arguments)
+    @arguments = arguments.dup
+    @source_root = Pathname.new(__dir__).join("../../..").expand_path.cleanpath.realpath
+  end
+
+  def run
+    command = @arguments.shift || "plan"
+    options = parse_options
+    case command
+    when "plan" then plan(options)
+    when "install" then install(options)
+    when "verify" then verify
+    when "register-air-identity" then register_air_identity(options)
+    when "login-air-identity" then login_air_identity(options)
+    when "enroll" then enroll(options)
+    when "enable" then enable(options)
+    else raise RemoteWork::Error, "unknown member runtime installer command: #{command}"
+    end
+  rescue RemoteWork::Error, JSON::ParserError, KeyError, SystemCallError => error
+    warn "Error: #{error.message}"
+    2
+  end
+
+  private
+
+  def parse_options
+    options = {
+      runtime_user: DEFAULT_USER,
+      runtime_uid: nil,
+      owner_uid: Integer(ENV.fetch("SUDO_UID", "501")),
+      device: "mac-mini-air-worker",
+      approve: false
+    }
+    parser = OptionParser.new do |item|
+      item.banner = "Usage: install-member-worker-runtime plan|install|verify|register-air-identity|login-air-identity|enroll|enable [OPTIONS]"
+      item.on("--runtime-user USER") { |value| options[:runtime_user] = value }
+      item.on("--runtime-uid UID", Integer) { |value| options[:runtime_uid] = value }
+      item.on("--owner-uid UID", Integer) { |value| options[:owner_uid] = value }
+      item.on("--codex-bin PATH") { |value| options[:codex_bin] = value }
+      item.on("--research-root PATH") { |value| options[:research_root] = value }
+      item.on("--openclaw-bin PATH") { |value| options[:openclaw_bin] = value }
+      item.on("--memory-workspace PATH") { |value| options[:memory_workspace] = value }
+      item.on("--identity ALIAS") { |value| options[:identity] = value }
+      item.on("--token-file PATH") { |value| options[:token_file] = value }
+      item.on("--device NAME") { |value| options[:device] = value }
+      item.on("--approve") { options[:approve] = true }
+    end
+    parser.parse!(@arguments)
+    raise RemoteWork::Error, "unknown installer arguments" unless @arguments.empty?
+    options
+  end
+
+  def plan(options)
+    user, uid = validated_identity(options)
+    codex = resolve_codex(options[:codex_bin], owner_uid: options.fetch(:owner_uid))
+    research = resolve_research_root(options[:research_root])
+    puts JSON.pretty_generate({
+      "schema_version" => 1,
+      "result" => "plan",
+      "runtime_identity" => { "user" => user, "uid" => uid },
+      "runtime_root" => RUNTIME_ROOT.to_s,
+      "release_root" => SYSTEM_ROOT.join("releases").to_s,
+      "codex_source_ready" => !codex.nil?,
+      "research_source_ready" => research.directory?,
+      "research_access" => "sanitized-root-owned-index-snapshot",
+      "launchd" => PLIST.to_s,
+      "activation" => "disabled-until-enrolled-and-air-health-passes",
+      "requires_root" => true
+    })
+    0
+  end
+
+  def install(options)
+    require_root_and_approval!(options)
+    disable_service!
+    user, uid = validated_identity(options)
+    owner_uid = Integer(options.fetch(:owner_uid))
+    codex_source = resolve_codex(options[:codex_bin], owner_uid: owner_uid)
+    research_root = resolve_research_root(options[:research_root])
+    validate_research_root!(research_root)
+    ensure_system_identity(user, uid)
+    ensure_system_directories(user)
+    notebook = install_owner_notebook_adapter(user, uid, owner_uid, options)
+
+    release = RemoteWork::MemberRuntimeRelease.new(source_root: @source_root).build(output_root: SYSTEM_ROOT)
+    FileUtils.chown_R("root", "wheel", release.to_s)
+    make_release_read_only(release)
+    codex = install_codex(codex_source)
+    research_snapshot = install_research_snapshot(research_root)
+    initialize_identity_root(release, user, uid, owner_uid)
+    install_plist(release, codex, research_snapshot, user, uid, owner_uid)
+    write_install_manifest(release, codex, research_snapshot, user, uid, owner_uid, notebook)
+    verify
+    puts "member worker isolation skeleton installed; service remains disabled"
+    0
+  end
+
+  def verify
+    raise RemoteWork::Error, "member runtime verification requires root" unless Process.euid.zero?
+    manifest = JSON.parse(SYSTEM_ROOT.join("install.json").read(encoding: "UTF-8"))
+    user = manifest.fetch("runtime_user")
+    uid = Integer(manifest.fetch("runtime_uid"))
+    release = Pathname.new(manifest.fetch("release_root")).realpath
+    codex = Pathname.new(manifest.fetch("codex_bin")).realpath
+    research = Pathname.new(manifest.fetch("research_root")).realpath
+    raise RemoteWork::Error, "member runtime identity drift" unless Etc.getpwnam(user).uid == uid
+    RemoteWork::MemberRuntimeRelease.new(source_root: @source_root).verify!(release)
+    immutable_root!(release, uid, "release")
+    immutable_file!(codex, uid, "Codex")
+    verify_research_snapshot!(research, uid, manifest.fetch("runtime_gid"))
+    private_runtime!(RUNTIME_ROOT, uid)
+    %w[worker-home tmp logs agent-identity agent-identity/codex-homes].each do |relative|
+      private_runtime!(RUNTIME_ROOT.join(relative), uid)
+    end
+    raise RemoteWork::Error, "member LaunchDaemon is missing" unless PLIST.file? && PLIST.stat.uid.zero? && (PLIST.stat.mode & 0o022).zero?
+    enabled = manifest.fetch("enabled") == true
+    if enabled
+      raise RemoteWork::Error, "enabled member LaunchDaemon remains persistently disabled" if service_disabled?
+      raise RemoteWork::Error, "enabled member LaunchDaemon is not loaded" unless service_loaded?
+    else
+      raise RemoteWork::Error, "member LaunchDaemon is not persistently disabled" unless service_disabled?
+      raise RemoteWork::Error, "disabled member LaunchDaemon is still loaded" if service_loaded?
+    end
+    verify_owner_notebook_adapter!(manifest, user, uid, Integer(manifest.fetch("owner_uid")))
+    probe_as(uid, manifest.fetch("runtime_gid")) do
+      File.open(CANARY.to_s, "rb") { |file| file.read(1) }
+    end and raise RemoteWork::Error, "member runtime can read owner canary"
+    puts "member worker isolation skeleton: verified"
+    puts "service: #{enabled ? 'loaded' : 'disabled'}"
+    0
+  rescue ArgumentError, Errno::ENOENT
+    raise RemoteWork::Error, "member runtime install manifest is invalid"
+  end
+
+  def enable(options)
+    require_root_and_approval!(options)
+    verify
+    manifest = JSON.parse(SYSTEM_ROOT.join("install.json").read(encoding: "UTF-8"))
+    user = manifest.fetch("runtime_user")
+    uid = Integer(manifest.fetch("runtime_uid"))
+    gid = Integer(manifest.fetch("runtime_gid"))
+    release = Pathname.new(manifest.fetch("release_root"))
+    worker_home = RUNTIME_ROOT.join("worker-home")
+    raise RemoteWork::Error, "member worker is not enrolled" unless worker_home.join("config.json").file? && worker_home.join("device.secret").file?
+    environment = launch_environment(manifest)
+    status = spawn_as(uid, gid, environment, "/usr/bin/ruby", release.join("capabilities/remote-work/worker/ltw-worker").to_s, "air-health")
+    raise RemoteWork::Error, "air-health did not pass; service remains disabled" unless status.success?
+    begin
+      unless system("/bin/launchctl", "enable", "system/#{SERVICE_LABEL}", out: File::NULL, err: File::NULL) &&
+             system("/bin/launchctl", "bootstrap", "system", PLIST.to_s, out: File::NULL, err: File::NULL)
+        raise RemoteWork::Error, "cannot enable member LaunchDaemon"
+      end
+      raise RemoteWork::Error, "member LaunchDaemon did not start" unless wait_for_service_state(loaded: true)
+      set_manifest_enabled!(true)
+      verify
+    rescue RemoteWork::Error
+      set_manifest_enabled!(false)
+      disable_service!
+      raise
+    end
+    puts "member worker LaunchDaemon: enabled"
+    0
+  end
+
+  def enroll(options)
+    require_root_and_approval!(options)
+    verify
+    manifest = JSON.parse(SYSTEM_ROOT.join("install.json").read(encoding: "UTF-8"))
+    uid = Integer(manifest.fetch("runtime_uid"))
+    gid = Integer(manifest.fetch("runtime_gid"))
+    owner_uid = Integer(manifest.fetch("owner_uid"))
+    release = Pathname.new(manifest.fetch("release_root")).realpath
+    client = release.join("capabilities/remote-work/adapters/remote-work")
+    raise RemoteWork::Error, "installed member release cannot enroll; rerun install with the current source" unless client.file? && client.executable?
+    worker_home = RUNTIME_ROOT.join("worker-home")
+    if worker_home.join("config.json").exist? || worker_home.join("device.secret").exist?
+      raise RemoteWork::Error, "member worker is already enrolled; no new enrollment token was consumed"
+    end
+    device = options.fetch(:device).to_s
+    raise RemoteWork::Error, "member worker device name is invalid" unless device.match?(/\A[a-z][a-z0-9-]{0,62}\z/)
+    token_path, token = validated_enrollment_token(options[:token_file], owner_uid)
+    environment = {
+      "HOME" => RUNTIME_ROOT.to_s,
+      "LANG" => "en_US.UTF-8",
+      "WU_REMOTE_HOME" => worker_home.to_s,
+      "WU_REMOTE_SECRET_STORE" => "file",
+      MEMBER_ENROLLMENT_ENV => token
+    }
+    status = spawn_as(
+      uid, gid, environment, "/usr/bin/ruby", client.to_s,
+      "enroll", "--endpoint", MEMBER_ENDPOINT, "--device", device,
+      "--token-env", MEMBER_ENROLLMENT_ENV, "--secret-store", "file"
+    )
+    raise RemoteWork::Error, "member worker enrollment failed; token file was retained for diagnosis" unless status.success?
+    FileUtils.rm_f(token_path.to_s)
+    token.replace("x" * token.bytesize)
+    health = spawn_as(
+      uid, gid, launch_environment(manifest), "/usr/bin/ruby",
+      release.join("capabilities/remote-work/worker/ltw-worker").to_s, "air-health"
+    )
+    raise RemoteWork::Error, "Air worker enrollment role or isolation health failed; service remains disabled" unless health.success?
+    puts "member worker enrollment: verified"
+    puts "service: disabled"
+    0
+  end
+
+  def register_air_identity(options)
+    require_root_and_approval!(options)
+    verify
+    manifest = install_manifest
+    identity = validated_air_identity(options)
+    adapter = installed_identity_adapter(manifest)
+    environment = air_identity_environment(manifest)
+    uid = Integer(manifest.fetch("runtime_uid"))
+    gid = Integer(manifest.fetch("runtime_gid"))
+    if command_succeeds_as(uid, gid, environment, "/usr/bin/ruby", adapter.to_s, "member-home", "--alias", identity, "--json")
+      puts "Air Codex identity already registered: #{identity}"
+      return 0
+    end
+    status = spawn_as(uid, gid, environment, "/usr/bin/ruby", adapter.to_s, "add-member", "--alias", identity, "--json")
+    raise RemoteWork::Error, "cannot register Air Codex identity: #{identity}" unless status.success?
+    puts "Air Codex identity registered: #{identity}"
+    puts "next: login-air-identity --identity #{identity}"
+    0
+  end
+
+  def login_air_identity(options)
+    require_root_and_approval!(options)
+    verify
+    manifest = install_manifest
+    identity = validated_air_identity(options)
+    adapter = installed_identity_adapter(manifest)
+    environment = air_identity_environment(manifest)
+    uid = Integer(manifest.fetch("runtime_uid"))
+    gid = Integer(manifest.fetch("runtime_gid"))
+    registered = command_succeeds_as(uid, gid, environment, "/usr/bin/ruby", adapter.to_s, "member-home", "--alias", identity, "--json")
+    raise RemoteWork::Error, "Air Codex identity is not registered: #{identity}" unless registered
+    status = spawn_as(uid, gid, environment, "/usr/bin/ruby", adapter.to_s, "login", "--alias", identity)
+    raise RemoteWork::Error, "Air Codex identity login did not complete: #{identity}" unless status.success?
+    puts "Air Codex identity login completed: #{identity}"
+    0
+  end
+
+  def validated_identity(options)
+    user = options.fetch(:runtime_user).to_s
+    raise RemoteWork::Error, "member runtime user is invalid" unless user.match?(/\A_[a-z][a-z0-9_-]{0,62}\z/)
+    existing = Etc.getpwnam(user) rescue nil
+    uid = if options[:runtime_uid]
+            Integer(options.fetch(:runtime_uid))
+          elsif existing
+            existing.uid
+          else
+            available_system_id
+          end
+    raise RemoteWork::Error, "member runtime UID must be a dedicated system UID" unless SYSTEM_ID_RANGE.cover?(uid)
+    owner_uid = Integer(options.fetch(:owner_uid))
+    raise RemoteWork::Error, "owner UID is invalid" unless owner_uid.positive?
+    raise RemoteWork::Error, "member runtime UID cannot equal the owner" if uid == owner_uid
+    [user, uid]
+  end
+
+  def available_system_id
+    SYSTEM_ID_RANGE.to_a.reverse.find do |candidate|
+      user = Etc.getpwuid(candidate) rescue nil
+      group = Etc.getgrgid(candidate) rescue nil
+      user.nil? && group.nil?
+    end || raise(RemoteWork::Error, "no free member runtime system UID/GID is available")
+  end
+
+  def require_root_and_approval!(options)
+    raise RemoteWork::Error, "pass --approve for this system mutation" unless options[:approve]
+    raise RemoteWork::Error, "run this command as root" unless Process.euid.zero?
+  end
+
+  def resolve_codex(value, owner_uid:)
+    selected = value.to_s
+    if selected.empty?
+      owner_home = Pathname.new(Etc.getpwuid(Integer(owner_uid)).dir)
+      candidates = Dir.glob(
+        owner_home.join(".vscode/extensions/openai.chatgpt-*-darwin-arm64/bin/macos-aarch64/codex").to_s
+      ).select { |candidate| File.file?(candidate) && File.executable?(candidate) }
+      selected = candidates.max_by { |candidate| File.mtime(candidate) }.to_s
+    end
+    raise RemoteWork::Error, "native Codex executable was not found" if selected.empty?
+    path = Pathname.new(selected).expand_path.cleanpath.realpath
+    raise RemoteWork::Error, "Codex executable is unavailable" unless path.file? && path.executable? && !path.symlink?
+    path
+  rescue Errno::ENOENT
+    raise RemoteWork::Error, "Codex executable is unavailable"
+  end
+
+  def validated_enrollment_token(value, owner_uid)
+    raise RemoteWork::Error, "--token-file is required" if value.to_s.empty?
+    path = Pathname.new(value).expand_path.cleanpath
+    raise RemoteWork::Error, "member enrollment token path must be absolute" unless path.absolute?
+    stat = path.lstat
+    unless stat.file? && !stat.symlink? && stat.uid == Integer(owner_uid) && (stat.mode & 0o777) == 0o600
+      raise RemoteWork::Error, "member enrollment token file must be an owner-owned, non-symlink regular file with mode 0600"
+    end
+    raise RemoteWork::Error, "member enrollment token file is too large" unless stat.size.between?(32, 257)
+    token = path.read(encoding: "UTF-8").strip
+    unless token.match?(/\A[A-Za-z0-9_-]{32,256}\z/)
+      raise RemoteWork::Error, "member enrollment token file contains invalid material"
+    end
+    [path.realpath, token]
+  rescue Errno::ENOENT, Errno::EACCES
+    raise RemoteWork::Error, "member enrollment token file is unavailable"
+  end
+
+  def resolve_research_root(value)
+    return Pathname.new(value).expand_path.cleanpath.realpath unless value.to_s.empty?
+    binding = JSON.parse(@source_root.join("var/resource-bindings/private-data-service.json").read(encoding: "UTF-8"))
+    Pathname.new(binding.fetch("data_root")).expand_path.cleanpath.realpath
+  rescue Errno::ENOENT
+    raise RemoteWork::Error, "research library binding is unavailable"
+  end
+
+  def validate_research_root!(root)
+    raise RemoteWork::Error, "research library root is invalid" unless root.absolute? && root.directory? && !root.symlink?
+    %w[.research-library-root.json state/library.sqlite3].each do |relative|
+      path = root.join(relative)
+      raise RemoteWork::Error, "research library root is incomplete" unless path.file? && !path.symlink?
+    end
+  end
+
+  def ensure_system_identity(user, uid)
+    existing = Etc.getpwnam(user) rescue nil
+    if existing
+      raise RemoteWork::Error, "member runtime identity UID drift" unless existing.uid == uid && existing.gid == uid
+    else
+      occupied_user = Etc.getpwuid(uid) rescue nil
+      raise RemoteWork::Error, "member runtime UID is already occupied" if occupied_user
+    end
+    existing_group = Etc.getgrnam(user) rescue nil
+    occupied_group = Etc.getgrgid(uid) rescue nil
+    raise RemoteWork::Error, "member runtime group GID drift" if existing_group && existing_group.gid != uid
+    if occupied_group && occupied_group.name != user
+      raise RemoteWork::Error, "member runtime GID is already occupied"
+    end
+    commands = []
+    unless existing_group
+      commands.concat([
+        ["/usr/bin/dscl", ".", "-create", "/Groups/#{user}"],
+        ["/usr/bin/dscl", ".", "-create", "/Groups/#{user}", "PrimaryGroupID", uid.to_s]
+      ])
+    end
+    commands << ["/usr/bin/dscl", ".", "-create", "/Users/#{user}"] unless existing
+    commands.concat([
+      ["/usr/bin/dscl", ".", "-create", "/Users/#{user}", "UniqueID", uid.to_s],
+      ["/usr/bin/dscl", ".", "-create", "/Users/#{user}", "PrimaryGroupID", uid.to_s],
+      ["/usr/bin/dscl", ".", "-create", "/Users/#{user}", "UserShell", "/usr/bin/false"],
+      ["/usr/bin/dscl", ".", "-create", "/Users/#{user}", "NFSHomeDirectory", RUNTIME_ROOT.to_s],
+      ["/usr/bin/dscl", ".", "-create", "/Users/#{user}", "IsHidden", "1"]
+    ])
+    commands.each { |command| raise RemoteWork::Error, "cannot create member runtime identity" unless system(*command) }
+    installed = Etc.getpwnam(user)
+    unless installed.uid == uid && installed.gid == uid && installed.dir == RUNTIME_ROOT.to_s && installed.shell == "/usr/bin/false"
+      raise RemoteWork::Error, "member runtime identity attributes drift"
+    end
+  end
+
+  def ensure_system_directories(user)
+    FileUtils.mkdir_p(SYSTEM_ROOT.to_s, mode: 0o755)
+    FileUtils.chown("root", "wheel", SYSTEM_ROOT.to_s)
+    FileUtils.mkdir_p(CANARY.dirname.to_s, mode: 0o700)
+    FileUtils.chown("root", "wheel", CANARY.dirname.to_s)
+    unless CANARY.file?
+      File.open(CANARY.to_s, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+        file.write("CANARY_DO_NOT_EXPORT_MEMBER_RUNTIME\n")
+      end
+    end
+    FileUtils.chown("root", "wheel", CANARY.to_s)
+    File.chmod(0o600, CANARY.to_s)
+    [RUNTIME_ROOT, *%w[worker-home tmp logs agent-identity agent-identity/codex-homes].map { |item| RUNTIME_ROOT.join(item) }].each do |path|
+      FileUtils.mkdir_p(path.to_s, mode: 0o700)
+      FileUtils.chown(user, user, path.to_s)
+      File.chmod(0o700, path.to_s)
+    end
+  end
+
+  def make_release_read_only(release)
+    Find.find(release.to_s).to_a.sort.reverse_each do |raw|
+      path = Pathname.new(raw)
+      File.chmod(path.directory? ? 0o555 : (path.executable? ? 0o555 : 0o444), path.to_s) unless path.symlink?
+    end
+  end
+
+  def install_codex(source)
+    digest = Digest::SHA256.file(source.to_s).hexdigest
+    destination = SYSTEM_ROOT.join("bin", "codex-#{digest[0, 16]}")
+    FileUtils.mkdir_p(destination.dirname.to_s, mode: 0o755)
+    FileUtils.install(source.to_s, destination.to_s, mode: 0o555, owner: "root", group: "wheel")
+    raise RemoteWork::Error, "installed Codex digest mismatch" unless Digest::SHA256.file(destination.to_s).hexdigest == digest
+    destination
+  end
+
+  def install_owner_notebook_adapter(runtime_user, runtime_uid, owner_uid, options)
+    owner = Etc.getpwuid(owner_uid)
+    owner_home = Pathname.new(owner.dir).expand_path.cleanpath.realpath
+    openclaw = exact_executable(options[:openclaw_bin] || DEFAULT_OPENCLAW, "OpenClaw")
+    workspace = exact_directory(options[:memory_workspace] || DEFAULT_MEMORY_WORKSPACE, "personal-memory workspace")
+    prepare_owner_workspace_boundary!(workspace, runtime_user, runtime_uid, owner_uid)
+
+    helper_source = @source_root.join("capabilities/remote-work/worker/protected_owner_notebook.rb").realpath
+    provider_source = @source_root.join("capabilities/personal-memory/adapters/personal-memory").realpath
+    FileUtils.mkdir_p(PROTECTED_OWNER_ROOT.to_s, mode: 0o700)
+    FileUtils.chown("root", "wheel", PROTECTED_OWNER_ROOT.to_s)
+    File.chmod(0o700, PROTECTED_OWNER_ROOT.to_s)
+    FileUtils.install(helper_source.to_s, PROTECTED_NOTEBOOK_HELPER.to_s, mode: 0o555, owner: "root", group: "wheel")
+    FileUtils.install(provider_source.to_s, PROTECTED_NOTEBOOK_PROVIDER.to_s, mode: 0o555, owner: "root", group: "wheel")
+    config = {
+      "schema_version" => 1,
+      "owner_uid" => owner_uid,
+      "owner_gid" => owner.gid,
+      "owner_home" => owner_home.to_s,
+      "personal_memory_adapter" => PROTECTED_NOTEBOOK_PROVIDER.to_s,
+      "openclaw_bin" => openclaw.to_s,
+      "memory_workspace" => workspace.to_s
+    }
+    atomic_root_file(PROTECTED_NOTEBOOK_CONFIG, JSON.pretty_generate(config) + "\n", mode: 0o600)
+    sudoers = "#{runtime_user} ALL=(root) NOPASSWD: /usr/bin/ruby #{PROTECTED_NOTEBOOK_HELPER} \"\"\n"
+    temporary = PROTECTED_NOTEBOOK_SUDOERS.dirname.join(".two-head-wu-air-notebook.#{Process.pid}.tmp")
+    atomic_root_file(temporary, sudoers, mode: 0o440)
+    unless system("/usr/sbin/visudo", "-cf", temporary.to_s, out: File::NULL, err: File::NULL)
+      raise RemoteWork::Error, "protected notebook sudo rule is invalid"
+    end
+    File.rename(temporary.to_s, PROTECTED_NOTEBOOK_SUDOERS.to_s)
+    notebook = {
+      "helper" => PROTECTED_NOTEBOOK_HELPER.to_s,
+      "helper_sha256" => Digest::SHA256.file(PROTECTED_NOTEBOOK_HELPER.to_s).hexdigest,
+      "provider" => PROTECTED_NOTEBOOK_PROVIDER.to_s,
+      "provider_sha256" => Digest::SHA256.file(PROTECTED_NOTEBOOK_PROVIDER.to_s).hexdigest,
+      "config" => PROTECTED_NOTEBOOK_CONFIG.to_s,
+      "sudoers" => PROTECTED_NOTEBOOK_SUDOERS.to_s
+    }
+    verify_owner_notebook_adapter!({ "owner_notebook" => notebook }, runtime_user, runtime_uid, owner_uid)
+    notebook
+  ensure
+    FileUtils.rm_f(temporary.to_s) if defined?(temporary) && temporary&.exist?
+  end
+
+  def verify_owner_notebook_adapter!(manifest, runtime_user, runtime_uid, owner_uid)
+    notebook = manifest.fetch("owner_notebook")
+    helper = Pathname.new(notebook.fetch("helper")).realpath
+    provider = Pathname.new(notebook.fetch("provider")).realpath
+    config_path = Pathname.new(notebook.fetch("config"))
+    sudoers = Pathname.new(notebook.fetch("sudoers"))
+    [[helper, notebook.fetch("helper_sha256")], [provider, notebook.fetch("provider_sha256")]].each do |path, digest|
+      stat = path.stat
+      unless stat.file? && stat.uid.zero? && path.executable? && (stat.mode & 0o222).zero? &&
+             Digest::SHA256.file(path.to_s).hexdigest == digest
+        raise RemoteWork::Error, "protected notebook executable drift"
+      end
+    end
+    config_stat = config_path.lstat
+    unless config_stat.file? && !config_stat.symlink? && config_stat.uid.zero? && (config_stat.mode & 0o777) == 0o600
+      raise RemoteWork::Error, "protected notebook config drift"
+    end
+    config = JSON.parse(config_path.read(encoding: "UTF-8"))
+    unless config["owner_uid"] == owner_uid && config["owner_gid"] == Etc.getpwuid(owner_uid).gid &&
+           config["personal_memory_adapter"] == provider.to_s
+      raise RemoteWork::Error, "protected notebook owner binding drift"
+    end
+    workspace = exact_directory(config.fetch("memory_workspace"), "personal-memory workspace")
+    verify_owner_workspace_boundary!(workspace, runtime_user, runtime_uid, owner_uid)
+    sudo_stat = sudoers.lstat
+    expected = "#{runtime_user} ALL=(root) NOPASSWD: /usr/bin/ruby #{helper} \"\"\n"
+    unless sudo_stat.file? && !sudo_stat.symlink? && sudo_stat.uid.zero? && (sudo_stat.mode & 0o777) == 0o440 &&
+           sudoers.read(encoding: "UTF-8") == expected &&
+           system("/usr/sbin/visudo", "-cf", sudoers.to_s, out: File::NULL, err: File::NULL)
+      raise RemoteWork::Error, "protected notebook sudo rule drift"
+    end
+    if probe_as(runtime_uid, Etc.getpwnam(runtime_user).gid) { File.read(config_path.to_s, 1) }
+      raise RemoteWork::Error, "Air worker can read protected notebook config"
+    end
+    true
+  rescue JSON::ParserError, KeyError, Errno::ENOENT
+    raise RemoteWork::Error, "protected notebook installation is invalid"
+  end
+
+  def prepare_owner_workspace_boundary!(workspace, runtime_user, runtime_uid, owner_uid)
+    verify_owner_workspace_metadata!(workspace, owner_uid)
+    unless owner_workspace_deny_acl?(workspace, runtime_user)
+      entry = "user:#{runtime_user} deny #{OWNER_WORKSPACE_DENY_PERMISSIONS.join(',')}"
+      unless system("/bin/chmod", "+a#", "0", entry, workspace.to_s, out: File::NULL, err: File::NULL)
+        raise RemoteWork::Error, "cannot install personal-memory worker deny ACL"
+      end
+    end
+    verify_owner_workspace_boundary!(workspace, runtime_user, runtime_uid, owner_uid)
+  end
+
+  def verify_owner_workspace_boundary!(workspace, runtime_user, runtime_uid, owner_uid)
+    verify_owner_workspace_metadata!(workspace, owner_uid)
+    unless owner_workspace_deny_acl?(workspace, runtime_user)
+      raise RemoteWork::Error, "personal-memory worker deny ACL is missing"
+    end
+    runtime_gid = Etc.getpwnam(runtime_user).gid
+    if probe_as(runtime_uid, runtime_gid) { Dir.open(workspace.to_s) { |directory| directory.read }; true }
+      raise RemoteWork::Error, "Air worker can traverse the personal-memory workspace"
+    end
+    owner = Etc.getpwuid(owner_uid)
+    unless probe_as(owner_uid, owner.gid) { Dir.open(workspace.to_s) { |directory| directory.read }; true }
+      raise RemoteWork::Error, "personal-memory workspace is unavailable to the owner"
+    end
+    true
+  end
+
+  def verify_owner_workspace_metadata!(workspace, owner_uid)
+    stat = workspace.stat
+    unless (stat.mode & 0o077).zero?
+      raise RemoteWork::Error, "personal-memory workspace must remain private to the owner"
+    end
+    return true if stat.uid == owner_uid
+    return true if mount_ignores_ownership?(workspace)
+
+    raise RemoteWork::Error, "personal-memory workspace must remain owned by the owner"
+  end
+
+  def owner_workspace_deny_acl?(workspace, runtime_user, acl_output: nil)
+    if acl_output.nil?
+      output, _stderr, status = Open3.capture3("/bin/ls", "-lde", workspace.to_s)
+      return false unless status.success?
+      acl_output = output
+    end
+    prefix = /\A\s*\d+:\s+user:#{Regexp.escape(runtime_user)}\s+deny\s+(.+)\z/
+    acl_output.each_line.any? do |line|
+      match = line.strip.match(prefix)
+      next false unless match
+      permissions = match[1].split(",").map(&:strip)
+      (OWNER_WORKSPACE_DENY_PERMISSIONS - permissions).empty?
+    end
+  end
+
+  def mount_ignores_ownership?(workspace, mount_output: nil)
+    if mount_output.nil?
+      output, _stderr, status = Open3.capture3("/sbin/mount")
+      return false unless status.success?
+      mount_output = output
+    end
+    path = workspace.to_s
+    candidates = mount_output.each_line.map do |line|
+      match = line.strip.match(/\A.+ on (.+) \(([^)]*)\)\z/)
+      next unless match
+      mountpoint = match[1]
+      boundary = mountpoint.end_with?(File::SEPARATOR) ? mountpoint : "#{mountpoint}#{File::SEPARATOR}"
+      next unless path == mountpoint || path.start_with?(boundary)
+      [mountpoint.length, match[2].split(",").map(&:strip)]
+    end.compact
+    selected = candidates.max_by(&:first)
+    selected && selected[1].include?("noowners")
+  end
+
+  def exact_executable(value, label)
+    path = Pathname.new(value).expand_path.cleanpath.realpath
+    raise RemoteWork::Error, "#{label} executable is unavailable" unless path.absolute? && path.file? && path.executable?
+    path
+  rescue Errno::ENOENT
+    raise RemoteWork::Error, "#{label} executable is unavailable"
+  end
+
+  def exact_directory(value, label)
+    path = Pathname.new(value).expand_path.cleanpath.realpath
+    raise RemoteWork::Error, "#{label} is unavailable" unless path.absolute? && path.directory?
+    path
+  rescue Errno::ENOENT
+    raise RemoteWork::Error, "#{label} is unavailable"
+  end
+
+  def atomic_root_file(path, content, mode:)
+    FileUtils.mkdir_p(path.dirname.to_s, mode: 0o755)
+    temporary = path.dirname.join(".#{path.basename}.#{Process.pid}.#{SecureRandom.hex(4)}.tmp")
+    File.open(temporary.to_s, File::WRONLY | File::CREAT | File::EXCL, mode) { |file| file.write(content) }
+    FileUtils.chown("root", "wheel", temporary.to_s)
+    File.chmod(mode, temporary.to_s)
+    File.rename(temporary.to_s, path.to_s)
+  ensure
+    FileUtils.rm_f(temporary.to_s) if defined?(temporary) && temporary&.exist?
+  end
+
+  def install_research_snapshot(source)
+    FileUtils.mkdir_p(RESEARCH_SNAPSHOT_ROOT.to_s, mode: 0o755)
+    FileUtils.chown("root", "wheel", RESEARCH_SNAPSHOT_ROOT.to_s)
+    File.chmod(0o755, RESEARCH_SNAPSHOT_ROOT.to_s)
+    stage = Pathname.new(Dir.mktmpdir(".member-index-", RESEARCH_SNAPSHOT_ROOT.to_s))
+    FileUtils.mkdir_p(stage.join("state").to_s, mode: 0o700)
+    database = stage.join("state/library.sqlite3")
+    escaped = database.to_s.gsub("'", "''")
+    _stdout, _stderr, status = Open3.capture3(
+      "/usr/bin/sqlite3", source.join("state/library.sqlite3").to_s,
+      ".timeout 30000", ".backup '#{escaped}'"
+    )
+    raise RemoteWork::Error, "cannot snapshot the research index" unless status.success? && database.file?
+    stdout, _stderr, status = Open3.capture3("/usr/bin/sqlite3", database.to_s, RESEARCH_SANITIZE_SQL)
+    unless status.success? && stdout.lines.map(&:strip).include?("ok")
+      raise RemoteWork::Error, "cannot sanitize the research index snapshot"
+    end
+    digest = Digest::SHA256.file(database.to_s).hexdigest
+    marker_source = JSON.parse(source.join(".research-library-root.json").read(encoding: "UTF-8"))
+    marker = {
+      "schema_version" => marker_source.fetch("schema_version"),
+      "capability" => "research-library",
+      "member_index_snapshot" => true,
+      "database_sha256" => digest,
+      "generated_at" => Time.now.utc.iso8601
+    }
+    stage.join(".research-library-root.json").write(JSON.pretty_generate(marker) + "\n", encoding: "UTF-8")
+    destination = RESEARCH_SNAPSHOT_ROOT.join("member-index-#{digest[0, 16]}")
+    unless destination.directory?
+      FileUtils.chown_R("root", "wheel", stage.to_s)
+      make_snapshot_read_only(stage)
+      File.rename(stage.to_s, destination.to_s)
+    end
+    destination.realpath
+  rescue JSON::ParserError, KeyError
+    raise RemoteWork::Error, "research library marker is invalid"
+  ensure
+    FileUtils.rm_rf(stage.to_s) if defined?(stage) && stage&.exist?
+  end
+
+  def make_snapshot_read_only(root)
+    Find.find(root.to_s).to_a.sort.reverse_each do |raw|
+      path = Pathname.new(raw)
+      File.chmod(path.directory? ? 0o555 : 0o444, path.to_s) unless path.symlink?
+    end
+  end
+
+  def verify_research_snapshot!(research, uid, gid)
+    expected_prefix = RESEARCH_SNAPSHOT_ROOT.realpath.to_s + File::SEPARATOR
+    raise RemoteWork::Error, "member research root is not a managed snapshot" unless research.to_s.start_with?(expected_prefix)
+    immutable_root!(research, uid, "research snapshot")
+    marker = research.join(".research-library-root.json")
+    database = research.join("state/library.sqlite3")
+    [marker, database].each do |path|
+      stat = path.stat
+      unless stat.file? && stat.uid != uid && (stat.mode & 0o222).zero?
+        raise RemoteWork::Error, "member research snapshot is mutable"
+      end
+    end
+    payload = JSON.parse(marker.read(encoding: "UTF-8"))
+    raise RemoteWork::Error, "member research snapshot marker drift" unless payload["member_index_snapshot"] == true
+    digest = Digest::SHA256.file(database.to_s).hexdigest
+    raise RemoteWork::Error, "member research snapshot digest mismatch" unless payload["database_sha256"] == digest
+    probes = <<~SQL
+      SELECT count(*) FROM sources;
+      SELECT count(*) FROM metadata_attempts;
+      SELECT count(*) FROM artifacts WHERE relative_path NOT LIKE 'member-index/%';
+      PRAGMA integrity_check;
+    SQL
+    stdout, _stderr, status = Open3.capture3("/usr/bin/sqlite3", database.to_s, probes)
+    lines = stdout.lines.map(&:strip).reject(&:empty?)
+    raise RemoteWork::Error, "member research snapshot contains private storage data" unless status.success? && lines == %w[0 0 0 ok]
+    unless probe_as(uid, gid) { File.open(database.to_s, "rb") { |file| file.read(16) }.start_with?("SQLite format 3") }
+      raise RemoteWork::Error, "member runtime cannot read the research index snapshot"
+    end
+    if probe_as(uid, gid) { File.writable?(database.to_s) }
+      raise RemoteWork::Error, "member runtime can write the research index snapshot"
+    end
+  end
+
+  def initialize_identity_root(release, user, uid, owner_uid)
+    gid = Etc.getgrnam(user).gid
+    environment = {
+      "HOME" => RUNTIME_ROOT.to_s,
+      "TWO_HEAD_WU_IDENTITY_ROOT" => RUNTIME_ROOT.join("agent-identity").to_s,
+      "WU_MEMBER_RUNTIME_USER" => user,
+      "WU_MEMBER_RUNTIME_UID" => uid.to_s,
+      "WU_MEMBER_OWNER_UID" => owner_uid.to_s,
+      "WU_MEMBER_RUNTIME_ROOT" => RUNTIME_ROOT.to_s,
+      "LANG" => "en_US.UTF-8"
+    }
+    status = spawn_as(
+      uid, gid, environment, "/usr/bin/ruby",
+      release.join("capabilities/agent-identity/adapters/agent-identity").to_s, "init"
+    )
+    raise RemoteWork::Error, "cannot initialize member identity registry" unless status.success?
+  end
+
+  def install_plist(release, codex, research, user, uid, owner_uid)
+    renderer = @source_root.join("capabilities/remote-work/installer/render-member-worker-launchd")
+    command = [
+      "/usr/bin/ruby", renderer.to_s,
+      "--runtime-user", user, "--runtime-uid", uid.to_s, "--owner-uid", owner_uid.to_s,
+      "--runtime-root", RUNTIME_ROOT.to_s, "--release-root", release.to_s,
+      "--codex-bin", codex.to_s, "--research-root", research.to_s,
+      "--private-canary", CANARY.to_s
+    ]
+    stdout, _stderr, status = Open3.capture3(*command)
+    raise RemoteWork::Error, "cannot render member LaunchDaemon" unless status.success?
+    temporary = PLIST.dirname.join(".#{PLIST.basename}.#{Process.pid}.tmp")
+    File.open(temporary.to_s, File::WRONLY | File::CREAT | File::EXCL, 0o600) { |file| file.write(stdout) }
+    FileUtils.chown("root", "wheel", temporary.to_s)
+    File.rename(temporary.to_s, PLIST.to_s)
+  ensure
+    FileUtils.rm_f(temporary.to_s) if defined?(temporary) && temporary&.exist?
+  end
+
+  def write_install_manifest(release, codex, research, user, uid, owner_uid, notebook)
+    gid = Etc.getgrnam(user).gid
+    payload = {
+      "schema_version" => 1,
+      "installed_at" => Time.now.utc.iso8601,
+      "runtime_user" => user,
+      "runtime_uid" => uid,
+      "runtime_gid" => gid,
+      "owner_uid" => owner_uid,
+      "runtime_root" => RUNTIME_ROOT.to_s,
+      "release_root" => release.to_s,
+      "codex_bin" => codex.to_s,
+      "codex_sha256" => Digest::SHA256.file(codex.to_s).hexdigest,
+      "research_root" => research.to_s,
+      "owner_notebook" => notebook,
+      "launchd" => PLIST.to_s,
+      "enabled" => false
+    }
+    path = SYSTEM_ROOT.join("install.json")
+    temporary = path.dirname.join(".install.#{Process.pid}.tmp")
+    File.open(temporary.to_s, File::WRONLY | File::CREAT | File::EXCL, 0o600) { |file| file.write(JSON.pretty_generate(payload) + "\n") }
+    FileUtils.chown("root", "wheel", temporary.to_s)
+    File.rename(temporary.to_s, path.to_s)
+  ensure
+    FileUtils.rm_f(temporary.to_s) if defined?(temporary) && temporary&.exist?
+  end
+
+  def set_manifest_enabled!(enabled)
+    path = SYSTEM_ROOT.join("install.json")
+    manifest = JSON.parse(path.read(encoding: "UTF-8"))
+    manifest["enabled"] = enabled == true
+    atomic_root_file(path, JSON.pretty_generate(manifest) + "\n", mode: 0o600)
+  rescue JSON::ParserError, KeyError, Errno::ENOENT
+    raise RemoteWork::Error, "member runtime install manifest is invalid"
+  end
+
+  def immutable_root!(path, runtime_uid, label)
+    stat = path.stat
+    raise RemoteWork::Error, "member #{label} is mutable" unless stat.directory? && stat.uid != runtime_uid && (stat.mode & 0o022).zero?
+  end
+
+  def immutable_file!(path, runtime_uid, label)
+    stat = path.stat
+    raise RemoteWork::Error, "member #{label} is mutable" unless stat.file? && path.executable? && stat.uid != runtime_uid && (stat.mode & 0o022).zero?
+  end
+
+  def private_runtime!(path, uid)
+    stat = path.stat
+    raise RemoteWork::Error, "member runtime directory drift" unless stat.directory? && stat.uid == uid && (stat.mode & 0o077).zero?
+  end
+
+  def probe_as(uid, gid)
+    read, write = IO.pipe
+    pid = fork do
+      read.close
+      Process::GID.change_privilege(Integer(gid))
+      Process::UID.change_privilege(uid)
+      begin
+        write.write(yield ? "1" : "0")
+      rescue SystemCallError
+        write.write("0")
+      ensure
+        write.close
+      end
+      exit! 0
+    end
+    write.close
+    result = read.read == "1"
+    read.close
+    Process.wait(pid)
+    result
+  end
+
+  def spawn_as(uid, gid, environment, *command)
+    pid = Process.spawn(environment, *command, uid: uid, gid: gid, unsetenv_others: true)
+    Process.wait(pid)
+    $CHILD_STATUS || $?
+  end
+
+  def command_succeeds_as(uid, gid, environment, *command)
+    pid = Process.spawn(
+      environment, *command, uid: uid, gid: gid, unsetenv_others: true,
+      out: File::NULL, err: File::NULL
+    )
+    Process.wait(pid)
+    ($CHILD_STATUS || $?).success?
+  end
+
+  def launch_environment(manifest)
+    {
+      "LANG" => "en_US.UTF-8",
+      "WU_REMOTE_WORKER_HOME" => RUNTIME_ROOT.join("worker-home").to_s,
+      "WU_MEMBER_RUNTIME_USER" => manifest.fetch("runtime_user"),
+      "WU_MEMBER_RUNTIME_UID" => manifest.fetch("runtime_uid").to_s,
+      "WU_MEMBER_OWNER_UID" => manifest.fetch("owner_uid").to_s,
+      "WU_MEMBER_RUNTIME_ROOT" => RUNTIME_ROOT.to_s,
+      "WU_MEMBER_RELEASE_ROOT" => manifest.fetch("release_root"),
+      "WU_MEMBER_CODEX_ROOT" => RUNTIME_ROOT.join("agent-identity/codex-homes").to_s,
+      "TWO_HEAD_WU_IDENTITY_ROOT" => RUNTIME_ROOT.join("agent-identity").to_s,
+      "WU_MEMBER_PRIVATE_CANARIES" => CANARY.to_s,
+      "WU_REMOTE_CODEX_BIN" => manifest.fetch("codex_bin"),
+      "TWO_HEAD_WU_CODEX_BIN" => manifest.fetch("codex_bin"),
+      "TWO_HEAD_WU_CODEX_LOGIN_DEVICE_AUTH" => "1",
+      "TWO_HEAD_WU_RESEARCH_LIBRARY_ROOT" => manifest.fetch("research_root")
+    }
+  end
+
+  def install_manifest
+    JSON.parse(SYSTEM_ROOT.join("install.json").read(encoding: "UTF-8"))
+  rescue JSON::ParserError, Errno::ENOENT
+    raise RemoteWork::Error, "member runtime install manifest is invalid"
+  end
+
+  def validated_air_identity(options)
+    value = options[:identity].to_s
+    unless value.match?(/\A[a-z][a-z0-9-]{0,62}\z/)
+      raise RemoteWork::Error, "--identity must use lowercase letters, digits, and hyphens"
+    end
+    value
+  end
+
+  def installed_identity_adapter(manifest)
+    release = Pathname.new(manifest.fetch("release_root")).realpath
+    adapter = release.join("capabilities/agent-identity/adapters/agent-identity").realpath
+    raise RemoteWork::Error, "installed Air identity adapter is unavailable" unless adapter.file? && adapter.executable?
+    adapter
+  rescue Errno::ENOENT
+    raise RemoteWork::Error, "installed Air identity adapter is unavailable"
+  end
+
+  def air_identity_environment(manifest)
+    launch_environment(manifest).merge(
+      "HOME" => RUNTIME_ROOT.to_s,
+      "PATH" => "/usr/bin:/bin:/usr/sbin:/sbin"
+    )
+  end
+
+  def service_loaded?
+    system("/bin/launchctl", "print", "system/#{SERVICE_LABEL}", out: File::NULL, err: File::NULL)
+  end
+
+  def service_disabled?(disabled_output: nil)
+    if disabled_output.nil?
+      output, _stderr, status = Open3.capture3("/bin/launchctl", "print-disabled", "system")
+      return false unless status.success?
+      disabled_output = output
+    end
+    disabled_output.match?(/^\s*"#{Regexp.escape(SERVICE_LABEL)}"\s*=>\s*(?:true|disabled)\s*$/)
+  end
+
+  def disable_service!
+    unless system("/bin/launchctl", "disable", "system/#{SERVICE_LABEL}", out: File::NULL, err: File::NULL)
+      raise RemoteWork::Error, "cannot persistently disable member LaunchDaemon"
+    end
+    system("/bin/launchctl", "bootout", "system/#{SERVICE_LABEL}", out: File::NULL, err: File::NULL)
+    raise RemoteWork::Error, "cannot stop member LaunchDaemon" unless wait_for_service_state(loaded: false)
+    raise RemoteWork::Error, "member LaunchDaemon disable override was not recorded" unless service_disabled?
+    true
+  end
+
+  def wait_for_service_state(loaded:, timeout_seconds: 5.0)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + Float(timeout_seconds)
+    loop do
+      return true if service_loaded? == loaded
+      return false if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      sleep 0.1
+    end
+  end
+end
+
+exit MemberWorkerInstaller.new(ARGV).run if $PROGRAM_NAME == __FILE__

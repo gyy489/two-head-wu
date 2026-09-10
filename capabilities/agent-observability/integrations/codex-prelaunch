@@ -1,0 +1,47 @@
+#!/usr/bin/ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "json"
+require "pathname"
+require "socket"
+require_relative "../lib/agent_observability"
+
+package_root = Pathname.new(__dir__).join("..").realpath
+state_root = Pathname.new(Dir.home).join(".local/state/two-head-wu/agent-observability")
+FileUtils.mkdir_p(state_root, mode: 0o700)
+config = JSON.parse(state_root.join("prelaunch.json").read)
+raise "invalid prelaunch contract" unless config.is_a?(Hash)
+
+project_root = config.fetch("project_root")
+data_root = config.fetch("data_root")
+raise "invalid prelaunch project root" unless Pathname.new(project_root).absolute?
+raise "invalid prelaunch data root" unless Pathname.new(data_root).absolute?
+socket_path = state_root.join("provider-trigger.sock")
+
+observability = TwoHeadWu::AgentObservability.new(
+  project_root: project_root,
+  data_root: data_root,
+  package_root: package_root
+)
+provider_package_root = observability.send(:provider_bootstrap_package_root)
+exit 0 if observability.send(:otlp_backend_ready?)
+
+begin
+  socket = UNIXSocket.new(socket_path.to_s)
+  socket.write("ping\n")
+  ready = IO.select([socket], nil, nil, 0.5)
+  exit 0 if ready && socket.gets == "ok\n"
+rescue SystemCallError, IOError
+  nil
+ensure
+  socket&.close
+end
+
+command = [
+  package_root.join("integrations/provider-trigger-broker").to_s,
+  "--project-root", project_root,
+  "--data-root", data_root,
+  "--package-root", provider_package_root.to_s
+]
+exec(*command)

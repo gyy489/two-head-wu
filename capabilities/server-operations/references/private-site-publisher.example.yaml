@@ -1,0 +1,31 @@
+# Protected executor input only. Install a populated copy outside this repository
+# under the executor's separate service account. Never commit it or put it in a
+# prompt, report, Catalog, or normal user-writable directory.
+# `workspace` records the registered project binding only. The protected
+# service must never open or traverse that path; its unprivileged client sends
+# a frozen release as a regular tar file descriptor over the fixed local socket.
+schema_version: 3
+
+projects:
+  "REPLACE_WITH_REGISTERED_PROJECT_ID":
+    workspace: "/REPLACE/WITH/ABSOLUTE/REGISTERED/PROJECT/WORKSPACE"
+    allowed_sites:
+      - private-site
+      - public-site
+
+targets:
+  private-site:
+    transport: rsync_ssh
+    ssh_target: "REPLACE_WITH_DEDICATED_DEPLOY_ALIAS"
+    remote_root: "/REPLACE/WITH/ENGLISH/SITE/ROOT"
+    delete_policy: mirror
+    verification: https-release-marker
+    verification_url: "https://private.example/"
+
+  public-site:
+    transport: rsync_ssh
+    ssh_target: "REPLACE_WITH_DEDICATED_DEPLOY_ALIAS"
+    remote_root: "/REPLACE/WITH/PUBLIC/TEMP/SITE/ROOT"
+    delete_policy: mirror
+    verification: https-release-marker
+    verification_url: "https://public.example/site/"

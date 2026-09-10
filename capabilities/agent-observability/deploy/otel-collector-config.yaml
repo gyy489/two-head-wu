@@ -1,0 +1,67 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 1024
+    spike_limit_mib: 256
+
+  filter/owner_local_codex:
+    error_mode: propagate
+    traces:
+      span:
+        - 'attributes["project.id"] == nil'
+        - 'attributes["agent.logical_identity"] != "two-head-wu-codex"'
+        - 'attributes["agent.runtime"] != "codex"'
+
+  transform/privacy:
+    error_mode: propagate
+    trace_statements:
+      - context: resource
+        statements:
+          - keep_matching_keys(attributes, "^(service\\.(name|version)|deployment\\.environment\\.name|telemetry\\.sdk\\.(name|language|version))$")
+      - context: span
+        statements:
+          - keep_matching_keys(attributes, "^(project\\.(id|kind|attribution)|agent\\.logical_identity|agent\\.runtime|runtime\\.surface|observability\\.schema|conversation\\.id|event\\.(name|kind)|capability\\.id|interface\\.id|app\\.version|model|originator|terminal\\.type|provider_name|reasoning_(effort|summary)|context_window|auto_compact_token_limit|approval_policy|sandbox_policy|attempt|duration_ms|http\\.response\\.status_code|input_token_count|output_token_count|cached_token_count|cache_write_token_count|reasoning_token_count|tool_token_count|ttft_ms|service_tier|model_reasoning_effort|tool_(name|namespace|origin)|success|output_truncated|arguments_length|output_length|output_line_count|mcp_tool|gen_ai\\.(request\\.model|usage\\.(input_tokens|output_tokens|cache_read\\.input_tokens|cache_write\\.input_tokens))|codex\\.(op|request\\.reasoning_effort|turn\\.(reasoning_effort|token_usage\\.(input_tokens|non_cached_input_tokens|cached_input_tokens|cache_write_input_tokens|output_tokens|reasoning_output_tokens|total_tokens))|usage\\.(reasoning_output_tokens|total_tokens))|otel\\.name)$")
+          - set(status.message, "")
+      - context: spanevent
+        statements:
+          - keep_matching_keys(attributes, "^(project\\.(id|kind|attribution)|agent\\.logical_identity|agent\\.runtime|runtime\\.surface|observability\\.schema|conversation\\.id|event\\.(name|kind)|capability\\.id|interface\\.id|app\\.version|model|originator|terminal\\.type|provider_name|reasoning_(effort|summary)|context_window|auto_compact_token_limit|approval_policy|sandbox_policy|attempt|duration_ms|http\\.response\\.status_code|input_token_count|output_token_count|cached_token_count|cache_write_token_count|reasoning_token_count|tool_token_count|ttft_ms|service_tier|model_reasoning_effort|tool_(name|namespace|origin)|success|output_truncated|arguments_length|output_length|output_line_count|mcp_tool|prompt_length|text_input_count|image_input_count|local_image_input_count|gen_ai\\.(request\\.model|usage\\.(input_tokens|output_tokens|cache_read\\.input_tokens|cache_write\\.input_tokens))|codex\\.(op|request\\.reasoning_effort|turn\\.(reasoning_effort|token_usage\\.(input_tokens|non_cached_input_tokens|cached_input_tokens|cache_write_input_tokens|output_tokens|reasoning_output_tokens|total_tokens))|usage\\.(reasoning_output_tokens|total_tokens))|otel\\.name)$")
+
+  batch:
+    send_batch_size: 1024
+    timeout: 5s
+
+exporters:
+  clickhouse:
+    endpoint: tcp://${env:INIT_DB_HOST}:9000?dial_timeout=10s
+    database: ${env:INIT_DB_DATABASE}
+    username: ${env:INIT_DB_USERNAME}
+    password: ${env:INIT_DB_PASSWORD}
+    ttl: 2190h
+    traces_table_name: otel_traces
+    timeout: 5s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/owner_local_codex, transform/privacy, batch]
+      exporters: [clickhouse]

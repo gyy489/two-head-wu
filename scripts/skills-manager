@@ -1,0 +1,1083 @@
+#!/usr/bin/env python3
+"""Liang-Tou-Wu local skill manager.
+
+This script keeps skill discovery/download separate from runtime activation.
+External skills are staged into the project first, audited there, and only then
+activated in the approved Codex/shared baseline. Runtime-specific exposure is
+materialized by scripts/capabilities-manager.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SKILLS_ROOT = PROJECT_ROOT / "skills"
+ACTIVE_DIR = SKILLS_ROOT / ".active"
+AUDIT_DIR = SKILLS_ROOT / "audits"
+SKILL_CONTEXTS_DIR = SKILLS_ROOT / "contexts"
+SKILL_LOGS_DIR = SKILLS_ROOT / "logs"
+SKILL_ARTIFACTS_DIR = SKILLS_ROOT / "artifacts"
+SKILL_OUTPUTS_DIR = SKILLS_ROOT / "outputs"
+SKILL_DOCS_DIR = SKILLS_ROOT / "docs"
+SKILL_INVENTORIES_DIR = SKILLS_ROOT / "inventories"
+SKILL_REGISTRY = SKILLS_ROOT / "registries" / "skills_registry.yaml"
+RELEASE_REGISTRY = SKILLS_ROOT / "registries" / "skill_releases.json"
+RELEASE_STORE = SKILLS_ROOT / "releases"
+CAPABILITIES_MANAGER = PROJECT_ROOT / "scripts" / "capabilities-manager"
+HASH_ALGORITHM = "sha256-tree-v1"
+RELEASE_IGNORED_PARTS = frozenset(
+    {".DS_Store", ".git", "__pycache__", ".pytest_cache", "node_modules"}
+)
+
+ALLOWED_PROVENANCE = frozenset(
+    {
+        "official-openai",
+        "official-anthropic",
+        "personal",
+        "third-party",
+        "system",
+        "candidate",
+    }
+)
+
+SOURCE_DIRS: dict[str, Path] = {
+    "inbox": SKILLS_ROOT / "inbox",
+    "official-openai": SKILLS_ROOT / "official" / "openai",
+    "official-anthropic": SKILLS_ROOT / "official" / "anthropic",
+    "personal": SKILLS_ROOT / "personal",
+    "third-party": SKILLS_ROOT / "third-party",
+    "tools": SKILLS_ROOT / "工具skills",
+    "research-writing": SKILLS_ROOT / "论文写作skills",
+    "system": SKILLS_ROOT / ".system",
+    "capability-packages": PROJECT_ROOT / "capabilities",
+}
+
+MANAGED_SOURCE_KEYS = (
+    "inbox",
+    "official-openai",
+    "official-anthropic",
+    "personal",
+    "third-party",
+)
+
+SOURCE_SCAN_KEYS = MANAGED_SOURCE_KEYS + (
+    "tools",
+    "research-writing",
+    "system",
+    "capability-packages",
+)
+
+RISK_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("destructive shell command", r"\brm\s+-rf\b|\bsudo\s+rm\b"),
+    ("privileged command", r"\bsudo\b|chmod\s+777|chown\s+"),
+    ("package installation", r"\b(pip|uv|npm|pnpm|yarn|brew)\s+install\b"),
+    ("network access", r"\b(curl|wget|requests\.|urllib\.|fetch\(|axios\.|httpx\.)"),
+    ("secret or token reference", r"API_KEY|TOKEN|SECRET|PASSWORD|credentials?"),
+    ("subprocess execution", r"subprocess\.|os\.system|child_process|exec\("),
+)
+
+
+@dataclass(frozen=True)
+class SkillInfo:
+    name: str
+    path: Path
+    description: str = ""
+
+
+def rel(path: Path) -> str:
+    try:
+        absolute = path if path.is_absolute() else path.absolute()
+        return str(absolute.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run(command: list[str], cwd: Path | None = None) -> int:
+    print("+ " + " ".join(command))
+    return subprocess.call(command, cwd=str(cwd or PROJECT_ROOT))
+
+
+def ensure_layout() -> None:
+    for key in MANAGED_SOURCE_KEYS:
+        SOURCE_DIRS[key].mkdir(parents=True, exist_ok=True)
+    for directory in (
+        ACTIVE_DIR,
+        AUDIT_DIR,
+        SKILL_CONTEXTS_DIR,
+        SKILL_LOGS_DIR,
+        SKILL_ARTIFACTS_DIR,
+        SKILL_OUTPUTS_DIR,
+        SKILL_DOCS_DIR,
+        SKILL_INVENTORIES_DIR,
+        RELEASE_STORE,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def empty_release_registry() -> dict:
+    return {
+        "version": 1,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "hash_algorithm": HASH_ALGORITHM,
+        "release_store": rel(RELEASE_STORE),
+        "releases": [],
+        "approvals": [],
+        "current": {},
+    }
+
+
+def load_release_registry() -> dict:
+    if not RELEASE_REGISTRY.is_file():
+        return empty_release_registry()
+    try:
+        data = json.loads(read_text(RELEASE_REGISTRY))
+    except json.JSONDecodeError as error:
+        fail(f"invalid Release registry: {error}", code=2)
+    if not isinstance(data, dict):
+        fail("Release registry root must be an object", code=2)
+    if data.get("hash_algorithm") != HASH_ALGORITHM:
+        fail(
+            f"unsupported Release hash algorithm: {data.get('hash_algorithm')}",
+            code=2,
+        )
+    for key, default in (("releases", []), ("approvals", []), ("current", {})):
+        data.setdefault(key, default)
+    return data
+
+
+def write_release_registry(data: dict) -> None:
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    data["releases"] = sorted(
+        data["releases"], key=lambda item: (item["skill_id"], item["digest"])
+    )
+    data["approvals"] = sorted(
+        data["approvals"],
+        key=lambda item: (item["skill_id"], item["digest"], item["approved_at"]),
+    )
+    data["current"] = dict(sorted(data["current"].items()))
+    RELEASE_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    temporary = RELEASE_REGISTRY.with_name(f".{RELEASE_REGISTRY.name}.tmp-{os.getpid()}")
+    temporary.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary.replace(RELEASE_REGISTRY)
+
+
+def tree_digest(root: Path) -> str:
+    root = root.resolve()
+    digest = hashlib.sha256()
+    entries = sorted(
+        (
+            path
+            for path in root.rglob("*")
+            if not RELEASE_IGNORED_PARTS.intersection(path.relative_to(root).parts)
+        ),
+        key=lambda path: path.relative_to(root).as_posix(),
+    )
+    for path in entries:
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            digest.update(b"L\0")
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(os.readlink(path).encode("utf-8"))
+            digest.update(b"\0")
+        elif path.is_file():
+            executable = bool(path.stat().st_mode & 0o111)
+            digest.update(b"F\0")
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0x\0" if executable else b"\0-\0")
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}"
+
+
+def release_record(data: dict, skill_id: str, digest: str) -> dict | None:
+    return next(
+        (
+            item
+            for item in data["releases"]
+            if item.get("skill_id") == skill_id and item.get("digest") == digest
+        ),
+        None,
+    )
+
+
+def approval_record(
+    data: dict, skill_id: str, digest: str, runtime: str | None = None
+) -> dict | None:
+    for item in data["approvals"]:
+        if item.get("skill_id") != skill_id or item.get("digest") != digest:
+            continue
+        if not str(item.get("decision", "approved")).startswith("approved"):
+            continue
+        if runtime and runtime not in item.get("runtimes", []):
+            continue
+        return item
+    return None
+
+
+def make_snapshot_read_only(root: Path) -> None:
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path.is_symlink():
+            continue
+        mode = path.stat().st_mode
+        path.chmod(mode & ~0o222)
+    root.chmod(root.stat().st_mode & ~0o222)
+
+
+def ensure_release(
+    info: SkillInfo,
+    data: dict,
+    *,
+    source_revision: str,
+    apply: bool,
+) -> tuple[str, dict]:
+    digest = tree_digest(info.path)
+    existing = release_record(data, info.name, digest)
+    digest_hex = digest.removeprefix("sha256:")
+    snapshot = RELEASE_STORE / info.name / digest_hex
+    record = existing or {
+        "skill_id": info.name,
+        "digest": digest,
+        "source_path": rel(info.path),
+        "snapshot_path": rel(snapshot),
+        "source_revision": source_revision,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if not apply:
+        return digest, record
+
+    if snapshot.exists():
+        if tree_digest(snapshot) != digest:
+            fail(f"Release snapshot digest mismatch: {rel(snapshot)}", code=2)
+    else:
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        stage = snapshot.parent / f".{digest_hex}.new-{os.getpid()}"
+        if stage.exists():
+            shutil.rmtree(stage)
+        shutil.copytree(info.path, stage, symlinks=True)
+        if tree_digest(stage) != digest:
+            shutil.rmtree(stage)
+            fail(f"Release snapshot verification failed: {info.name}", code=2)
+        make_snapshot_read_only(stage)
+        stage.replace(snapshot)
+    if existing is None:
+        data["releases"].append(record)
+    elif existing.get("source_path") != rel(info.path):
+        existing["source_path"] = rel(info.path)
+    return digest, record
+
+
+def scope_runtimes(scope: str) -> list[str]:
+    return {
+        "shared": ["codex", "claude-code", "openclaw"],
+        "codex-only": ["codex"],
+        "claude-only": ["claude-code"],
+    }[scope]
+
+
+def audit_digest(report: Path) -> str | None:
+    match = re.search(
+        r"^Digest:\s*\x60(sha256:[0-9a-f]{64})\x60",
+        read_text(report),
+        re.MULTILINE,
+    )
+    return match.group(1) if match else None
+
+
+def frontmatter(skill_md: Path) -> dict[str, str]:
+    content = read_text(skill_md)
+    match = re.match(r"\A---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if not match:
+        return {}
+    data: dict[str, str] = {}
+    for raw_line in match.group(1).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        value = value.strip().strip('"').strip("'")
+        data[key.strip()] = value
+    return data
+
+
+def registry_provenance_findings(registry_path: Path = SKILL_REGISTRY) -> tuple[list[str], int]:
+    """Validate provenance without adding a YAML dependency to the manager."""
+    findings: list[str] = []
+    records: list[tuple[str, str | None]] = []
+    current_name: str | None = None
+    current_provenance: str | None = None
+
+    def finish_record() -> None:
+        nonlocal current_name, current_provenance
+        if current_name is not None:
+            records.append((current_name, current_provenance))
+        current_name = None
+        current_provenance = None
+
+    if not registry_path.is_file():
+        return [f"Skill registry is missing: {rel(registry_path)}"], 0
+
+    for raw_line in read_text(registry_path).splitlines():
+        name_match = re.match(r"^  - name:\s*(.+?)\s*$", raw_line)
+        if name_match:
+            finish_record()
+            current_name = name_match.group(1).strip().strip('"').strip("'")
+            continue
+        provenance_match = re.match(r"^    provenance:\s*(.+?)\s*$", raw_line)
+        if provenance_match and current_name is not None:
+            current_provenance = provenance_match.group(1).strip().strip('"').strip("'")
+    finish_record()
+
+    seen: set[str] = set()
+    for name, provenance in records:
+        if name in seen:
+            findings.append(f"duplicate Skill registry name: {name}")
+        seen.add(name)
+        if provenance is None:
+            findings.append(f"Skill registry provenance missing: {name}")
+        elif provenance not in ALLOWED_PROVENANCE:
+            findings.append(f"Skill registry provenance invalid: {name} -> {provenance}")
+
+    if not records:
+        findings.append("Skill registry contains no records")
+    return findings, len(records)
+
+
+def skill_info(path: Path) -> SkillInfo:
+    skill_md = path / "SKILL.md"
+    if not skill_md.is_file():
+        fail(f"not a skill directory: {path}")
+    meta = frontmatter(skill_md)
+    return SkillInfo(
+        name=meta.get("name") or path.name,
+        path=path.resolve(),
+        description=meta.get("description", ""),
+    )
+
+
+def iter_skill_dirs(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    result: list[Path] = []
+    for skill_md in root.rglob("SKILL.md"):
+        parts = set(skill_md.parts)
+        if {
+            ".git",
+            ".trash",
+            "artifacts",
+            "audits",
+            "contexts",
+            "docs",
+            "inventories",
+            "logs",
+            "node_modules",
+            "outputs",
+            "__pycache__",
+        } & parts:
+            continue
+        if ACTIVE_DIR in skill_md.parents:
+            continue
+        result.append(skill_md.parent.resolve())
+    return sorted(set(result), key=lambda item: str(item))
+
+
+def source_skill_dirs(include_system: bool = True) -> list[Path]:
+    keys = list(SOURCE_SCAN_KEYS)
+    if not include_system:
+        keys.remove("system")
+    dirs: list[Path] = []
+    for key in keys:
+        dirs.extend(iter_skill_dirs(SOURCE_DIRS[key]))
+    return sorted(set(dirs), key=lambda item: str(item))
+
+
+def active_entries() -> list[Path]:
+    if not ACTIVE_DIR.exists():
+        return []
+    result: list[Path] = []
+    for entry in sorted(ACTIVE_DIR.iterdir(), key=lambda item: item.name):
+        if entry.name == ".system":
+            result.extend(
+                path
+                for path in sorted(entry.iterdir(), key=lambda item: item.name)
+                if not path.name.startswith(".") and (path.is_dir() or path.is_symlink())
+            )
+        elif entry.name.startswith("."):
+            continue
+        elif entry.is_dir() or entry.is_symlink():
+            result.append(entry)
+    return result
+
+
+def compatibility_entry(name: str) -> Path:
+    candidates = [ACTIVE_DIR / name, ACTIVE_DIR / ".system" / name]
+    for candidate in candidates:
+        if candidate.exists() or candidate.is_symlink():
+            try:
+                if skill_info(candidate).name == name:
+                    return candidate
+            except SystemExit:
+                continue
+    return ACTIVE_DIR / name
+
+
+def relink_compatibility_entry(name: str, snapshot: Path, *, backup_directory: bool) -> Path:
+    active = compatibility_entry(name)
+    if active.is_symlink():
+        if active.resolve() == snapshot.resolve():
+            return active
+        active.unlink()
+    elif active.exists():
+        if not backup_directory:
+            fail(f"refusing to replace non-symlink active entry: {rel(active)}")
+        relative = active.relative_to(ACTIVE_DIR)
+        backup = SKILLS_ROOT / ".trash" / "v2-active-source-backup" / relative
+        if backup.exists() or backup.is_symlink():
+            suffix = 2
+            while True:
+                candidate = backup.with_name(f"{backup.name}.repeat-{suffix}")
+                if not candidate.exists() and not candidate.is_symlink():
+                    backup = candidate
+                    break
+                suffix += 1
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(active, backup)
+        print(f"preserved legacy active source: {rel(active)} -> {rel(backup)}")
+    active.parent.mkdir(parents=True, exist_ok=True)
+    active.symlink_to(snapshot)
+    return active
+
+
+def resolve_skill(identifier: str) -> SkillInfo:
+    candidate = Path(identifier).expanduser()
+    if candidate.exists():
+        if not candidate.is_absolute():
+            candidate = (PROJECT_ROOT / candidate).resolve()
+        return skill_info(candidate)
+
+    matches: list[SkillInfo] = []
+    for directory in source_skill_dirs():
+        info = skill_info(directory)
+        if info.name == identifier or directory.name == identifier:
+            matches.append(info)
+
+    if not matches:
+        fail(f"skill not found in managed source dirs: {identifier}")
+    if len(matches) > 1:
+        details = "\n".join(f"- {item.name}: {rel(item.path)}" for item in matches)
+        fail(f"multiple skills match {identifier}:\n{details}")
+    return matches[0]
+
+
+def safe_copytree(src: Path, dest: Path, replace: bool = False) -> None:
+    if dest.exists() or dest.is_symlink():
+        if not replace:
+            fail(f"destination exists: {rel(dest)}; pass --replace to overwrite")
+        if dest.is_symlink() or dest.is_file():
+            dest.unlink()
+        else:
+            shutil.rmtree(dest)
+    shutil.copytree(src, dest, symlinks=True)
+
+
+def cmd_find(args: argparse.Namespace) -> None:
+    query = " ".join(args.query)
+    if not query:
+        fail("provide a search query")
+    raise SystemExit(run(["npx", "-y", "skills", "find", query]))
+
+
+def cmd_stage(args: argparse.Namespace) -> None:
+    ensure_layout()
+    dest_root = SOURCE_DIRS[args.dest]
+    with tempfile.TemporaryDirectory(prefix="ltw-skills-") as temp:
+        temp_root = Path(temp)
+        command = ["npx", "-y", "skills", "add", args.source, "-a", "claude-code", "--copy", "-y"]
+        for skill in args.skill or []:
+            command.extend(["--skill", skill])
+        if args.all:
+            command.append("--all")
+        code = run(command, cwd=temp_root)
+        if code != 0:
+            raise SystemExit(code)
+
+        installed_root = temp_root / ".claude" / "skills"
+        installed = [path for path in installed_root.iterdir() if (path / "SKILL.md").is_file()] if installed_root.exists() else []
+        if not installed:
+            fail("npx skills did not produce any skill under the staging temp dir")
+
+        for skill_dir in sorted(installed, key=lambda item: item.name):
+            info = skill_info(skill_dir)
+            target_name = args.name if args.name and len(installed) == 1 else info.name
+            target = dest_root / target_name
+            safe_copytree(skill_dir, target, replace=args.replace)
+            print(f"staged {info.name} -> {rel(target)}")
+
+
+def cmd_import_local(args: argparse.Namespace) -> None:
+    ensure_layout()
+    src = Path(args.path).expanduser()
+    if not src.is_absolute():
+        src = (PROJECT_ROOT / src).resolve()
+    info = skill_info(src)
+    target_name = args.name or info.name
+    target = SOURCE_DIRS[args.dest] / target_name
+    safe_copytree(src, target, replace=args.replace)
+    print(f"imported {info.name} -> {rel(target)}")
+
+
+def cmd_audit(args: argparse.Namespace) -> None:
+    ensure_layout()
+    info = resolve_skill(args.skill)
+    digest = tree_digest(info.path)
+    skill_md = info.path / "SKILL.md"
+    files = [path for path in info.path.rglob("*") if path.is_file()]
+    scripts = [path for path in files if "/scripts/" in str(path)]
+    references = [path for path in files if "/references/" in str(path)]
+    assets = [path for path in files if "/assets/" in str(path)]
+
+    body = "\n".join(read_text(path) for path in files if path.suffix in {".md", ".py", ".js", ".ts", ".sh", ".rb"})
+    findings: list[str] = []
+    for label, pattern in RISK_PATTERNS:
+        if re.search(pattern, body, re.IGNORECASE):
+            findings.append(label)
+
+    status = "needs-review" if findings else "low-obvious-risk"
+    generated = datetime.now(timezone.utc).isoformat()
+    report = [
+        f"# Skill Audit: {info.name}",
+        "",
+        f"Generated: `{generated}`",
+        f"Path: `{rel(info.path)}`",
+        f"Digest: `{digest}`",
+        f"Status: `{status}`",
+        "",
+        "## Metadata",
+        "",
+        f"- name: `{info.name}`",
+        f"- description: {info.description or '(empty)'}",
+        "",
+        "## File Summary",
+        "",
+        f"- files: {len(files)}",
+        f"- scripts: {len(scripts)}",
+        f"- references: {len(references)}",
+        f"- assets: {len(assets)}",
+        "",
+        "## Risk Signals",
+        "",
+    ]
+    if findings:
+        report.extend(f"- {item}" for item in findings)
+    else:
+        report.append("- No obvious scripted risk signals found by static scan.")
+    report.extend(
+        [
+            "",
+            "## Activation Decision",
+            "",
+            "- Do not activate until a human or agent has reviewed SKILL.md and bundled scripts.",
+            "- Prefer `shared` only when the skill has no Codex-only or Claude-only tool assumptions.",
+        ]
+    )
+    text = "\n".join(report) + "\n"
+    print(text)
+    if args.write:
+        target = AUDIT_DIR / f"{info.name}.md"
+        target.write_text(text, encoding="utf-8")
+        print(f"wrote {rel(target)}")
+
+
+def approval_status(info: SkillInfo) -> str | None:
+    digest = tree_digest(info.path)
+    registry = load_release_registry()
+    approval = approval_record(registry, info.name, digest)
+    if approval:
+        runtimes = set(approval.get("runtimes", []))
+        if "codex" in runtimes:
+            return "approved-structured"
+        if runtimes == {"claude-code"}:
+            return "approved-claude-only"
+
+    report = AUDIT_DIR / f"{info.name}.md"
+    if not report.is_file():
+        return None
+    text = read_text(report)
+    match = re.search(r"Decision:\s*`(approved-(?:shared|codex-only|claude-only))`", text)
+    if match:
+        return match.group(1)
+    if re.search(r"^Status:\s*`reviewed-active`", text, re.MULTILINE):
+        return "approved-legacy"
+    return None
+
+
+def cmd_approve(args: argparse.Namespace) -> None:
+    ensure_layout()
+    info = resolve_skill(args.skill)
+    report = AUDIT_DIR / f"{info.name}.md"
+    if not report.is_file():
+        fail(f"audit report missing: {rel(report)}; run audit --write first")
+    digest = tree_digest(info.path)
+    audited_digest = audit_digest(report)
+    if audited_digest != digest:
+        fail(
+            f"audit digest does not match current source for {info.name}; "
+            "run audit --write and review the new Release first"
+        )
+
+    registry = load_release_registry()
+    runtimes = scope_runtimes(args.scope)
+    existing = approval_record(registry, info.name, digest)
+    if existing and set(runtimes).issubset(set(existing.get("runtimes", []))):
+        fail(f"Skill Release already has the requested approval: {info.name} {digest}")
+
+    decision = f"approved-{args.scope}"
+    approved_at = datetime.now(timezone.utc).isoformat()
+    ensure_release(
+        info,
+        registry,
+        source_revision=args.source_revision,
+        apply=True,
+    )
+    block = (
+        "\n## Approval\n\n"
+        f"- Decision: `{decision}`\n"
+        f"- Reviewer: `{args.reviewer}`\n"
+        f"- Approved: `{approved_at}`\n"
+    )
+    with report.open("a", encoding="utf-8") as handle:
+        handle.write(block)
+    registry["approvals"].append(
+        {
+            "skill_id": info.name,
+            "digest": digest,
+            "decision": "approved",
+            "runtimes": runtimes,
+            "reviewer": args.reviewer,
+            "approved_at": approved_at,
+            "audit_path": rel(report),
+            "basis": "digest-reviewed",
+        }
+    )
+    write_release_registry(registry)
+    print(f"approved {info.name}: {decision}, digest={digest}")
+
+
+def cmd_activate(args: argparse.Namespace) -> None:
+    ensure_layout()
+    info = resolve_skill(args.skill)
+    name = args.name or info.name
+    approval = approval_status(info)
+    if not approval:
+        fail(
+            f"activation approval missing for {info.name}; "
+            "run audit --write, review the report, then approve"
+        )
+    if approval == "approved-claude-only":
+        fail(
+            f"{info.name} is approved only for Claude Code; activation would expose it to Codex. "
+            "Register it in a Claude-only capability set and generate that runtime surface instead"
+        )
+    registry = load_release_registry()
+    digest = tree_digest(info.path)
+    release = release_record(registry, info.name, digest)
+    if not release:
+        fail(
+            f"approved Release snapshot missing for {info.name}; "
+            "run approve again or migrate-v2"
+        )
+    snapshot = PROJECT_ROOT / release["snapshot_path"]
+    if not snapshot.joinpath("SKILL.md").is_file():
+        fail(f"approved Release snapshot missing: {rel(snapshot)}")
+
+    active = compatibility_entry(name)
+    if active.exists() or active.is_symlink():
+        if not args.replace:
+            fail(f"active entry exists: {rel(active)}; pass --replace to relink")
+        if not active.is_symlink():
+            fail(f"refusing to replace non-symlink active entry: {rel(active)}")
+        active.unlink()
+    active.symlink_to(snapshot)
+    registry["current"][info.name] = digest
+    write_release_registry(registry)
+    print(f"activated {name}: {rel(active)} -> {rel(snapshot)} ({digest})")
+
+
+def cmd_release(args: argparse.Namespace) -> None:
+    ensure_layout()
+    info = resolve_skill(args.skill)
+    registry = load_release_registry()
+    digest, record = ensure_release(
+        info,
+        registry,
+        source_revision=args.source_revision,
+        apply=args.apply,
+    )
+    if args.apply:
+        write_release_registry(registry)
+        print(f"released {info.name}: {digest} -> {record['snapshot_path']}")
+    else:
+        print(f"would release {info.name}: {digest} -> {record['snapshot_path']}")
+
+
+def load_yaml_registry(path: Path) -> dict:
+    try:
+        import yaml
+    except ImportError:
+        fail("PyYAML is required for v2 migration and Release validation", code=2)
+    try:
+        data = yaml.safe_load(read_text(path))
+    except yaml.YAMLError as error:
+        fail(f"invalid YAML {rel(path)}: {error}", code=2)
+    if not isinstance(data, dict):
+        fail(f"YAML root is not a mapping: {rel(path)}", code=2)
+    return data
+
+
+def source_path_for_registry_skill(record: dict) -> Path:
+    candidates = [record.get("path"), record.get("active_path")]
+    for value in candidates:
+        if not value:
+            continue
+        path = Path(value)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        if path.joinpath("SKILL.md").is_file():
+            return path.resolve()
+    fail(f"registered Skill source missing: {record.get('name', '(unknown)')}", code=2)
+
+
+def approved_runtimes_for_migration(skill_name: str) -> list[str]:
+    capability_data = load_yaml_registry(
+        PROJECT_ROOT / "registries" / "capabilities_registry.yaml"
+    )
+    profile_path = PROJECT_ROOT / capability_data.get(
+        "profile_registry", "skills/registries/skill_profiles.yaml"
+    )
+    profile_data = load_yaml_registry(profile_path) if profile_path.is_file() else {}
+    runtimes: set[str] = set()
+    collections = [
+        capability_data.get("skill_sets", {}),
+        profile_data.get("stacks", {}),
+    ]
+    for groups in collections:
+        for group in groups.values():
+            if skill_name not in group.get("skills", []):
+                continue
+            for runtime, state in group.get("compatibility", {}).items():
+                if state in {"native", "compatible"}:
+                    runtimes.add(runtime)
+    return sorted(runtimes)
+
+
+def cmd_migrate_v2(args: argparse.Namespace) -> None:
+    ensure_layout()
+    registry = load_release_registry()
+    skill_data = load_yaml_registry(SKILL_REGISTRY)
+    records = [
+        item for item in skill_data.get("skills", []) if item.get("status") == "active"
+    ]
+    migrated = 0
+    for record in records:
+        source = source_path_for_registry_skill(record)
+        info = skill_info(source)
+        expected_name = record["name"]
+        if info.name != expected_name:
+            fail(
+                f"registry/frontmatter name mismatch: {expected_name} != {info.name}",
+                code=2,
+            )
+        digest, release = ensure_release(
+            info,
+            registry,
+            source_revision=args.source_revision,
+            apply=args.apply,
+        )
+        runtimes = approved_runtimes_for_migration(info.name)
+        if not runtimes:
+            fail(f"no approved runtime compatibility found for {info.name}", code=2)
+        if args.apply and not approval_record(registry, info.name, digest):
+            audit_path = AUDIT_DIR / f"{info.name}.md"
+            registry["approvals"].append(
+                {
+                    "skill_id": info.name,
+                    "digest": digest,
+                    "decision": "approved-migrated-v1",
+                    "runtimes": runtimes,
+                    "reviewer": args.reviewer,
+                    "approved_at": datetime.now(timezone.utc).isoformat(),
+                    "audit_path": rel(audit_path) if audit_path.is_file() else None,
+                    "basis": "existing-active-policy-and-owner-authorized-v2-migration",
+                }
+            )
+        if args.apply:
+            registry["current"][info.name] = digest
+            snapshot = PROJECT_ROOT / release["snapshot_path"]
+            active = relink_compatibility_entry(
+                info.name, snapshot, backup_directory=True
+            )
+            print(f"linked compatibility catalog: {rel(active)} -> {rel(snapshot)}")
+        migrated += 1
+        verb = "migrated" if args.apply else "would migrate"
+        print(
+            f"{verb} {info.name}: {digest} runtimes={','.join(runtimes)} "
+            f"snapshot={release['snapshot_path']}"
+        )
+    if args.apply:
+        write_release_registry(registry)
+    print(f"v2 migration {'applied' if args.apply else 'dry-run'}: {migrated} active Skills")
+
+
+def cmd_deactivate(args: argparse.Namespace) -> None:
+    active = compatibility_entry(args.name)
+    if not active.exists() and not active.is_symlink():
+        print(f"not active: {args.name}")
+        return
+    if not active.is_symlink():
+        fail(f"refusing to remove non-symlink active entry: {rel(active)}")
+    active.unlink()
+    print(f"deactivated {args.name}")
+
+
+def cmd_sync_links(args: argparse.Namespace) -> None:
+    command = [str(CAPABILITIES_MANAGER), "sync-skills"]
+    if args.apply:
+        command.append("--apply")
+    result = subprocess.run(command, cwd=PROJECT_ROOT, check=False)
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
+
+def cmd_status(_: argparse.Namespace) -> None:
+    ensure_layout()
+    print(f"project: {PROJECT_ROOT}")
+    print(f"active:  {ACTIVE_DIR}")
+    print("runtime overlays: scripts/capabilities-manager status")
+    active = [entry for entry in active_entries() if (entry / "SKILL.md").is_file()]
+    staged = iter_skill_dirs(SOURCE_DIRS["inbox"])
+    print(f"active skills: {len(active)}")
+    print(f"inbox skills:  {len(staged)}")
+    print(f"audit dir:     {AUDIT_DIR}")
+    release_data = load_release_registry()
+    print(f"releases:      {len(release_data['releases'])}")
+    print(f"current:       {len(release_data['current'])}")
+
+
+def release_registry_findings() -> list[str]:
+    findings: list[str] = []
+    if not RELEASE_REGISTRY.is_file():
+        return [f"Release registry is missing: {rel(RELEASE_REGISTRY)}"]
+    data = load_release_registry()
+    skill_data = load_yaml_registry(SKILL_REGISTRY)
+    release_keys = {
+        (item.get("skill_id"), item.get("digest")): item
+        for item in data.get("releases", [])
+    }
+    if len(release_keys) != len(data.get("releases", [])):
+        findings.append("duplicate Skill Release record")
+    for record in skill_data.get("skills", []):
+        if record.get("status") != "active":
+            continue
+        name = record["name"]
+        digest = data["current"].get(name)
+        if not digest:
+            findings.append(f"active Skill has no current Release: {name}")
+            continue
+        release = release_keys.get((name, digest))
+        if not release:
+            findings.append(f"current Release record missing: {name} {digest}")
+            continue
+        snapshot = Path(release["snapshot_path"])
+        if not snapshot.is_absolute():
+            snapshot = PROJECT_ROOT / snapshot
+        if not snapshot.joinpath("SKILL.md").is_file():
+            findings.append(f"Release snapshot missing: {name} {digest}")
+            continue
+        actual = tree_digest(snapshot)
+        if actual != digest:
+            findings.append(
+                f"Release snapshot digest mismatch: {name} {digest} != {actual}"
+            )
+        if not approval_record(data, name, digest):
+            findings.append(f"current Release has no digest-bound approval: {name}")
+        active = compatibility_entry(name)
+        if not active.is_symlink():
+            findings.append(f"compatibility catalog entry is not a Release link: {name}")
+        elif active.resolve() != snapshot.resolve():
+            findings.append(f"compatibility catalog Release mismatch: {name}")
+    return findings
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    if args.active:
+        for entry in active_entries():
+            skill_md = entry / "SKILL.md"
+            if skill_md.is_file():
+                info = skill_info(entry)
+                marker = "symlink" if entry.is_symlink() else "dir"
+                print(f"{info.name}\t{marker}\t{rel(entry)}")
+        return
+
+    keys = list(SOURCE_DIRS.keys()) if args.all else list(MANAGED_SOURCE_KEYS)
+    for key in keys:
+        print(f"[{key}] {rel(SOURCE_DIRS[key])}")
+        for directory in iter_skill_dirs(SOURCE_DIRS[key]):
+            info = skill_info(directory)
+            active = " active" if (ACTIVE_DIR / info.name).exists() else ""
+            print(f"  - {info.name}: {rel(directory)}{active}")
+
+
+def cmd_doctor(_: argparse.Namespace) -> None:
+    ensure_layout()
+    problems = 0
+    for key in MANAGED_SOURCE_KEYS:
+        path = SOURCE_DIRS[key]
+        print(f"dir {key}: {rel(path)}")
+    for entry in active_entries():
+        if not (entry / "SKILL.md").is_file():
+            print(f"broken active entry: {rel(entry)}")
+            problems += 1
+    provenance_findings, record_count = registry_provenance_findings()
+    if provenance_findings:
+        for finding in provenance_findings:
+            print(f"registry problem: {finding}")
+        problems += len(provenance_findings)
+    else:
+        print(f"registry provenance: ok ({record_count})")
+    lifecycle_findings = release_registry_findings()
+    if lifecycle_findings:
+        for finding in lifecycle_findings:
+            print(f"Release problem: {finding}")
+        problems += len(lifecycle_findings)
+    else:
+        registry = load_release_registry()
+        print(
+            "Release lifecycle: ok "
+            f"(releases={len(registry['releases'])}, current={len(registry['current'])})"
+        )
+    if problems:
+        fail(f"doctor found {problems} problem(s)", code=2)
+    print("doctor ok")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Manage Liang-Tou-Wu skills.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    find = sub.add_parser("find", help="Search skills.sh via npx skills.")
+    find.add_argument("query", nargs="+")
+    find.set_defaults(func=cmd_find)
+
+    stage = sub.add_parser("stage", help="Download external skills into a managed source dir.")
+    stage.add_argument("source", help="owner/repo, URL, or owner/repo@skill accepted by npx skills.")
+    stage.add_argument("--skill", action="append", help="Specific skill inside a repo. May be repeated.")
+    stage.add_argument("--all", action="store_true", help="Install all skills from the source.")
+    stage.add_argument("--dest", choices=MANAGED_SOURCE_KEYS, default="inbox")
+    stage.add_argument("--name", help="Override name when staging exactly one skill.")
+    stage.add_argument("--replace", action="store_true")
+    stage.set_defaults(func=cmd_stage)
+
+    import_local = sub.add_parser("import-local", help="Copy a local skill into a managed source dir.")
+    import_local.add_argument("path")
+    import_local.add_argument("--dest", choices=MANAGED_SOURCE_KEYS, default="inbox")
+    import_local.add_argument("--name")
+    import_local.add_argument("--replace", action="store_true")
+    import_local.set_defaults(func=cmd_import_local)
+
+    audit = sub.add_parser("audit", help="Static audit of one staged/source skill.")
+    audit.add_argument("skill", help="Skill name or path.")
+    audit.add_argument("--write", action="store_true")
+    audit.set_defaults(func=cmd_audit)
+
+    approve = sub.add_parser("approve", help="Record an explicit activation approval after review.")
+    approve.add_argument("skill", help="Skill name or path.")
+    approve.add_argument("--scope", choices=("shared", "codex-only", "claude-only"), required=True)
+    approve.add_argument("--reviewer", required=True, help="Human or accountable reviewer name.")
+    approve.add_argument(
+        "--source-revision",
+        default="workspace-source",
+        help="Upstream revision, tag, or local source revision recorded with the Release.",
+    )
+    approve.set_defaults(func=cmd_approve)
+
+    release = sub.add_parser(
+        "release",
+        help="Create an immutable content-addressed Release without approving or activating it.",
+    )
+    release.add_argument("skill", help="Skill name or path.")
+    release.add_argument("--source-revision", default="workspace-source")
+    release.add_argument("--apply", action="store_true")
+    release.set_defaults(func=cmd_release)
+
+    migrate = sub.add_parser(
+        "migrate-v2",
+        help="Snapshot current active Skills and bind legacy approvals to exact digests.",
+    )
+    migrate.add_argument("--reviewer", required=True)
+    migrate.add_argument("--source-revision", default="v1-active-migration")
+    migrate.add_argument("--apply", action="store_true")
+    migrate.set_defaults(func=cmd_migrate_v2)
+
+    activate = sub.add_parser("activate", help="Expose a source skill through skills/.active.")
+    activate.add_argument("skill", help="Skill name or path.")
+    activate.add_argument("--name")
+    activate.add_argument("--replace", action="store_true")
+    activate.set_defaults(func=cmd_activate)
+
+    deactivate = sub.add_parser("deactivate", help="Remove a symlink from skills/.active.")
+    deactivate.add_argument("name")
+    deactivate.set_defaults(func=cmd_deactivate)
+
+    sync_links = sub.add_parser("sync-links", help="Delegate runtime Profile overlays to capabilities-manager.")
+    sync_links.add_argument("--apply", action="store_true")
+    sync_links.set_defaults(func=cmd_sync_links)
+
+    status = sub.add_parser("status", help="Show current runtime paths and counts.")
+    status.set_defaults(func=cmd_status)
+
+    list_cmd = sub.add_parser("list", help="List managed source or active skills.")
+    list_cmd.add_argument("--active", action="store_true")
+    list_cmd.add_argument("--all", action="store_true")
+    list_cmd.set_defaults(func=cmd_list)
+
+    doctor = sub.add_parser("doctor", help="Validate expected directories and links.")
+    doctor.add_argument("--strict", action="store_true", help="Fail on every registry or topology problem.")
+    doctor.set_defaults(func=cmd_doctor)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

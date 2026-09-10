@@ -1,0 +1,4 @@
+#!/bin/zsh
+set -eu
+
+exec "${0:A:h}/wu" 查看额度 "$@"
