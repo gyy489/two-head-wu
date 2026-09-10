@@ -1,0 +1,16 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "optparse"
+
+options = { name: "world" }
+OptionParser.new do |parser|
+  parser.banner = "Usage: hello [--name NAME]"
+  parser.on("--name NAME", String, "Name to greet") { |name| options[:name] = name }
+end.parse!
+
+name = options[:name].strip
+abort "name must contain between 1 and 80 characters" unless (1..80).cover?(name.length)
+
+puts JSON.generate(message: "Hello, #{name}!", interface: "hello.greet.v1")

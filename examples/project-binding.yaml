@@ -1,0 +1,22 @@
+schema_version: 1
+updated_at: "2026-09-10"
+policy:
+  opt_in: true
+  default_update_policy: pinned
+  automatic_update_requires_explicit_binding: true
+  discovery_does_not_grant_authorization: true
+
+bindings:
+  - project: example-project
+    capability: hello-capability
+    channel: stable
+    update_policy: pinned
+    requirement: "= 0.1.0"
+    automatic: false
+    runtimes:
+      - codex
+      - openclaw
+    interfaces:
+      hello.greet.v1: "Allow a read-only greeting with no external access"
+    # Placeholder digest for this synthetic example; calculate it from a real permission set.
+    permission_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"

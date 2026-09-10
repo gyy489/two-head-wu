@@ -1,0 +1,23 @@
+name: Public reference checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - name: Validate capability manifests
+        run: |
+          ruby tools/validate-capability examples/capability.yaml
+          ruby tools/validate-capability examples/hello-capability/capability.yaml
+      - name: Run capability acceptance test
+        run: examples/hello-capability/tests/test_hello.sh

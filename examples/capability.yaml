@@ -1,19 +1,39 @@
+# Manifest-shaped reference. The runnable package is examples/hello-capability/.
 schema_version: 1
 id: example-capability
 version: "0.1.0"
-status: example
-summary: "Minimal public example of a versioned capability declaration."
+status: experimental
+summary: "Sanitized reference declaration for a small deterministic capability."
+
+documentation:
+  overview: hello-capability/README.md
+  skill_docs: []
+  references: []
+  generated: []
+
+installation:
+  source_owner: two-head-wu
+  runtime_mode: source
+  managed_copy: false
+  large_artifacts: none
 
 interfaces:
-  - id: example.read.v1
+  - id: example.greet.v1
     type: adapter
-    entrypoint: adapters/example
+    entrypoint: hello-capability/adapters/hello
     side_effect: read-only
+
+components:
+  skills: []
+  agents: []
+  adapters:
+    - hello-capability/adapters/hello
+  workflows: []
+  services: []
 
 compatibility:
   codex: compatible
-  claude-code: compatible
-  openclaw: needs-review
+  openclaw: compatible
 
 permissions:
   risk_level: low
@@ -26,9 +46,10 @@ permissions:
 dependencies: []
 
 recovery:
-  source_of_truth: Git-tracked source and declarations
+  source_of_truth: "Git-tracked source and declarations"
   private_material: none
-  rollback: Reactivate the previous verified release
+  rebuild_command: "ruby tools/validate-capability examples/capability.yaml"
+  rollback: "Reactivate the previous verified release"
 
 tests:
-  - tests/test_example.sh
+  - hello-capability/tests/test_hello.sh

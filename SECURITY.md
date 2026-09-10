@@ -1,13 +1,11 @@
-# Security Policy
+# Security policy
 
-This public repository contains architecture documentation and sanitized examples only.
+This public repository contains a sanitized architecture reference, schemas, tooling, and synthetic
+examples. It must not contain credentials, private data, account bindings, deployment topology,
+machine-specific paths, or generated runtime state.
 
-The following material must never be committed:
+Review [the security boundary](docs/security-boundary.md) before publishing a capability.
 
-- passwords, API tokens, private keys, cookies, or authentication exports;
-- personal documents, conversations, databases, or backups;
-- account bindings, private deployment targets, or machine-specific topology;
-- generated runtime state, logs, caches, or absolute local paths.
-
-Security-sensitive capabilities are published only after their public interface and private
-execution boundary can be reviewed independently.
+If you find a vulnerability, use GitHub's private vulnerability reporting channel when available,
+or contact the repository owner privately through the contact method on their GitHub profile. Do
+not include secrets or private operational details in a public issue.

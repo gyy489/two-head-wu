@@ -1,0 +1,54 @@
+schema_version: 1
+id: hello-capability
+version: "0.1.0"
+status: active
+summary: "Return a deterministic JSON greeting without network, secrets, or filesystem writes."
+
+documentation:
+  overview: README.md
+  skill_docs: []
+  references: []
+  generated: []
+
+installation:
+  source_owner: two-head-wu
+  runtime_mode: source
+  managed_copy: false
+  large_artifacts: none
+
+interfaces:
+  - id: hello.greet.v1
+    type: adapter
+    entrypoint: adapters/hello
+    side_effect: read-only
+
+components:
+  skills: []
+  agents: []
+  adapters:
+    - adapters/hello
+  workflows: []
+  services: []
+
+compatibility:
+  codex: compatible
+  openclaw: compatible
+
+permissions:
+  risk_level: low
+  network: none
+  secrets: none
+  filesystem:
+    read: []
+    write: []
+
+dependencies: []
+
+recovery:
+  source_of_truth: "Git-tracked package source"
+  private_material: none
+  rebuild_command: "ruby tools/validate-capability examples/hello-capability/capability.yaml"
+  rollback: "Restore the previous verified package version"
+
+tests:
+  - tests/test_hello.sh

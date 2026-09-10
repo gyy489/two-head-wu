@@ -1,0 +1,128 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://raw.githubusercontent.com/gyy489/two-head-wu/main/schemas/capability.schema.yaml"
+title: "Two-Headed-Wu Capability Package"
+type: object
+additionalProperties: false
+required:
+  - schema_version
+  - id
+  - version
+  - status
+  - summary
+  - documentation
+  - installation
+  - interfaces
+  - components
+  - compatibility
+  - permissions
+  - dependencies
+  - recovery
+  - tests
+properties:
+  schema_version:
+    const: 1
+  id:
+    type: string
+    pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+  version:
+    type: string
+    pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"
+  status:
+    enum: [candidate, experimental, active, disabled, deprecated]
+  summary:
+    type: string
+    minLength: 1
+  documentation:
+    type: object
+    additionalProperties: false
+    required: [overview, skill_docs, references, generated]
+    properties:
+      overview: { type: string }
+      skill_docs: { type: array, items: { type: string } }
+      references: { type: array, items: { type: string } }
+      generated: { type: array, items: { type: string } }
+  installation:
+    type: object
+    additionalProperties: false
+    required: [source_owner, runtime_mode, managed_copy, large_artifacts]
+    properties:
+      source_owner:
+        enum: [system-package-manager, runtime-native, two-head-wu, external-service, vendored]
+      runtime_mode:
+        enum:
+          - source
+          - project-generated
+          - source-and-generated
+          - source-and-external-state
+          - source-and-external-service
+          - source-and-protected-service
+      managed_copy: { type: boolean }
+      large_artifacts:
+        enum: [none, external-volume-required]
+  interfaces:
+    type: array
+    minItems: 1
+    items:
+      type: object
+      additionalProperties: false
+      required: [id, type, entrypoint]
+      properties:
+        id:
+          type: string
+          pattern: "^[a-z0-9]+(?:[.-][a-z0-9]+)*\\.v[1-9][0-9]*$"
+        type: { enum: [cli, skill, mcp, adapter, workflow, agent, service] }
+        entrypoint: { type: string, minLength: 1 }
+        side_effect: { enum: [read-only, local-write, external-write] }
+  components:
+    type: object
+    additionalProperties: false
+    properties:
+      skills: { type: array, items: { type: string } }
+      agents: { type: array, items: { type: string } }
+      adapters: { type: array, items: { type: string } }
+      workflows: { type: array, items: { type: string } }
+      services: { type: array, items: { type: string } }
+  compatibility:
+    type: object
+    additionalProperties:
+      enum: [native, compatible, needs-review, denied]
+  permissions:
+    type: object
+    additionalProperties: false
+    required: [risk_level, network, secrets, filesystem]
+    properties:
+      risk_level: { enum: [low, medium, high, critical] }
+      network: { type: string }
+      secrets: { type: string }
+      filesystem:
+        type: object
+        additionalProperties: false
+        required: [read, write]
+        properties:
+          read: { type: array, items: { type: string } }
+          write: { type: array, items: { type: string } }
+  dependencies:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required: [id, version]
+      properties:
+        id:
+          type: string
+          pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        version: { type: string, minLength: 1 }
+        purpose: { type: string }
+  recovery:
+    type: object
+    additionalProperties: false
+    required: [source_of_truth, rollback]
+    properties:
+      source_of_truth: { type: string, minLength: 1 }
+      private_material: { type: string }
+      rebuild_command: { type: string }
+      rollback: { type: string, minLength: 1 }
+  tests:
+    type: array
+    minItems: 1
+    items: { type: string }
