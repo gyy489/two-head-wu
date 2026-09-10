@@ -84,7 +84,7 @@ class SkillsDashboardCLI
     raise SkillsDashboardError, "dashboard is not running" unless pid && process_alive?(pid)
 
     do_stop
-    emit("result" => "stopped", "pid" => pid)
+    emit({ "result" => "stopped", "pid" => pid })
     0
   end
 
@@ -102,7 +102,7 @@ class SkillsDashboardCLI
   def do_start(options)
     if running?
       pid, port = read_state
-      emit("result" => "already-running", "pid" => pid, "port" => port, "url" => url_for(port))
+      emit({ "result" => "already-running", "pid" => pid, "port" => port, "url" => url_for(port) })
       return 0
     end
 
@@ -129,10 +129,10 @@ class SkillsDashboardCLI
     raise SkillsDashboardError, "server exited immediately; see #{log}" unless process_alive?(pid)
 
     write_state(pid, port)
-    emit(
+    emit({
       "result" => "started", "pid" => pid, "port" => port, "bind" => bind, "url" => url_for(port),
       "idle_timeout" => idle_timeout, "log" => log.to_s
-    )
+    })
     system("open", url_for(port)) if options[:open] && darwin?
     0
   end
