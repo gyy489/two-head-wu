@@ -209,7 +209,7 @@ class AgentIdentity
   def init
     ensure_private_root!
     write_state(default_state) unless state_path.exist?
-    emit("result" => "initialized", "private_registry" => "ready")
+    emit({ "result" => "initialized", "private_registry" => "ready" })
     0
   end
 
@@ -226,7 +226,7 @@ class AgentIdentity
     pool_name = options.fetch(:pool)
     attach_to_pool!(state, identity, pool_name) if pool_name
     write_state(state)
-    emit("result" => "registered-current", "identity" => alias_name, "state_kind" => "default", "mode" => options.fetch(:mode), "conversation_pool" => pool_name || "none")
+    emit({ "result" => "registered-current", "identity" => alias_name, "state_kind" => "default", "mode" => options.fetch(:mode), "conversation_pool" => pool_name || "none" })
     0
   end
 
@@ -243,7 +243,7 @@ class AgentIdentity
     pool_name = options.fetch(:pool)
     attach_to_pool!(state, identity, pool_name) if pool_name
     write_state(state)
-    emit("result" => "added", "identity" => alias_name, "state_kind" => "isolated", "mode" => options.fetch(:mode), "shared_skills" => shared_skills, "conversation_pool" => pool_name || "none", "next" => "run login --alias #{alias_name}")
+    emit({ "result" => "added", "identity" => alias_name, "state_kind" => "isolated", "mode" => options.fetch(:mode), "shared_skills" => shared_skills, "conversation_pool" => pool_name || "none", "next" => "run login --alias #{alias_name}" })
     0
   end
 
@@ -288,7 +288,7 @@ class AgentIdentity
     ensure_owner_local!(identity, "change selection mode")
     identity["selection_mode"] = mode
     write_state(state)
-    emit("result" => "mode-updated", "identity" => alias_name, "mode" => mode)
+    emit({ "result" => "mode-updated", "identity" => alias_name, "mode" => mode })
     0
   end
 
@@ -305,7 +305,7 @@ class AgentIdentity
 
     state.fetch("project_bindings")[project_id] = alias_name
     write_state(state)
-    emit("result" => "bound", "project" => project_id, "identity" => alias_name)
+    emit({ "result" => "bound", "project" => project_id, "identity" => alias_name })
     0
   end
 
@@ -316,7 +316,7 @@ class AgentIdentity
     raise AgentIdentityError, "project is not bound: #{project_id}" unless state.fetch("project_bindings").delete(project_id)
 
     write_state(state)
-    emit("result" => "unbound", "project" => project_id)
+    emit({ "result" => "unbound", "project" => project_id })
     0
   end
 
@@ -336,7 +336,7 @@ class AgentIdentity
     ensure_pool_root!(pool_name)
     state.fetch("conversation_pools")[pool_name] ||= { "id" => pool_name, "created_at" => Time.now.utc.iso8601, "identities" => [] }
     write_state(state)
-    emit("result" => "pool-created", "pool" => pool_name, "shared_dirs" => SHARED_CONVERSATION_DIRS.join(","))
+    emit({ "result" => "pool-created", "pool" => pool_name, "shared_dirs" => SHARED_CONVERSATION_DIRS.join(",") })
     0
   end
 
@@ -348,7 +348,7 @@ class AgentIdentity
     identity = fetch_identity!(state, alias_name)
     attach_to_pool!(state, identity, pool_name)
     write_state(state)
-    emit("result" => "pool-attached", "pool" => pool_name, "identity" => alias_name, "shared_dirs" => SHARED_CONVERSATION_DIRS.join(","))
+    emit({ "result" => "pool-attached", "pool" => pool_name, "identity" => alias_name, "shared_dirs" => SHARED_CONVERSATION_DIRS.join(",") })
     0
   end
 
@@ -1202,12 +1202,12 @@ class AgentIdentity
     login_arguments = ["login"]
     login_arguments << "--device-auth" if ENV["TWO_HEAD_WU_CODEX_LOGIN_DEVICE_AUTH"] == "1"
     if options.fetch(:dry_run)
-      emit(
+      emit({
         "result" => "login-ready",
         "identity" => alias_name,
         "state_kind" => identity.fetch("state_kind"),
         "command" => (["codex"] + login_arguments).join(" ")
-      )
+      })
       return 0
     end
 
@@ -1217,7 +1217,7 @@ class AgentIdentity
     success = system(environment_for(identity), codex, *login_arguments)
     raise AgentIdentityError, "native Codex login did not complete" unless success
 
-    emit("result" => "login-completed", "identity" => alias_name)
+    emit({ "result" => "login-completed", "identity" => alias_name })
     0
   end
 
